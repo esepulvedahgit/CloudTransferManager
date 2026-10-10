@@ -1,0 +1,8 @@
+# Configuración de OpenAI Codex para Cloud Transfer Manager
+sandbox_mode = "workspace-write"
+default_test_command = "pytest"
+agents_doc = "AGENTS.md"
+
+[sandbox]
+allow_network = false
+write_allowlist = ["src", "tests", "docs", "compose.yaml", "Dockerfile", "package.json", "pyproject.toml"]
