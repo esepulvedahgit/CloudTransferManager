@@ -966,6 +966,30 @@ class TransferExecutor:
                     )
                 record.current_item = None
                 await self.publish(record)
+            elif directories:
+                if await self.should_cancel():
+                    await self._cancel(record)
+                    return
+                record.current_item = record.source_paths[0]
+                await self.publish(record)
+                for directory_path in sorted(
+                    directories,
+                    key=lambda value: (len(PurePosixPath(value).parts), value),
+                ):
+                    relative_directory = PurePosixPath(directory_path)
+                    if relative_directory.is_absolute() or any(
+                        part in {"", ".", ".."} for part in relative_directory.parts
+                    ):
+                        raise ValueError("Unsafe relative transfer path")
+                    if await self.should_cancel():
+                        await self._cancel(record)
+                        return
+                    destination_directory = MockStorageProvider.normalize_path(
+                        f"{destination_root.rstrip('/')}/{relative_directory.as_posix()}"
+                    )
+                    await mega_session.mkdir(destination_directory)
+                record.current_item = None
+                await self.publish(record)
 
             for item, relative_path in files:
                 if await self.should_cancel():

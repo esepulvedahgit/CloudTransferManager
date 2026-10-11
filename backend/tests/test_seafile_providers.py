@@ -1,10 +1,11 @@
+import gzip
 import hashlib
 import re
 import uuid
 from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
-from urllib.parse import unquote, unquote_plus
+from urllib.parse import quote, unquote
 
 import httpx
 import pytest
@@ -174,6 +175,36 @@ async def test_api_streams_file_download_and_sha256_without_buffering_response()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["download", "sha256"])
+async def test_api_download_handles_compressed_content_length(operation: str, tmp_path: Path):
+    data = b"markdown body with repeated data " * 20
+    compressed = gzip.compress(data)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/api2/repos/{REPOSITORY_ID}/file/":
+            return httpx.Response(200, json=f"{BASE_URL}/seafhttp/compressed")
+        if request.url.path == "/seafhttp/compressed":
+            return httpx.Response(
+                200,
+                content=compressed,
+                headers={
+                    "Content-Encoding": "gzip",
+                    "Content-Length": str(len(compressed)),
+                },
+            )
+        return httpx.Response(404)
+
+    provider = _provider(httpx.MockTransport(handler), library="Archive")
+    target = tmp_path / "compressed.md"
+
+    if operation == "download":
+        await provider.download_file("/compressed.md", target)
+        assert target.read_bytes() == data
+    else:
+        assert await provider.sha256("/compressed.md") == hashlib.sha256(data).hexdigest()
+
+
+@pytest.mark.asyncio
 async def test_api_resumable_upload_starts_at_existing_offset_and_uses_bounded_chunks(
     tmp_path: Path,
 ):
@@ -228,11 +259,9 @@ async def test_api_resumable_upload_starts_at_existing_offset_and_uses_bounded_c
     ]
     assert b"a" * 64_000 in upload_requests[0].content
     disposition = upload_requests[0].headers["Content-Disposition"]
-    encoded_filename = re.search(r"filename\*=UTF-8''([^;]+)", disposition)
+    encoded_filename = re.search(r'filename\*=UTF-8\'\'"([^"]+)"', disposition)
     assert encoded_filename is not None
-    assert unquote_plus(
-        unquote(encoded_filename.group(1), encoding="utf-8"), encoding="utf-8"
-    ) == "résumé file.bin"
+    assert unquote(encoded_filename.group(1), encoding="utf-8") == "résumé file.bin"
     assert all(
         request.headers["Authorization"] == f"Token {ACCOUNT}" for request in upload_requests
     )
@@ -355,13 +384,11 @@ async def test_api_upload_preserves_special_names_for_empty_and_chunked_files(
     assert upload_requests
     for request in upload_requests:
         if "Content-Range" in request.headers:
-            raw_encoded_name = re.search(
-                r"filename\*=UTF-8''([^;]+)", request.headers["Content-Disposition"]
+            # Seafile extracts the first quoted value and URI-decodes it.
+            encoded_name = quote(file_name, safe="")
+            assert request.headers["Content-Disposition"] == (
+                f"attachment; filename*=UTF-8''\"{encoded_name}\""
             )
-            assert raw_encoded_name is not None
-            # The fileserver applies MIME decoding and then url.QueryUnescape.
-            mime_decoded = unquote(raw_encoded_name.group(1), encoding="utf-8")
-            assert unquote_plus(mime_decoded, encoding="utf-8") == file_name
         else:
             multipart = BytesParser(policy=default).parsebytes(
                 b"Content-Type: "

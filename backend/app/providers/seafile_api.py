@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -404,11 +403,7 @@ class SeafileApiProvider(StorageProvider):
                     self._raise_for_status(response)
                     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                     transferred = 0
-                    content_length = response.headers.get("Content-Length")
-                    try:
-                        total = max(0, int(content_length)) if content_length is not None else None
-                    except ValueError:
-                        total = None
+                    total = self._decoded_content_length(response)
                     with target.open("wb") as output:
                         async for chunk in response.aiter_bytes(1024 * 1024):
                             await _check_cancel(should_cancel)
@@ -439,11 +434,7 @@ class SeafileApiProvider(StorageProvider):
                 ) as response:
                     self._raise_for_status(response)
                     transferred = 0
-                    content_length = response.headers.get("Content-Length")
-                    try:
-                        total = max(0, int(content_length)) if content_length is not None else None
-                    except ValueError:
-                        total = None
+                    total = self._decoded_content_length(response)
                     async for chunk in response.aiter_bytes(1024 * 1024):
                         await _check_cancel(should_cancel)
                         digest.update(chunk)
@@ -474,6 +465,18 @@ class SeafileApiProvider(StorageProvider):
         if not isinstance(link, str) or not link:
             raise SeafileApiError(502)
         return self._validate_transfer_url(link)
+
+    @staticmethod
+    def _decoded_content_length(response: httpx.Response) -> int | None:
+        """Return Content-Length only when it measures the bytes aiter_bytes yields."""
+        content_encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+        if content_encoding not in {"", "identity"}:
+            return None
+        content_length = response.headers.get("Content-Length")
+        try:
+            return max(0, int(content_length)) if content_length is not None else None
+        except ValueError:
+            return None
 
     def _validate_transfer_url(self, value: str) -> str:
         target = urljoin(f"{self.base_url}/", value)
@@ -542,12 +545,10 @@ class SeafileApiProvider(StorageProvider):
             upload_parts = urlsplit(upload_url)
             query = f"{upload_parts.query}&ret-json=1" if upload_parts.query else "ret-json=1"
             upload_url = upload_parts._replace(query=query).geturl()
-            fallback_name = _ascii_fallback(relative.name)
-            # Seafile's fileserver MIME-decodes filename* and then QueryUnescapes it.
-            encoded_name = quote(quote(relative.name, safe=""), safe="")
-            disposition = (
-                f"attachment; filename=\"{fallback_name}\"; filename*=UTF-8''{encoded_name}"
-            )
+            # Seafile's chunk upload parser URI-decodes the quoted value from this
+            # header. Do not include a plain filename fallback: its parser chooses it.
+            encoded_name = quote(relative.name, safe="")
+            disposition = f"attachment; filename*=UTF-8''\"{encoded_name}\""
             last_response: httpx.Response | None = None
             with source.open("rb") as file_handle:
                 if size == 0:
@@ -678,8 +679,3 @@ def _retry_after(value: str | None) -> int | None:
 async def _check_cancel(should_cancel: CancelCheck | None) -> None:
     if should_cancel is not None and await should_cancel():
         raise SeafileApiCancelledError("Seafile transfer was cancelled")
-
-
-def _ascii_fallback(value: str) -> str:
-    fallback = value.encode("ascii", errors="replace").decode("ascii")
-    return re.sub(r'[\\"\r\n\x00]', "_", fallback)

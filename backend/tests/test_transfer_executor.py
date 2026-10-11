@@ -50,6 +50,7 @@ class FakeStorage:
         self.failure: str | None = None
         self.download_attempts = 0
         self.upload_attempts = 0
+        self.created_directories: list[str] = []
 
     async def get_item(self, path: str):
         return self.items.get(path)
@@ -91,6 +92,9 @@ class FakeMegaSession:
 
     async def get_item(self, path: str):
         return await self.provider.get_item(path)
+
+    async def mkdir(self, path: str):
+        self.provider.created_directories.append(path)
 
     async def list_items(self, path: str, cursor=None, page_size=200, **kwargs):
         return await self.provider.list_items(path, cursor, page_size, **kwargs)
@@ -341,6 +345,7 @@ async def test_drive_to_mega_preserves_nested_paths_and_skips_existing_destinati
 
     mega_destination = providers[transfer.destination_connection_id]
     assert mega_destination.open_count == 1
+    assert mega_destination.created_directories == ["/backup/sub"]
     assert [folder for _local, folder in mega_destination.uploads] == ["/backup", "/backup/sub"]
     assert [remote for remote, _local in runner.downloaded] == [
         f"ctm_{providers[transfer.source_connection_id].connection_id.hex}:/source/a.txt",
@@ -353,6 +358,24 @@ async def test_drive_to_mega_preserves_nested_paths_and_skips_existing_destinati
     assert len(runner.active_areas) == 2
     assert all(len(areas) == 1 for areas in runner.active_areas)
     assert list(Path(executor.settings.transfer_staging_path).iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_seafile_rclone_to_mega_creates_nested_destination_directories(tmp_path):
+    executor, transfer, providers, _runner, _snapshots, _store = _cross_provider_executor(
+        tmp_path,
+        source_type="SEAFILE",
+        destination_type="MEGA",
+        source_items=_nested_tree("SEAFILE"),
+        source_paths=["/source"],
+    )
+
+    await executor.execute(transfer.id)
+
+    mega_destination = providers[transfer.destination_connection_id]
+    assert mega_destination.created_directories == ["/backup/sub"]
+    assert [folder for _local, folder in mega_destination.uploads] == ["/backup", "/backup/sub"]
+    assert transfer.status == "COMPLETED"
 
 
 @pytest.mark.parametrize(
