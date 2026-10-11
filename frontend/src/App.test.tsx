@@ -135,6 +135,104 @@ describe('Cloud Transfer Manager', () => {
     expect(screen.getByLabelText(/Contraseña de MEGA/i)).toBeVisible();
   });
 
+  it('creates Seafile with an explicit adapter and sends 2FA only with the connection test', async () => {
+    let connections: Array<Record<string, unknown>> = [];
+    let createRequest: Record<string, unknown> | undefined;
+    let testRequest: { body?: string } | undefined;
+    const safeConnection = {
+      id: 'seafile-1',
+      name: 'Seafile CE',
+      provider_type: 'SEAFILE',
+      adapter_type: 'SEAFILE_API',
+      status: 'INACTIVE',
+      credentials_configured: true,
+      is_global: true,
+      last_tested_at: null,
+      last_test_status: null,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/connections') && init?.method === 'POST') {
+        createRequest = JSON.parse(String(init.body)) as Record<string, unknown>;
+        connections = [safeConnection];
+        return jsonResponse(safeConnection, 201);
+      }
+      if (path.endsWith('/connections/seafile-1/test') && init?.method === 'POST') {
+        testRequest = { body: init.body?.toString() };
+        return jsonResponse({ success: true, message: 'Seafile verificado' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: connections });
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('tab', { name: /Conexiones/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /Agregar conexión/i }));
+    const providerSelect = screen.getByRole('combobox', { name: 'Proveedor' });
+    fireEvent.mouseDown(providerSelect);
+    fireEvent.click(await screen.findByRole('option', { name: 'Seafile' }));
+
+    expect(await screen.findByLabelText(/URL del servidor Seafile/i)).toBeVisible();
+    const adapterSelect = screen.getByRole('combobox', { name: /Adaptador Seafile/i });
+    expect(adapterSelect).toHaveTextContent('Rclone');
+    fireEvent.mouseDown(adapterSelect);
+    fireEvent.click(await screen.findByRole('option', { name: /API de Seafile/i }));
+    fireEvent.change(screen.getByLabelText(/Nombre de conexión/i), { target: { value: 'Seafile CE' } });
+    fireEvent.change(screen.getByLabelText(/URL del servidor Seafile/i), {
+      target: { value: 'https://files.example.test' },
+    });
+    fireEvent.change(screen.getByLabelText(/Usuario de Seafile/i), {
+      target: { value: 'operator@example.test' },
+    });
+    fireEvent.change(screen.getByLabelText(/Contraseña de Seafile/i), {
+      target: { value: 'seafile-login-secret' },
+    });
+    fireEvent.change(screen.getByLabelText(/Biblioteca \(opcional\)/i), {
+      target: { value: 'Archive' },
+    });
+    fireEvent.change(screen.getByLabelText(/Contraseña de biblioteca/i), {
+      target: { value: 'library-secret' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Guardar conexión' }));
+
+    await waitFor(() => expect(createRequest).toEqual({
+      name: 'Seafile CE',
+      provider_type: 'SEAFILE',
+      adapter_type: 'SEAFILE_API',
+      is_global: true,
+      credentials: {
+        url: 'https://files.example.test',
+        username: 'operator@example.test',
+        password: 'seafile-login-secret',
+        library: 'Archive',
+        library_password: 'library-secret',
+      },
+    }));
+    expect(JSON.stringify(safeConnection)).not.toContain('secret');
+    expect(screen.queryByDisplayValue('seafile-login-secret')).not.toBeInTheDocument();
+    await waitForElementToBeRemoved(() => screen.queryByRole('dialog', { name: /Agregar conexión/i }));
+    expect(await screen.findByText(/Adaptador: API de Seafile/i)).toBeVisible();
+
+    fireEvent.click(screen.getByRole('tab', { name: /Explorador/i }));
+    const otpInput = await screen.findByLabelText(/Código 2FA de Seafile/i);
+    fireEvent.change(otpInput, { target: { value: '123456' } });
+    fireEvent.click(screen.getByRole('button', { name: /Probar conexión/i }));
+
+    await waitFor(() => expect(testRequest?.body).toBe(JSON.stringify({ otp: '123456' })));
+    expect(otpInput).toHaveValue('');
+    expect(screen.queryByDisplayValue('123456')).not.toBeInTheDocument();
+    expect(screen.getByText(/Seafile verificado/i)).toBeVisible();
+  });
+
   it('archives an idle connection only after confirmation and clears explorer selection', async () => {
     let connections = [
       { id: 'source', name: 'Origen', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false, is_global: true },

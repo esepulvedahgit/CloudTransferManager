@@ -80,7 +80,7 @@ Todas las mutaciones requieren el encabezado `X-CSRF-Token`. Obtenerlo con `GET 
 ## 3. Conexiones (`/connections`)
 
 `GET /api/v1/connections` devuelve únicamente las conexiones globales o asignadas al usuario. Los campos de credenciales nunca forman parte de las respuestas.
-Las conexiones MEGA y Google Drive nuevas quedan `INACTIVE` hasta superar la prueba; las simuladas quedan activas. Un administrador puede ejecutar la prueba desde el explorador o mediante el endpoint siguiente.
+Las conexiones MEGA, Google Drive y Seafile nuevas quedan `INACTIVE` hasta superar la prueba; las simuladas quedan activas. Un administrador puede ejecutar la prueba desde el explorador o mediante el endpoint siguiente.
 
 ### `DELETE /api/v1/connections/{connection_id}` [Solo ADMIN]
 - Requiere CSRF y archiva la conexión de forma lógica; no elimina la fila ni las referencias de transferencias históricas.
@@ -114,6 +114,26 @@ Las conexiones MEGA y Google Drive nuevas quedan `INACTIVE` hasta superar la pru
 ```
 Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `team_drive`/`root_folder_id` opcionales); la conexión queda inactiva mientras se completa OAuth.
 
+- **Request Body (Seafile):**
+```json
+{
+  "name": "Seafile CE",
+  "provider_type": "SEAFILE",
+  "adapter_type": "RCLONE",
+  "is_global": true,
+  "credentials": {
+    "url": "https://seafile.example.com",
+    "username": "operador@example.com",
+    "password": "contraseña-de-cuenta",
+    "library": "Archivos",
+    "library_password": "contraseña-de-biblioteca"
+  }
+}
+```
+- `adapter_type` acepta `RCLONE` o `SEAFILE_API`; omitirlo equivale a `RCLONE`. La API es una elección explícita por conexión y un error nunca cambia de adaptador.
+- `library` y `library_password` son opcionales. Sin biblioteca fija, el explorador muestra las bibliotecas disponibles; la contraseña se usa solo para una biblioteca cifrada.
+- La respuesta contiene `adapter_type` y `credentials_configured`, pero nunca credenciales, OTP ni token de Seafile.
+
 ### `POST /api/v1/connections/{connection_id}/google-oauth/start` [Solo ADMIN]
 - **Response `200 OK`:** `{ "authorization_url": "https://accounts.google.com/..." }`. El estado anti-CSRF queda vinculado a la sesión del administrador; el navegador no recibe el secreto del cliente ni tokens.
 - Google debe tener registrada como URI de redirección `${APP_BASE_URL}/api/v1/connections/google-oauth/callback`.
@@ -122,6 +142,7 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 - Intercambia el código OAuth en el servidor, cifra los tokens y redirige a la interfaz. La conexión sigue inactiva hasta una prueba exitosa.
 
 ### `POST /api/v1/connections/{connection_id}/test`
+- **Request Body opcional para Seafile:** `{ "otp": "123456" }`. El OTP se usa únicamente para autenticar esta prueba; no se persiste ni se devuelve. Si se omite, se usa el token cifrado vigente o se intenta autenticar con las credenciales guardadas.
 - **Response `200 OK`:**
 ```json
 {
@@ -133,7 +154,7 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 ```
 
 ### `PATCH /api/v1/connections/{connection_id}` [Solo ADMIN]
-- Permite actualizar `name`, `is_global` y/o `credentials` sin devolver secretos.
+- Permite actualizar `name`, `is_global`, `adapter_type` (solo Seafile) y/o `credentials` sin devolver secretos. Cambiar el adaptador o credenciales deja la conexión inactiva hasta volver a probarla.
 
 ### `POST /api/v1/connections/{connection_id}/deactivate` [Solo ADMIN]
 - Desactiva la conexión y bloquea nuevas navegaciones y transferencias.

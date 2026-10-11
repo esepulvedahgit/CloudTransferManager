@@ -92,7 +92,7 @@
 - [x] **Step 2: Run tests and confirm failures.** Run: `cd backend && .venv/bin/pytest tests/test_seafile_transfers.py -q`. Expected: API transfers are not currently routed.
 - [x] **Step 3: Implement explicit route selection and staged copies.** Preserve existing Mega/Google behavior; use per-file helper methods for Seafile API and Rclone endpoints; carry cancellation into streaming and retry loops; do not add API delete/move/sync or silent adapter changes.
 - [x] **Step 4: Run transfer tests.** Run: `cd backend && .venv/bin/pytest tests/test_seafile_transfers.py tests/test_transfer_executor.py tests/test_staging.py -q`. Expected: all pass and staging is removed after all terminal outcomes.
-- [ ] **Step 5: Commit** as `feat: execute verified Seafile API transfers`.
+- [x] **Step 5: Commit** as `feat: execute verified Seafile API transfers`.
 
 ### Task 4: Admin UI, API contract docs, compatibility harness, and full verification
 
@@ -109,11 +109,11 @@
 - Consumes: Tasks 1–3 API fields, explicit adapter choice, and transient OTP test request.
 - Produces: Admin can create a Seafile connection, select Rclone (default) or API, configure URL/account/library fields, and test with a transient OTP. Compatibility instructions document a destructive-safe disposable library and an opt-in CE 13.x integration run.
 
-- [ ] **Step 1: Write failing UI tests** for Seafile form fields, default Rclone selection, explicit API selection, POST payload without secrets in responses, and transient OTP test behavior.
-- [ ] **Step 2: Run UI tests and confirm failures.** Run: `cd frontend && npm test -- --run src/App.test.tsx`. Expected: no Seafile connection form exists yet.
-- [ ] **Step 3: Implement UI and documentation.** Add admin-only Seafile setup and adapter selection; show adapter choice in connection inventory; add test/re-auth input for OTP without retaining it in form state after submission. Update public API and provider/transfer specs and provide an opt-in integration test against Seafile CE 13.x that creates, uploads, downloads, hashes, and removes only its own disposable test data after explicit environment configuration.
-- [ ] **Step 4: Run focused and full verification.** Run: `cd frontend && npm test -- --run`; `cd frontend && npm run lint`; `cd frontend && npm run build`; `cd backend && .venv/bin/pytest -v --tb=short`; `cd backend && .venv/bin/ruff check .`; `cd backend && .venv/bin/mypy app`. Expected: all existing and new tests pass; integration test skips unless explicitly configured.
-- [ ] **Step 5: Commit** as `feat: expose configurable Seafile adapters`.
+- [x] **Step 1: Write failing UI tests** for Seafile form fields, default Rclone selection, explicit API selection, POST payload without secrets in responses, and transient OTP test behavior.
+- [x] **Step 2: Run UI tests and confirm failures.** Run: `cd frontend && npm test -- --run src/App.test.tsx`. Expected: no Seafile connection form exists yet.
+- [x] **Step 3: Implement UI and documentation.** Add admin-only Seafile setup and adapter selection; show adapter choice in connection inventory; add test/re-auth input for OTP without retaining it in form state after submission. Update public API and provider/transfer specs and provide an opt-in integration test against Seafile CE 13.x that creates, uploads, downloads, hashes, and removes only its own disposable test data after explicit environment configuration.
+- [x] **Step 4: Run focused and full verification.** Run: `cd frontend && npm test -- --run`; `cd frontend && npm run lint`; `cd frontend && npm run build`; `cd backend && .venv/bin/pytest -v --tb=short`; `cd backend && .venv/bin/ruff check .`; `cd backend && .venv/bin/mypy app`. Expected: all existing and new tests pass; integration test skips unless explicitly configured.
+- [x] **Step 5: Commit** as `feat: expose configurable Seafile adapters`.
 
 ## Self-Review
 

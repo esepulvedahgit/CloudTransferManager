@@ -93,7 +93,16 @@ class StorageProvider(ABC):
   - Unidades Compartidas (*Shared Drives*): Parámetro de configuración `team_drive`.
   - Renovación automática de tokens mediante el Refresh Token cuando expire el Access Token.
 
-### C. Proveedor Mock (`MockStorageProvider`)
+### C. Adaptadores Seafile (`SeafileRcloneProvider` y `SeafileApiProvider`)
+- `provider_type` es `SEAFILE`. `adapter_type` se guarda por conexión y acepta `RCLONE` (predeterminado) o `SEAFILE_API`; no se cambia automáticamente al fallar una operación.
+- `RCLONE` usa el backend nativo de Rclone `type = seafile`. `SEAFILE_API` solo se usa cuando un administrador lo selecciona al crear o editar la conexión.
+- Se autentica en el servidor mediante `/api2/auth-token/`; el token de cuenta queda dentro del payload cifrado. El OTP se acepta únicamente en la solicitud de prueba de conexión, no se persiste ni se devuelve.
+- La API directa usa endpoints de bibliotecas, directorios, metadatos, enlaces de descarga y carga fragmentada. Los enlaces devueltos por Seafile deben permanecer en el mismo host configurado.
+- El adaptador API está implementado para operaciones de navegación y copia; los flujos que lo usan descargan o suben un archivo a la vez mediante staging privado. No añade operaciones de eliminación, movimiento o sincronización.
+- Toda subida a Seafile API se vuelve a leer y se compara con SHA-256 del origen antes de contar el archivo como completado. En transferencias grandes esto añade una lectura de red del contenido subido.
+- La compatibilidad de lanzamiento se limita inicialmente a Seafile Community Edition 13.x. Otras versiones y Professional no se consideran comprobadas por defecto; se debe ejecutar el test optativo contra la instancia de destino antes de habilitarlas.
+
+### D. Proveedor Mock (`MockStorageProvider`)
 - Implementación en memoria que simula un árbol de directorios con archivos ficticios y latencias programables.
 - **Uso obligatorio en la Fase 2** para construir y validar el *Vertical Slice* de la aplicación antes de depender de credenciales reales.
 
@@ -134,7 +143,8 @@ class StorageProvider(ABC):
 CREATE TABLE storage_connections (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(128) NOT NULL,
-    provider_type VARCHAR(32) NOT NULL CHECK (provider_type IN ('MEGA', 'GOOGLE_DRIVE', 'S3', 'WASABI', 'MEGA_S4')),
+    provider_type VARCHAR(32) NOT NULL CHECK (provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE')),
+    adapter_type VARCHAR(32) NOT NULL DEFAULT 'RCLONE' CHECK (adapter_type IN ('RCLONE', 'SEAFILE_API')),
     status VARCHAR(16) NOT NULL DEFAULT 'INACTIVE' CHECK (status IN ('ACTIVE', 'INACTIVE', 'ERROR')),
     deleted_at TIMESTAMP WITH TIME ZONE NULL,
     encrypted_credentials BYTEA NOT NULL,
@@ -160,6 +170,8 @@ CREATE TABLE connection_permissions (
     UNIQUE(connection_id, user_id)
 );
 ```
+
+`adapter_type` solo selecciona el motor Seafile (`RCLONE` o `SEAFILE_API`); las otras conexiones conservan `RCLONE` como valor neutral por compatibilidad de esquema.
 
 ### Archivado lógico de conexiones
 

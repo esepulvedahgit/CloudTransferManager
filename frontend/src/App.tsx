@@ -43,6 +43,7 @@ type Connection = {
   id: string;
   name: string;
   provider_type: string;
+  adapter_type?: 'RCLONE' | 'SEAFILE_API';
   status: string;
   credentials_configured: boolean;
   is_global?: boolean;
@@ -87,7 +88,8 @@ const terminalTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILE
 type LoginForm = { username_or_email: string; password: string };
 type ConnectionForm = {
   name: string;
-  provider_type: 'MOCK' | 'MEGA' | 'GOOGLE_DRIVE';
+  provider_type: 'MOCK' | 'MEGA' | 'GOOGLE_DRIVE' | 'SEAFILE';
+  seafile_adapter_type: 'RCLONE' | 'SEAFILE_API';
   is_global: boolean;
   mega_username: string;
   mega_password: string;
@@ -95,6 +97,11 @@ type ConnectionForm = {
   drive_client_secret: string;
   drive_team_drive: string;
   drive_root_folder_id: string;
+  seafile_url: string;
+  seafile_username: string;
+  seafile_password: string;
+  seafile_library: string;
+  seafile_library_password: string;
 };
 type PasswordForm = { current_password: string; new_password: string };
 
@@ -198,7 +205,8 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
 
 const connectionSchema = z.object({
   name: z.string().trim().min(1, 'Ingresa un nombre.'),
-  provider_type: z.enum(['MOCK', 'MEGA', 'GOOGLE_DRIVE']),
+  provider_type: z.enum(['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE']),
+  seafile_adapter_type: z.enum(['RCLONE', 'SEAFILE_API']),
   is_global: z.boolean(),
   mega_username: z.string(),
   mega_password: z.string(),
@@ -206,21 +214,33 @@ const connectionSchema = z.object({
   drive_client_secret: z.string(),
   drive_team_drive: z.string(),
   drive_root_folder_id: z.string(),
+  seafile_url: z.string(),
+  seafile_username: z.string(),
+  seafile_password: z.string(),
+  seafile_library: z.string(),
+  seafile_library_password: z.string(),
 }).superRefine((values, context) => {
-  const required = values.provider_type === 'MEGA'
+  const required: Array<[keyof ConnectionForm, string]> = values.provider_type === 'MEGA'
     ? [['mega_username', values.mega_username], ['mega_password', values.mega_password]]
     : values.provider_type === 'GOOGLE_DRIVE'
       ? [['drive_client_id', values.drive_client_id], ['drive_client_secret', values.drive_client_secret]]
-      : [];
+      : values.provider_type === 'SEAFILE'
+        ? [
+            ['seafile_url', values.seafile_url],
+            ['seafile_username', values.seafile_username],
+            ['seafile_password', values.seafile_password],
+          ]
+        : [];
   required.forEach(([field, value]) => {
     if (!value) context.addIssue({ code: 'custom', path: [field], message: 'Este campo es obligatorio.' });
   });
 });
 
 const emptyConnectionForm: ConnectionForm = {
-  name: '', provider_type: 'MEGA', is_global: true,
+  name: '', provider_type: 'MEGA', seafile_adapter_type: 'RCLONE', is_global: true,
   mega_username: '', mega_password: '', drive_client_id: '', drive_client_secret: '',
-  drive_team_drive: '', drive_root_folder_id: '',
+  drive_team_drive: '', drive_root_folder_id: '', seafile_url: '', seafile_username: '',
+  seafile_password: '', seafile_library: '', seafile_library_password: '',
 };
 
 function ConnectionDialog({
@@ -258,13 +278,26 @@ function ConnectionDialog({
             ...(values.drive_team_drive ? { team_drive: values.drive_team_drive } : {}),
             ...(values.drive_root_folder_id ? { root_folder_id: values.drive_root_folder_id } : {}),
           }
-        : undefined;
+        : values.provider_type === 'SEAFILE'
+          ? {
+              url: values.seafile_url,
+              username: values.seafile_username,
+              password: values.seafile_password,
+              ...(values.seafile_library.trim() ? { library: values.seafile_library.trim() } : {}),
+              ...(values.seafile_library_password
+                ? { library_password: values.seafile_library_password }
+                : {}),
+            }
+          : undefined;
     try {
       const connection = await apiRequest<Connection>('/api/v1/connections', {
         method: 'POST',
         body: JSON.stringify({
           name: values.name,
           provider_type: values.provider_type,
+          ...(values.provider_type === 'SEAFILE'
+            ? { adapter_type: values.seafile_adapter_type }
+            : {}),
           is_global: values.is_global,
           ...(credentials ? { credentials } : {}),
         }),
@@ -308,6 +341,7 @@ function ConnectionDialog({
                   <Select {...field} labelId="provider-label" label="Proveedor">
                     <MenuItem value="MEGA">MEGA</MenuItem>
                     <MenuItem value="GOOGLE_DRIVE">Google Drive</MenuItem>
+                    <MenuItem value="SEAFILE">Seafile</MenuItem>
                     <MenuItem value="MOCK">Simulado (pruebas)</MenuItem>
                   </Select>
                 )}
@@ -326,6 +360,61 @@ function ConnectionDialog({
                 <TextField label="OAuth Client Secret" type="password" autoComplete="new-password" {...register('drive_client_secret')} error={Boolean(errors.drive_client_secret)} helperText={errors.drive_client_secret?.message ?? ' '} />
                 <TextField label="Shared Drive ID (opcional)" {...register('drive_team_drive')} />
                 <TextField label="Carpeta raíz (opcional)" {...register('drive_root_folder_id')} />
+              </>
+            )}
+            {provider === 'SEAFILE' && (
+              <>
+                <Alert severity="info">
+                  Rclone es el adaptador predeterminado. La API solo se usará si la seleccionas aquí; un error nunca cambia el adaptador automáticamente.
+                </Alert>
+                <FormControl fullWidth>
+                  <InputLabel id="seafile-adapter-label">Adaptador Seafile</InputLabel>
+                  <Controller
+                    name="seafile_adapter_type"
+                    control={control}
+                    render={({ field }) => (
+                      <Select {...field} labelId="seafile-adapter-label" label="Adaptador Seafile">
+                        <MenuItem value="RCLONE">Rclone (predeterminado)</MenuItem>
+                        <MenuItem value="SEAFILE_API">API de Seafile (opcional)</MenuItem>
+                      </Select>
+                    )}
+                  />
+                </FormControl>
+                <TextField
+                  label="URL del servidor Seafile"
+                  placeholder="https://seafile.example.com"
+                  autoComplete="url"
+                  error={Boolean(errors.seafile_url)}
+                  helperText={errors.seafile_url?.message ?? ' '}
+                  {...register('seafile_url')}
+                />
+                <TextField
+                  label="Usuario de Seafile"
+                  autoComplete="username"
+                  error={Boolean(errors.seafile_username)}
+                  helperText={errors.seafile_username?.message ?? ' '}
+                  {...register('seafile_username')}
+                />
+                <TextField
+                  label="Contraseña de Seafile"
+                  type="password"
+                  autoComplete="new-password"
+                  error={Boolean(errors.seafile_password)}
+                  helperText={errors.seafile_password?.message ?? ' '}
+                  {...register('seafile_password')}
+                />
+                <TextField
+                  label="Biblioteca (opcional)"
+                  helperText="Déjala vacía para mostrar las bibliotecas disponibles."
+                  {...register('seafile_library')}
+                />
+                <TextField
+                  label="Contraseña de biblioteca"
+                  type="password"
+                  autoComplete="new-password"
+                  helperText="Solo se necesita para una biblioteca cifrada."
+                  {...register('seafile_library_password')}
+                />
               </>
             )}
             {provider === 'MOCK' && <Alert severity="info">Conexión local de demostración; no usa credenciales externas.</Alert>}
@@ -596,8 +685,16 @@ function formatBytes(size: number | null): string {
 
 function providerLabel(provider: string): string {
   if (provider === 'GOOGLE_DRIVE') return 'Google Drive';
+  if (provider === 'SEAFILE') return 'Seafile Community Edition';
   if (provider === 'MOCK') return 'Simulada';
   return provider;
+}
+
+function connectionAdapterLabel(connection: Connection): string | null {
+  if (connection.provider_type !== 'SEAFILE') return null;
+  return connection.adapter_type === 'SEAFILE_API'
+    ? 'Adaptador: API de Seafile'
+    : 'Adaptador: Rclone (predeterminado)';
 }
 
 function connectionStatusLabel(status: string): string {
@@ -707,6 +804,11 @@ function ConnectionManagementSection({
               <span className="connection-field-label">Conexión</span>
               <Typography fontWeight={700}>{connection.name}</Typography>
               <Typography variant="caption" color="text.secondary">{providerLabel(connection.provider_type)}</Typography>
+              {connectionAdapterLabel(connection) && (
+                <Typography variant="caption" color="text.secondary">
+                  {connectionAdapterLabel(connection)}
+                </Typography>
+              )}
             </Box>
             <Box className="connection-row-field">
               <span className="connection-field-label">Estado</span>
@@ -790,10 +892,11 @@ function ExplorerPanel({
   selectedPaths?: string[];
   onToggle?: (item: StorageItem) => void;
   isAdmin: boolean;
-  onTestConnection: (connectionId: string) => Promise<void>;
+  onTestConnection: (connectionId: string, otp?: string) => Promise<void>;
 }) {
   const [search, setSearch] = useState('');
   const [testing, setTesting] = useState(false);
+  const [otp, setOtp] = useState('');
   const active = connections.find((connection) => connection.id === connectionId);
   const query = useInfiniteQuery({
     queryKey: ['items', connectionId, path, search],
@@ -812,9 +915,11 @@ function ExplorerPanel({
 
   const testConnection = async () => {
     if (!active) return;
+    const submittedOtp = otp.trim();
+    setOtp('');
     setTesting(true);
     try {
-      await onTestConnection(active.id);
+      await onTestConnection(active.id, submittedOtp || undefined);
     } finally {
       setTesting(false);
     }
@@ -836,7 +941,10 @@ function ExplorerPanel({
             labelId={`${side}-connection-label`}
             label="Conexión"
             value={connectionId}
-            onChange={(event) => onConnectionChange(event.target.value)}
+            onChange={(event) => {
+              setOtp('');
+              onConnectionChange(event.target.value);
+            }}
           >
             {connections.map((connection) => (
               <MenuItem key={connection.id} value={connection.id}>{connection.name}</MenuItem>
@@ -855,6 +963,18 @@ function ExplorerPanel({
                 </Button>
               )}
             </Stack>
+            {isAdmin && active.provider_type === 'SEAFILE' && (
+              <TextField
+                size="small"
+                fullWidth
+                label={`Código 2FA de Seafile (${side === 'source' ? 'origen' : 'destino'})`}
+                type="password"
+                autoComplete="one-time-code"
+                value={otp}
+                onChange={(event) => setOtp(event.target.value)}
+                helperText="Opcional. Se envía solo al probar y se borra al enviar."
+              />
+            )}
             {active.status !== 'ACTIVE' && (
               <Alert severity={active.status === 'ERROR' ? 'error' : 'warning'}>
                 Prueba esta conexión antes de explorar o transferir archivos.
@@ -1001,12 +1121,15 @@ function TransferWorkspace({
     }
   }, [connections, destinationId, sourceId]);
 
-  const runConnectionTest = async (connectionId: string) => {
+  const runConnectionTest = async (connectionId: string, otp?: string) => {
     setNotice('');
     try {
       const result = await apiRequest<{ success: boolean; message: string }>(
         `/api/v1/connections/${connectionId}/test`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          ...(otp ? { body: JSON.stringify({ otp }) } : {}),
+        },
       );
       setNotice(result.success ? result.message : `${result.message}. La conexión sigue desactivada.`);
       setNoticeSeverity(result.success ? 'success' : 'error');

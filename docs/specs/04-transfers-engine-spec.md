@@ -1,7 +1,7 @@
-# Especificación 04: Motor de Transferencias con MEGAcmd y Rclone
+# Especificación 04: Motor de Transferencias con MEGAcmd, Rclone y Seafile API
 
 ## 1. Contexto y Objetivos
-El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Coordina copias asíncronas entre MEGA y Google Drive: **MEGAcmd** opera las cuentas MEGA y **Rclone** opera Google Drive. Administra la cola, progreso, cancelaciones y reintentos.
+El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Coordina copias asíncronas entre proveedores: **MEGAcmd** opera MEGA, **Rclone** opera Google Drive y Seafile con `adapter_type=RCLONE`, y el adaptador HTTPX de Seafile opera únicamente las conexiones marcadas explícitamente `adapter_type=SEAFILE_API`. Administra la cola, progreso, cancelaciones y reintentos.
 
 ---
 
@@ -39,9 +39,11 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
    - **Cláusula `finally` garantizada:** El archivo se elimina de forma segura e inmediata al terminar, fallar o cancelarse el trabajo.
 - El directorio temporal se monta como `tmpfs`. Un bloqueo exclusivo del archivo evita ejecuciones concurrentes del mismo trabajo y permite que una redelivery reemplace y limpie un archivo huérfano dejado por una terminación abrupta.
 6. **Staging por archivo:** Las copias cruzadas descargan o copian un solo archivo a un directorio privado, disk-backed y temporal. El archivo y su directorio se eliminan en `finally` antes de procesar el siguiente; el staging no es volumen persistente ni `tmpfs`. Se comprueba espacio libre cuando se conoce el tamaño.
-7. **Conflictos en destino MEGA:** Antes de subir se consulta la ruta exacta; si ya existe, se omite y se suma una advertencia. Nunca se sobrescribe ni elimina el elemento remoto.
-8. **Fallos de limpieza:** No se silencian errores al borrar staging. Si no se puede limpiar un archivo temporal, el trabajo falla y no procesa el siguiente. El HOME de MEGAcmd se retira solo después de confirmar `mega-quit`; si no se logra detener el daemon, se conserva el HOME y se falla de forma saneada.
-9. **Listados completos:** Si la salida de `mega-ls` supera el límite de captura, el listado falla explícitamente; no se usa una lista parcial para navegar ni para declarar completa una transferencia.
+7. **Selección Seafile:** La conexión guarda `RCLONE` o `SEAFILE_API`. Un error de autenticación, lectura o escritura no provoca fallback ni reautenticación silenciosa con otro adaptador.
+8. **Integridad Seafile API:** Cada archivo subido mediante Seafile API se lee de vuelta en streaming y su SHA-256 se compara con el archivo local antes de incrementar el progreso completado. La verificación añade una lectura completa del destino.
+9. **Conflictos en destino MEGA:** Antes de subir se consulta la ruta exacta; si ya existe, se omite y se suma una advertencia. Nunca se sobrescribe ni elimina el elemento remoto.
+10. **Fallos de limpieza:** No se silencian errores al borrar staging. Si no se puede limpiar un archivo temporal, el trabajo falla y no procesa el siguiente. El HOME de MEGAcmd se retira solo después de confirmar `mega-quit`; si no se logra detener el daemon, se conserva el HOME y se falla de forma saneada.
+11. **Listados completos:** Si la salida de `mega-ls` supera el límite de captura, el listado falla explícitamente; no se usa una lista parcial para navegar ni para declarar completa una transferencia.
 
 ---
 
@@ -103,6 +105,7 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
   - Respuestas HTTP 429 (Rate Limit / Quota transitoria).
   - Respuestas HTTP 5xx temporales del proveedor.
 - Se aplican a los pasos de lectura/descarga y copia Drive de cada archivo MEGA↔Drive. MEGAcmd clasifica el fallo a partir de su salida internamente, pero no expone esa salida en errores ni logs.
+- Para Seafile API, los timeouts/desconexiones y HTTP 408, 429 o 5xx configurados como transitorios se reintentan dentro del límite global. Las cargas reanudan desde el offset reportado por Seafile; una subida API a destino solo se declara completada tras verificar su SHA-256 de lectura posterior. Errores de autenticación y otros 4xx no se reintentan como fallos transitorios.
 - **Excepción de seguridad para subir a MEGA:** Una vez invocado `mega-put`, cualquier resultado fallido es ambiguo: el servidor pudo haber recibido el archivo aunque el cliente informe error. El trabajo no reintenta esa subida, consulta el destino solo para diagnóstico y registra `MEGA_DESTINATION_STATE_UNCERTAIN`; el operador debe verificar el destino antes de reintentar manualmente. Esto evita crear duplicados y no elimina ningún objeto remoto.
 - **Errores No Reintentables (Fallo inmediato):**
   - Credenciales inválidas (`Authentication Failed`).
