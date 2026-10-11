@@ -1,0 +1,63 @@
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    app_env: str = "development"
+    app_secret_key: str = ""
+    app_secret_key_file: str | None = None
+    database_url: str | None = None
+    postgres_host: str = "postgres"
+    postgres_port: int = 5432
+    postgres_db: str = "cloud_transfer"
+    postgres_user: str = "cloud_transfer"
+    postgres_password_file: str | None = None
+    redis_url: str = "redis://redis:6379/0"
+    rclone_binary: str = "/usr/bin/rclone"
+    megacmd_binary_dir: str = "/usr/bin"
+    transfer_temp_path: str = "/var/lib/cloud-transfer/tmp"
+    transfer_staging_path: str = "/var/lib/cloud-transfer/staging"
+    transfer_max_retries: int = 5
+    transfer_max_concurrent: int = 2
+    app_base_url: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password_file: str | None = None
+    smtp_use_tls: bool = True
+    smtp_from_address: str = ""
+    session_cookie_secure: bool = True
+    session_max_age_seconds: int = 28800
+    master_encryption_key_file: str = "/run/ctm-secrets/master_key"
+
+    def session_secret(self) -> str:
+        if self.app_secret_key:
+            return self.app_secret_key
+        if self.app_secret_key_file:
+            return Path(self.app_secret_key_file).read_text(encoding="utf-8").strip()
+        return ""
+
+    def resolved_database_url(self) -> str:
+        if self.database_url:
+            return self.database_url
+        password = None
+        if self.postgres_password_file:
+            password = Path(self.postgres_password_file).read_text(encoding="utf-8").strip()
+        return URL.create(
+            "postgresql+asyncpg",
+            username=self.postgres_user,
+            password=password,
+            host=self.postgres_host,
+            port=self.postgres_port,
+            database=self.postgres_db,
+        ).render_as_string(hide_password=False)
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

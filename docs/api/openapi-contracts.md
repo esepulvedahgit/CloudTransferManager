@@ -6,6 +6,11 @@ Base URL: `/api/v1`
 
 ## 1. Autenticación (`/auth`)
 
+Todas las mutaciones requieren el encabezado `X-CSRF-Token`. Obtenerlo con `GET /api/v1/auth/csrf`; la sesión se mantiene en una cookie HttpOnly.
+
+### `GET /api/v1/auth/csrf`
+- **Response `200 OK`:** Devuelve `csrf_token` y establece la cookie `ctm_csrf`.
+
 ### `POST /api/v1/auth/login`
 - **Request Body:**
 ```json
@@ -36,6 +41,10 @@ Base URL: `/api/v1`
 ### `GET /api/v1/auth/me`
 - **Response `200 OK`:** Devuelve datos del usuario autenticado.
 
+### `POST /api/v1/auth/password`
+- **Request Body:** `{ "current_password": "...", "new_password": "..." }` (mínimo 12 caracteres).
+- **Response `200 OK`:** `{ "message": "Contraseña actualizada" }`.
+
 ---
 
 ## 2. Usuarios (`/users`) [Solo ADMIN]
@@ -55,12 +64,29 @@ Base URL: `/api/v1`
 }
 ```
 
+### `PATCH /api/v1/users/{user_id}`
+- Actualiza `username`, `email`, `role` o `is_active`; admite uno o varios campos.
+- No permite desactivar ni degradar al último administrador activo.
+
+### `POST /api/v1/users/{user_id}/password-reset`
+- **Request Body:** `{ "password": "..." }`.
+- Restablece la contraseña y obliga al usuario a cambiarla en el siguiente inicio de sesión.
+
 ### `POST /api/v1/users/{user_id}/deactivate`
 - **Response `200 OK`:** Revoca sesiones activas e inhabilita usuario.
 
 ---
 
 ## 3. Conexiones (`/connections`)
+
+`GET /api/v1/connections` devuelve únicamente las conexiones globales o asignadas al usuario. Los campos de credenciales nunca forman parte de las respuestas.
+Las conexiones MEGA y Google Drive nuevas quedan `INACTIVE` hasta superar la prueba; las simuladas quedan activas. Un administrador puede ejecutar la prueba desde el explorador o mediante el endpoint siguiente.
+
+### `DELETE /api/v1/connections/{connection_id}` [Solo ADMIN]
+- Requiere CSRF y archiva la conexión de forma lógica; no elimina la fila ni las referencias de transferencias históricas.
+- Antes de responder `204 No Content`, borra las credenciales cifradas y revoca los permisos privados. No realiza operaciones en el proveedor.
+- **Errores:** `403 Forbidden` sin rol ADMIN o token CSRF válido; `404 Not Found` si el UUID no existe o ya está archivado; `409 Conflict` si una transferencia asociada está `QUEUED`, `VALIDATING`, `RUNNING`, `RETRYING` o `CANCELLING`.
+- Las conexiones archivadas no aparecen en listados y no admiten navegación, pruebas, OAuth, cambios, permisos ni transferencias nuevas.
 
 ### `POST /api/v1/connections`
 - **Request Body (MEGA):**
@@ -82,10 +108,18 @@ Base URL: `/api/v1`
   "credentials": {
     "client_id": "...",
     "client_secret": "...",
-    "refresh_token": "..."
+    "team_drive": "..."
   }
 }
 ```
+Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `team_drive`/`root_folder_id` opcionales); la conexión queda inactiva mientras se completa OAuth.
+
+### `POST /api/v1/connections/{connection_id}/google-oauth/start` [Solo ADMIN]
+- **Response `200 OK`:** `{ "authorization_url": "https://accounts.google.com/..." }`. El estado anti-CSRF queda vinculado a la sesión del administrador; el navegador no recibe el secreto del cliente ni tokens.
+- Google debe tener registrada como URI de redirección `${APP_BASE_URL}/api/v1/connections/google-oauth/callback`.
+
+### `GET /api/v1/connections/google-oauth/callback`
+- Intercambia el código OAuth en el servidor, cifra los tokens y redirige a la interfaz. La conexión sigue inactiva hasta una prueba exitosa.
 
 ### `POST /api/v1/connections/{connection_id}/test`
 - **Response `200 OK`:**
@@ -97,6 +131,18 @@ Base URL: `/api/v1`
   "quota_used_bytes": 5368709120
 }
 ```
+
+### `PATCH /api/v1/connections/{connection_id}` [Solo ADMIN]
+- Permite actualizar `name`, `is_global` y/o `credentials` sin devolver secretos.
+
+### `POST /api/v1/connections/{connection_id}/deactivate` [Solo ADMIN]
+- Desactiva la conexión y bloquea nuevas navegaciones y transferencias.
+
+### `POST /api/v1/connections/{connection_id}/users/{user_id}` [Solo ADMIN]
+- Otorga acceso privado a una conexión.
+
+### `DELETE /api/v1/connections/{connection_id}/users/{user_id}` [Solo ADMIN]
+- Revoca ese acceso (respuesta `204 No Content`).
 
 ---
 
@@ -162,5 +208,19 @@ Base URL: `/api/v1`
 ### `GET /api/v1/transfers/{transfer_id}/stream`
 - **Response `200 OK`:** `Content-Type: text/event-stream` emitiendo telemetría en tiempo real.
 
+### `GET /api/v1/transfers`
+- Devuelve historial paginado con `offset` y `page_size`; ADMIN ve todas las transferencias y USER solo las propias.
+
+### `GET /api/v1/transfers/{transfer_id}`
+- Devuelve el estado y métricas actuales de la transferencia visible para el usuario.
+
+### `GET /api/v1/transfers/{transfer_id}/events`
+- Devuelve eventos auditables con categorías de error y detalles técnicos sanitizados; solo el solicitante o ADMIN puede consultarlos.
+
 ### `POST /api/v1/transfers/{transfer_id}/cancel`
 - **Response `200 OK`:** Envía orden de cancelación inmediata al worker.
+
+## 6. Auditoría (`/audit-events`) [Solo ADMIN]
+
+### `GET /api/v1/audit-events?limit=100`
+- Devuelve los eventos de auditoría más recientes, con secretos sanitizados.

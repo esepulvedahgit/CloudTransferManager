@@ -75,14 +75,18 @@ class StorageProvider(ABC):
 
 ## 3. Implementaciones Iniciales del MVP
 
-### A. Adaptador MEGA (`RcloneMegaProvider`)
-- **Parámetros requeridos:** Correo de la cuenta (`username`) y contraseña (`password`).
-- **Particularidades técnicas:**
-  - Rclone requiere que la cuenta de MEGA haya realizado un login inicial normal para derivar las llaves maestras de cifrado simétrico de MEGA.
-  - MEGA no garantiza hashes MD5 ni fechas de modificación en todas las llamadas; los modelos deben tratar `modified_at` y `hash` como opcionales (`None`).
-  - Comando de prueba interno: `rclone about <temp_remote>: --config <temp_file>` o `rclone lsf <temp_remote>: --max-depth 1`.
+### A. Adaptador MEGA (`MegaCmdProvider`)
+- **Parámetros requeridos:** Correo de la cuenta (`username`) y contraseña (`password`), cifrados en la base de datos.
+- **Motor:** El binario oficial MEGAcmd gestiona la sesión, exploración, cuota, descargas y subidas de MEGA; Rclone no se usa como backend MEGA.
+- **Seguridad y ciclo de vida:** El login se envía a `mega-cmd` por stdin (nunca como argumento del proceso). Cada sesión usa un `HOME` privado y efímero, ejecuta logout/quit y elimina su caché al cerrarse.
+- **Límites de espera:** Login: 30 s; listado/cuota: 10 s; logout/quit: 3 s por cliente, con cierre acotado a 5 s por paso. Las tuberías heredadas por el daemon no pueden dejar el cliente esperando indefinidamente. Un logout agotado no impide intentar quit; si quit falla, se conserva el HOME y se informa el fallo. Las descargas/subidas no tienen este límite de metadatos.
+- **Comandos permitidos:** `mega-ls`, `mega-df`, `mega-get`, `mega-put -c`, `mega-logout` y `mega-quit`; no se invocan comandos remotos destructivos.
+- MEGA no garantiza hashes ni fechas de modificación en todas las respuestas; los metadatos opcionales permanecen como `None` cuando no están disponibles.
+- El parser de `mega-ls -l` excluye los encabezados de columnas (`FLAGS ... NAME`) y los títulos de directorio con ruta absoluta antes de crear elementos, paginar o contar archivos. Un archivo real llamado `NAME` se conserva.
+- Las transferencias con MEGA se realizan por archivo individual mediante staging local temporal, que se elimina antes de procesar el siguiente archivo.
 
 ### B. Adaptador Google Drive (`RcloneGoogleDriveProvider`)
+- **Motor:** Rclone CLI aislado, exclusivamente para Google Drive.
 - **Flujo de Autorización:** OAuth 2.0 (Client ID, Client Secret, Refresh Token y Access Token).
 - **Soporte de Unidades:**
   - Mi Unidad (`root`).
@@ -132,6 +136,7 @@ CREATE TABLE storage_connections (
     name VARCHAR(128) NOT NULL,
     provider_type VARCHAR(32) NOT NULL CHECK (provider_type IN ('MEGA', 'GOOGLE_DRIVE', 'S3', 'WASABI', 'MEGA_S4')),
     status VARCHAR(16) NOT NULL DEFAULT 'INACTIVE' CHECK (status IN ('ACTIVE', 'INACTIVE', 'ERROR')),
+    deleted_at TIMESTAMP WITH TIME ZONE NULL,
     encrypted_credentials BYTEA NOT NULL,
     credential_version INTEGER NOT NULL DEFAULT 1,
     root_path VARCHAR(512) NULL,
@@ -156,6 +161,12 @@ CREATE TABLE connection_permissions (
 );
 ```
 
+### Archivado lógico de conexiones
+
+`DELETE /api/v1/connections/{connection_id}` archiva una conexión sin borrar su fila: las transferencias históricas conservan sus referencias y eventos. Solo `ADMIN` puede realizar la operación y el endpoint requiere CSRF. El archivado borra `encrypted_credentials` y revoca todos los permisos privados; no llama al proveedor ni modifica archivos remotos. No existe restauración: para volver a usar el proveedor se debe crear y autenticar una conexión nueva.
+
+La operación devuelve `204 No Content` al completarse, `404 Not Found` para UUID inexistentes o ya archivados y `409 Conflict` cuando haya una transferencia asociada en `QUEUED`, `VALIDATING`, `RUNNING`, `RETRYING` o `CANCELLING`. La creación de transferencias y el archivado bloquean las filas de conexión en orden determinista para que una conexión archivada no reciba trabajos nuevos. Las conexiones archivadas se excluyen de listados y de navegación, prueba, OAuth, edición, asignación de permisos y nuevas transferencias.
+
 ---
 
 ## 6. Estrategia de Pruebas (TDD)
@@ -166,3 +177,5 @@ CREATE TABLE connection_permissions (
   - `test_mock_storage_provider_navigation`: El proveedor mock permite navegar niveles jerárquicos.
 - **Integración:**
   - `test_test_connection_endpoint`: Endpoint `/api/v1/connections/{id}/test` ejecuta y actualiza `last_tested_at`.
+  - `test_archive_connection_preserves_transfer_history`: Archivar una conexión inactiva borra ciphertext y permisos, sin eliminar transferencias o eventos.
+  - `test_archive_connection_rejects_active_transfers`: Una transferencia en cualquiera de los estados activos bloquea el archivado con `409`.

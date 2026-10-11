@@ -1,0 +1,173 @@
+services:
+  reverse-proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:${HTTP_PORT:-8080}:80"
+      - "0.0.0.0:${HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./infrastructure/nginx/reverse-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+      - ctm_proxy_edge
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 20s
+      timeout: 3s
+      retries: 3
+    networks:
+      - ctm_internal
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --loop asyncio --no-access-log"]
+    env_file:
+      - .env
+    environment:
+      APP_SECRET_KEY_FILE: /run/ctm-secrets/app_secret_key
+      POSTGRES_PASSWORD_FILE: /run/ctm-secrets/postgres_password
+      MASTER_ENCRYPTION_KEY_FILE: /run/ctm-secrets/master_key
+      SMTP_PASSWORD_FILE: /run/ctm-secrets/smtp_password
+      MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
+      TRANSFER_STAGING_PATH: ${TRANSFER_STAGING_PATH:-/var/lib/cloud-transfer/staging}
+    secrets:
+      - app_secret_key
+      - postgres_password
+      - master_key
+      - smtp_password
+    expose:
+      - "8000"
+    volumes:
+      - application_logs:/var/log/cloud-transfer
+    tmpfs:
+      - /run/ctm-secrets:mode=0700,size=1m
+      - /var/lib/cloud-transfer/tmp:mode=0700,size=64m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ctm_internal
+      - provider_egress
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=${TRANSFER_MAX_CONCURRENT:-2}",
+        "--queues=transfers",
+      ]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/ctm-secrets/postgres_password
+      MASTER_ENCRYPTION_KEY_FILE: /run/ctm-secrets/master_key
+      SMTP_PASSWORD_FILE: /run/ctm-secrets/smtp_password
+      MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
+      TRANSFER_STAGING_PATH: ${TRANSFER_STAGING_PATH:-/var/lib/cloud-transfer/staging}
+    secrets:
+      - postgres_password
+      - master_key
+      - smtp_password
+    volumes:
+      - application_logs:/var/log/cloud-transfer
+    tmpfs:
+      - /run/ctm-secrets:mode=0700,size=1m
+      - /var/lib/cloud-transfer/tmp:mode=0700,size=64m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+      - provider_egress
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cloud_transfer
+      POSTGRES_USER: cloud_transfer
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloud_transfer -d cloud_transfer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ctm_internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ctm_internal
+
+volumes:
+  postgres_data:
+  redis_data:
+  application_logs:
+
+networks:
+  ctm_internal:
+    driver: bridge
+    internal: true
+  ctm_proxy_edge:
+    driver: bridge
+  provider_egress:
+    driver: bridge
+
+secrets:
+  app_secret_key:
+    file: ./secrets/app_secret_key
+  postgres_password:
+    file: ./secrets/postgres_password
+  master_key:
+    file: ./secrets/master_key
+  smtp_password:
+    file: ./secrets/smtp_password

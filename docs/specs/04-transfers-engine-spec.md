@@ -1,14 +1,15 @@
-# Especificación 04: Motor de Transferencias y Ejecución Segura de Rclone
+# Especificación 04: Motor de Transferencias con MEGAcmd y Rclone
 
 ## 1. Contexto y Objetivos
-El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Coordina la ejecución asíncrona de transferencias entre proveedores mediante **Rclone**, administrando la cola de trabajos, monitorizando el progreso en tiempo real, gestionando cancelaciones y aplicando reintentos automáticos para errores transitorios.
+El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Coordina copias asíncronas entre MEGA y Google Drive: **MEGAcmd** opera las cuentas MEGA y **Rclone** opera Google Drive. Administra la cola, progreso, cancelaciones y reintentos.
 
 ---
 
-## 2. Invocación Segura de Rclone (Invariante Crítico)
+## 2. Invocación Segura de los motores (Invariante Crítico)
 
 ### Reglas Obligatorias:
-1. **Prohibición Total de Shell:** Rclone **NUNCA** debe ejecutarse con `shell=True`. Se invoca estrictamente pasando una lista de argumentos (`list[str]`):
+1. **Prohibición Total de Shell:** Rclone y MEGAcmd **NUNCA** se ejecutan mediante shell; ambos reciben argumentos separados. El login MEGA se envía por stdin a `mega-cmd`, sin contraseña en argv.
+2. **Lista Blanca de Rclone:** Rclone se invoca solo con:
    ```python
    # Correcto:
    proc = await asyncio.create_subprocess_exec(
@@ -24,18 +25,23 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
        stderr=asyncio.subprocess.PIPE
    )
    ```
-2. **Lista Blanca de Comandos Permitidos:**
    - `copy`: Operación de copiado de archivos.
    - `lsjson`: Listado detallado de elementos en JSON.
    - `about`: Consulta de cuota y espacio.
    - `size`: Cálculo de tamaño total y cantidad de archivos.
-3. **Comandos Estrictamente Prohibidos (Blacklist Activa):**
+3. **Lista Blanca de MEGAcmd:** Solo `mega-ls`, `mega-df`, `mega-get`, `mega-put -c`, `mega-logout` y `mega-quit`.
+4. **Comandos Estrictamente Prohibidos:**
    - `delete`, `purge`, `sync`, `move`, `moveto`, `rmdir`, `dedupe`, `serve`, `mount`, `config dump`.
-4. **Archivo de Configuración Temporal Efímero:**
-   - Para cada trabajo, el worker genera un archivo de configuración temporal en `/var/lib/cloud-transfer/tmp/{job_id}.rclone.conf`.
+5. **Archivo de Configuración Temporal Efímero para Rclone:**
+- Para cada trabajo, el worker genera un archivo de configuración temporal en `/var/lib/cloud-transfer/tmp/{job_id}.rclone.conf`.
    - Permisos estrictos: `0600` (solo legible por el usuario del worker).
-   - Contiene únicamente las secciones temporales de los dos remotos involucrados.
+- Contiene únicamente las secciones temporales de los remotos Rclone involucrados (uno para una transferencia MEGA↔Drive, dos para Drive↔Drive).
    - **Cláusula `finally` garantizada:** El archivo se elimina de forma segura e inmediata al terminar, fallar o cancelarse el trabajo.
+- El directorio temporal se monta como `tmpfs`. Un bloqueo exclusivo del archivo evita ejecuciones concurrentes del mismo trabajo y permite que una redelivery reemplace y limpie un archivo huérfano dejado por una terminación abrupta.
+6. **Staging por archivo:** Las copias cruzadas descargan o copian un solo archivo a un directorio privado, disk-backed y temporal. El archivo y su directorio se eliminan en `finally` antes de procesar el siguiente; el staging no es volumen persistente ni `tmpfs`. Se comprueba espacio libre cuando se conoce el tamaño.
+7. **Conflictos en destino MEGA:** Antes de subir se consulta la ruta exacta; si ya existe, se omite y se suma una advertencia. Nunca se sobrescribe ni elimina el elemento remoto.
+8. **Fallos de limpieza:** No se silencian errores al borrar staging. Si no se puede limpiar un archivo temporal, el trabajo falla y no procesa el siguiente. El HOME de MEGAcmd se retira solo después de confirmar `mega-quit`; si no se logra detener el daemon, se conserva el HOME y se falla de forma saneada.
+9. **Listados completos:** Si la salida de `mega-ls` supera el límite de captura, el listado falla explícitamente; no se usa una lista parcial para navegar ni para declarar completa una transferencia.
 
 ---
 
@@ -72,7 +78,7 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
 ### Estados y Semántica:
 - `QUEUED`: En cola esperando worker disponible.
 - `VALIDATING`: Verificando existencia de origen y permisos de destino.
-- `RUNNING`: Proceso Rclone activo transfiriendo datos.
+- `RUNNING`: Proceso MEGAcmd o Rclone activo transfiriendo datos.
 - `CANCELLING`: Solicitud de cancelación recibida; enviando SIGTERM/SIGKILL al subproceso.
 - `CANCELLED`: Trabajo cancelado por el usuario; subproceso terminado y recursos liberados.
 - `COMPLETED`: Todos los elementos copiados con éxito.
@@ -96,6 +102,8 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
   - Timeouts de red y desconexiones de socket.
   - Respuestas HTTP 429 (Rate Limit / Quota transitoria).
   - Respuestas HTTP 5xx temporales del proveedor.
+- Se aplican a los pasos de lectura/descarga y copia Drive de cada archivo MEGA↔Drive. MEGAcmd clasifica el fallo a partir de su salida internamente, pero no expone esa salida en errores ni logs.
+- **Excepción de seguridad para subir a MEGA:** Una vez invocado `mega-put`, cualquier resultado fallido es ambiguo: el servidor pudo haber recibido el archivo aunque el cliente informe error. El trabajo no reintenta esa subida, consulta el destino solo para diagnóstico y registra `MEGA_DESTINATION_STATE_UNCERTAIN`; el operador debe verificar el destino antes de reintentar manualmente. Esto evita crear duplicados y no elimina ningún objeto remoto.
 - **Errores No Reintentables (Fallo inmediato):**
   - Credenciales inválidas (`Authentication Failed`).
   - Permisos insuficientes permanentes (`Permission Denied`).

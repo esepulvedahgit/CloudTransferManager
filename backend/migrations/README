@@ -1,0 +1,1 @@
+Place Alembic revisions in this directory. Database credentials are read from mounted Docker Secrets.
