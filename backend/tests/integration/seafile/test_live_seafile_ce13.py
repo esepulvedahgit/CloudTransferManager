@@ -20,6 +20,16 @@ _CLEANUP_CONFIRMATION = "DELETE_CTM_COMPATIBILITY_PREFIX_ONLY"
 _ROOT_PATTERN = re.compile(r"^/ctm-compat-[0-9a-f]{32}$")
 
 
+def _remote_file_path(root: str, directory: str, source_file_name: str) -> str:
+    return f"{root.rstrip('/')}/{directory.strip('/')}/{source_file_name}"
+
+
+def test_live_rclone_path_uses_uploaded_source_filename() -> None:
+    assert _remote_file_path("/compat", "rclone", "origen Rclone.bin") == (
+        "/compat/rclone/origen Rclone.bin"
+    )
+
+
 def _required_environment(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -111,7 +121,7 @@ async def test_live_seafile_ce_13_api_and_rclone_round_trip(tmp_path: Path) -> N
     rclone_source = staging / "origen Rclone.bin"
     rclone_source.write_bytes(bytes(reversed(range(256))) * 8193)
     rclone_digest = hashlib.sha256(rclone_source.read_bytes()).hexdigest()
-    rclone_remote_path = f"{root}/rclone/rclone archivo.bin"
+    rclone_remote_path = _remote_file_path(root, "rclone", rclone_source.name)
     empty_source = staging / "vacío 0 bytes.txt"
     empty_source.touch()
 

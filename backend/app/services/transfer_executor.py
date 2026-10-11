@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import random
+import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
@@ -546,6 +547,8 @@ class TransferExecutor:
                 completed = False
                 already_identical = False
                 size_added_for_file = False
+                staged_file_size = 0
+                mega_upload_started = False
                 for attempt in range(1, self.settings.transfer_max_retries + 2):
                     if await self.should_cancel():
                         await self._cancel(record)
@@ -667,6 +670,25 @@ class TransferExecutor:
                                 local_file = staging_area / item.name
 
                             file_size = local_file.stat().st_size
+                            staged_file_size = file_size
+                            if (
+                                self._uses_seafile_api(source_connection)
+                                and item.size_bytes is not None
+                                and file_size != item.size_bytes
+                            ):
+                                await self._fail(
+                                    record,
+                                    error_code="SOURCE_SIZE_MISMATCH",
+                                    message=(
+                                        "El tamaño descargado no coincide con los metadatos "
+                                        "del archivo de origen."
+                                    ),
+                                    technical_details={
+                                        "expected_bytes": item.size_bytes,
+                                        "downloaded_bytes": file_size,
+                                    },
+                                )
+                                return
                             source_digest = await _sha256_file(local_file, self.should_cancel)
                             if item.size_bytes is None and not size_added_for_file:
                                 remaining_known_size = sum(
@@ -691,15 +713,15 @@ class TransferExecutor:
                                         completed = True
                                         already_identical = True
                                         break
-                                await destination.upload_file(
+                                stored_path = await destination.upload_file(
                                     local_file,
                                     destination_file,
-                                    replace=True,
+                                    replace=record.conflict_policy != "SKIP",
                                     should_cancel=self.should_cancel,
                                     progress_callback=on_api_progress,
                                 )
                                 destination_digest = await destination.sha256(
-                                    destination_file,
+                                    stored_path,
                                     should_cancel=self.should_cancel,
                                 )
                                 if destination_digest != source_digest:
@@ -712,8 +734,26 @@ class TransferExecutor:
                                         technical_details={"path": relative.as_posix()},
                                     )
                                     return
+                                stored_nfc = unicodedata.normalize("NFC", stored_path)
+                                requested_nfc = unicodedata.normalize("NFC", destination_file)
+                                if stored_nfc != requested_nfc:
+                                    await self._fail(
+                                        record,
+                                        error_code="SEAFILE_DESTINATION_NAME_CONFLICT",
+                                        message=(
+                                            "Seafile guardó el archivo con otro nombre por un "
+                                            "conflicto concurrente. Revise el destino antes "
+                                            "de reintentar."
+                                        ),
+                                        technical_details={
+                                            "requested_path": destination_file,
+                                            "stored_path": stored_path,
+                                        },
+                                    )
+                                    return
                             elif destination_is_mega:
                                 assert mega_session is not None
+                                mega_upload_started = True
                                 await mega_session.upload_file(
                                     local_file,
                                     destination_folder,
@@ -740,6 +780,30 @@ class TransferExecutor:
                         MegaCmdTimeoutError,
                         SeafileApiError,
                     ) as exc:
+                        if mega_upload_started:
+                            destination_visible: bool | None = None
+                            try:
+                                assert mega_session is not None
+                                destination_visible = (
+                                    await mega_session.get_item(destination_file) is not None
+                                )
+                            except Exception:
+                                pass
+                            await self._fail(
+                                record,
+                                error_code="MEGA_DESTINATION_STATE_UNCERTAIN",
+                                message=(
+                                    "No se reintentó la subida: MEGA puede haber recibido "
+                                    "el archivo aunque el cliente informara un fallo. "
+                                    "Revise el destino antes de reintentar."
+                                ),
+                                technical_details={
+                                    "attempt": attempt,
+                                    "retryable": self._is_retryable_transfer_error(exc),
+                                    "destination_visible": destination_visible,
+                                },
+                            )
+                            return
                         retryable = self._is_retryable_transfer_error(exc)
                         if not retryable or attempt > self.settings.transfer_max_retries:
                             code = (
@@ -787,7 +851,7 @@ class TransferExecutor:
                     await self._fail(record)
                     return
                 actual_size = (
-                    item.size_bytes if item.size_bytes is not None else local_file.stat().st_size
+                    item.size_bytes if item.size_bytes is not None else staged_file_size
                 )
                 if not already_identical:
                     record.bytes_transferred = max(

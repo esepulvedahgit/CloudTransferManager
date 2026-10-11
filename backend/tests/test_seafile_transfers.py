@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 
 from app.providers.base import PaginatedItems, StorageItem
 from app.providers.seafile_api import SeafileApiCancelledError, SeafileApiError
+from app.services.megacmd import MegaCmdCommandError
 from app.services.memory_store import MemoryStore
 from app.services.transfer_executor import TransferExecutor
 from app.settings import Settings
@@ -42,6 +44,11 @@ class FakeStorage:
         self.cancel_after_download = False
         self.downloaded: list[str] = []
         self.open_count = 0
+        self.upload_calls: list[tuple[str, bool]] = []
+        self.race_on_upload = False
+        self.fail_mega_upload_after_write = False
+        self.mega_upload_attempts = 0
+        self.normalize_names_on_upload = False
 
     async def get_item(self, path: str):
         return self.items.get(path)
@@ -92,16 +99,32 @@ class FakeStorage:
             raise SeafileApiCancelledError("cancelled")
         return target
 
-    async def upload_file(self, local_file: Path, remote_path: str, **_kwargs):
+    async def upload_file(self, local_file: Path, remote_path: str, **kwargs):
         self.upload_attempts += 1
+        replace = kwargs.get("replace", True)
+        self.upload_calls.append((remote_path, replace))
         if self.fail_upload_once and self.upload_attempts == 1:
             partial = local_file.read_bytes()[:3]
             self.data[remote_path] = partial
             self.items[remote_path] = _item(remote_path, data=partial, provider=self.provider_type)
             raise SeafileApiError(503)
+        actual_path = remote_path
+        if self.normalize_names_on_upload:
+            actual_path = unicodedata.normalize("NFC", actual_path)
+        if self.race_on_upload and not replace:
+            self.race_on_upload = False
+            self.data[remote_path] = b"concurrent writer"
+            self.items[remote_path] = _item(
+                remote_path, data=b"concurrent writer", provider=self.provider_type
+            )
+            parent, separator, name = remote_path.rpartition("/")
+            stem, dot, suffix = name.rpartition(".")
+            unique_name = f"{stem} (1).{suffix}" if dot else f"{name} (1)"
+            actual_path = f"{parent}{separator}{unique_name}"
         data = local_file.read_bytes()
-        self.data[remote_path] = data
-        self.items[remote_path] = _item(remote_path, data=data, provider=self.provider_type)
+        self.data[actual_path] = data
+        self.items[actual_path] = _item(actual_path, data=data, provider=self.provider_type)
+        return actual_path
 
     async def sha256(self, remote_path: str, **_kwargs):
         data = self.data[remote_path]
@@ -129,12 +152,15 @@ class FakeMegaSession:
         return target
 
     async def upload_file(self, local_file: Path, remote_folder: str, **_kwargs):
+        self.provider.mega_upload_attempts += 1
         remote_path = f"{remote_folder.rstrip('/')}/{local_file.name}"
         data = local_file.read_bytes()
         self.provider.data[remote_path] = data
         self.provider.items[remote_path] = _item(
             remote_path, data=data, provider=self.provider.provider_type
         )
+        if self.provider.fail_mega_upload_after_write:
+            raise MegaCmdCommandError(1, b"connection reset")
 
 
 class FakeRcloneRunner:
@@ -179,6 +205,7 @@ def _setup(
     destination_tree: dict[str, bytes | None] | None = None,
     source_paths: list[str] | None = None,
     destination_path: str = "/backup",
+    conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
 ):
     store = MemoryStore()
     requester = store.add_user("operator", "operator@example.test", "hash")
@@ -205,6 +232,7 @@ def _setup(
         destination_id,
         source_paths or ["/source"],
         destination_path,
+        conflict_policy,
     )
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'unused.sqlite'}",
@@ -313,6 +341,102 @@ async def test_api_retry_repeats_resumable_upload_without_fallback(tmp_path):
     assert destination.upload_attempts == 2
     assert runner.uploads == []
     assert transfer.error_count == 1
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_api_source_with_unknown_listing_size_keeps_staged_size_for_progress(tmp_path):
+    executor, transfer, providers, _runner, _snapshots, staging, _cancel, _store = _setup(
+        tmp_path
+    )
+    source = providers[transfer.source_connection_id]
+    source.items["/source"].size_bytes = None
+
+    await executor.execute(transfer.id)
+
+    assert transfer.status == "COMPLETED"
+    assert transfer.bytes_total == transfer.bytes_transferred == len(b"payload")
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_api_source_download_size_must_match_listing_before_copy(tmp_path):
+    executor, transfer, providers, runner, _snapshots, staging, _cancel, store = _setup(
+        tmp_path,
+        source_type="SEAFILE",
+        destination_type="GOOGLE_DRIVE",
+        source_adapter="SEAFILE_API",
+        destination_adapter="RCLONE",
+    )
+    providers[transfer.source_connection_id].items["/source"].size_bytes = 2
+
+    await executor.execute(transfer.id)
+
+    assert transfer.status == "FAILED"
+    assert runner.uploads == []
+    assert store.transfer_events[transfer.id][0]["provider_error_code"] == "SOURCE_SIZE_MISMATCH"
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_api_to_mega_upload_error_is_not_retried_after_upload_started(tmp_path):
+    executor, transfer, providers, _runner, _snapshots, staging, _cancel, store = _setup(
+        tmp_path,
+        source_type="SEAFILE",
+        destination_type="MEGA",
+        source_adapter="SEAFILE_API",
+        destination_adapter="RCLONE",
+    )
+    mega = providers[transfer.destination_connection_id]
+    mega.fail_mega_upload_after_write = True
+
+    await executor.execute(transfer.id)
+
+    assert transfer.status == "FAILED"
+    assert mega.mega_upload_attempts == 1
+    assert store.transfer_events[transfer.id][0]["provider_error_code"] == (
+        "MEGA_DESTINATION_STATE_UNCERTAIN"
+    )
+    assert "/backup/source" in mega.data
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_api_skip_race_does_not_overwrite_or_report_renamed_file_as_success(tmp_path):
+    executor, transfer, providers, _runner, _snapshots, staging, _cancel, store = _setup(
+        tmp_path,
+        conflict_policy="SKIP",
+    )
+    destination = providers[transfer.destination_connection_id]
+    destination.race_on_upload = True
+
+    await executor.execute(transfer.id)
+
+    assert transfer.status == "FAILED"
+    assert destination.upload_calls == [("/backup/source", False)]
+    assert destination.data["/backup/source"] == b"concurrent writer"
+    assert destination.data["/backup/source (1)"] == b"payload"
+    assert store.transfer_events[transfer.id][0]["provider_error_code"] == (
+        "SEAFILE_DESTINATION_NAME_CONFLICT"
+    )
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_api_destination_accepts_seafiles_unicode_nfc_name_normalization(tmp_path):
+    decomposed_name = unicodedata.normalize("NFD", "café.txt")
+    source_path = f"/source/{decomposed_name}"
+    executor, transfer, providers, _runner, _snapshots, staging, _cancel, _store = _setup(
+        tmp_path,
+        source_tree={"/source": None, source_path: b"unicode"},
+    )
+    destination = providers[transfer.destination_connection_id]
+    destination.normalize_names_on_upload = True
+
+    await executor.execute(transfer.id)
+
+    assert transfer.status == "COMPLETED"
+    assert destination.data["/backup/source/café.txt"] == b"unicode"
     assert list(staging.iterdir()) == []
 
 

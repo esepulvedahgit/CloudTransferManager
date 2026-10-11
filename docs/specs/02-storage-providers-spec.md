@@ -98,7 +98,10 @@ class StorageProvider(ABC):
 - `RCLONE` usa el backend nativo de Rclone `type = seafile`. `SEAFILE_API` solo se usa cuando un administrador lo selecciona al crear o editar la conexión.
 - Se autentica en el servidor mediante `/api2/auth-token/`; el token de cuenta queda dentro del payload cifrado. El OTP se acepta únicamente en la solicitud de prueba de conexión, no se persiste ni se devuelve.
 - La API directa usa endpoints de bibliotecas, directorios, metadatos, enlaces de descarga y carga fragmentada. Los enlaces devueltos por Seafile deben permanecer en el mismo host configurado.
+- El fileserver de Seafile normaliza nombres a NFC. En cargas con `Content-Range` interpreta `filename*` mediante MIME y luego `QueryUnescape`; para cargas multipart sin rango toma el nombre de la parte `file`. El adaptador debe conservar ambos formatos y devolver la ruta que el servidor confirme en la respuesta `ret-json`.
+- `replace=false` evita sobrescribir un nombre que aparezca durante la carga, pero Seafile puede guardar el nuevo archivo con un nombre único. Si la ruta confirmada difiere de la solicitada (salvo equivalencia NFC), la transferencia falla con `SEAFILE_DESTINATION_NAME_CONFLICT` y expone ambas rutas en el detalle técnico.
 - El adaptador API está implementado para operaciones de navegación y copia; los flujos que lo usan descargan o suben un archivo a la vez mediante staging privado. No añade operaciones de eliminación, movimiento o sincronización.
+- Los fallos HTTP y de streaming se sanitizan; redirecciones HTTP no se aceptan como contenido de archivo. Cuando el listado informa el tamaño de un archivo API de origen, el worker exige que la descarga tenga ese tamaño antes de copiarla.
 - Toda subida a Seafile API se vuelve a leer y se compara con SHA-256 del origen antes de contar el archivo como completado. En transferencias grandes esto añade una lectura de red del contenido subido.
 - La compatibilidad de lanzamiento se limita inicialmente a Seafile Community Edition 13.x. Otras versiones y Professional no se consideran comprobadas por defecto; se debe ejecutar el test optativo contra la instancia de destino antes de habilitarlas.
 

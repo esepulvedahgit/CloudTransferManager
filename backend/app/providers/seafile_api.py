@@ -122,7 +122,7 @@ class SeafileApiProvider(StorageProvider):
             )
         except httpx.HTTPError:
             raise SeafileApiError(None) from None
-        if response.status_code >= 400:
+        if not 200 <= response.status_code < 300:
             retry_after = _retry_after(response.headers.get("Retry-After"))
             raise SeafileApiError(response.status_code, retry_after)
         return response
@@ -397,24 +397,29 @@ class SeafileApiProvider(StorageProvider):
             library, repository_path, _full_path = await self._resolve_library(client, safe_path)
             await self._ensure_unlocked(client, library)
             download_url = await self._download_url(client, library, repository_path)
-            async with client.stream(
-                "GET", download_url, headers={"Authorization": f"Token {self.token}"}
-            ) as response:
-                self._raise_for_status(response)
-                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                transferred = 0
-                content_length = response.headers.get("Content-Length")
-                try:
-                    total = max(0, int(content_length)) if content_length is not None else None
-                except ValueError:
-                    total = None
-                with target.open("wb") as output:
-                    async for chunk in response.aiter_bytes(1024 * 1024):
-                        await _check_cancel(should_cancel)
-                        output.write(chunk)
-                        transferred += len(chunk)
-                        if progress_callback is not None:
-                            await progress_callback(transferred, total)
+            try:
+                async with client.stream(
+                    "GET", download_url, headers={"Authorization": f"Token {self.token}"}
+                ) as response:
+                    self._raise_for_status(response)
+                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    transferred = 0
+                    content_length = response.headers.get("Content-Length")
+                    try:
+                        total = max(0, int(content_length)) if content_length is not None else None
+                    except ValueError:
+                        total = None
+                    with target.open("wb") as output:
+                        async for chunk in response.aiter_bytes(1024 * 1024):
+                            await _check_cancel(should_cancel)
+                            output.write(chunk)
+                            transferred += len(chunk)
+                            if progress_callback is not None:
+                                await progress_callback(transferred, total)
+                    if total is not None and transferred != total:
+                        raise SeafileApiError(None, safe_message="Incomplete Seafile download")
+            except httpx.HTTPError:
+                raise SeafileApiError(None) from None
 
     async def sha256(
         self,
@@ -428,13 +433,25 @@ class SeafileApiProvider(StorageProvider):
             library, repository_path, _full_path = await self._resolve_library(client, safe_path)
             await self._ensure_unlocked(client, library)
             download_url = await self._download_url(client, library, repository_path)
-            async with client.stream(
-                "GET", download_url, headers={"Authorization": f"Token {self.token}"}
-            ) as response:
-                self._raise_for_status(response)
-                async for chunk in response.aiter_bytes(1024 * 1024):
-                    await _check_cancel(should_cancel)
-                    digest.update(chunk)
+            try:
+                async with client.stream(
+                    "GET", download_url, headers={"Authorization": f"Token {self.token}"}
+                ) as response:
+                    self._raise_for_status(response)
+                    transferred = 0
+                    content_length = response.headers.get("Content-Length")
+                    try:
+                        total = max(0, int(content_length)) if content_length is not None else None
+                    except ValueError:
+                        total = None
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        await _check_cancel(should_cancel)
+                        digest.update(chunk)
+                        transferred += len(chunk)
+                    if total is not None and transferred != total:
+                        raise SeafileApiError(None, safe_message="Incomplete Seafile download")
+            except httpx.HTTPError:
+                raise SeafileApiError(None) from None
         return digest.hexdigest()
 
     async def _download_url(
@@ -478,7 +495,7 @@ class SeafileApiProvider(StorageProvider):
         replace: bool = True,
         should_cancel: CancelCheck | None = None,
         progress_callback: ProgressCallback | None = None,
-    ) -> None:
+    ) -> str:
         safe_path = self._normalize_path(path)
         await _check_cancel(should_cancel)
         relative = PurePosixPath(safe_path)
@@ -526,14 +543,16 @@ class SeafileApiProvider(StorageProvider):
             query = f"{upload_parts.query}&ret-json=1" if upload_parts.query else "ret-json=1"
             upload_url = upload_parts._replace(query=query).geturl()
             fallback_name = _ascii_fallback(relative.name)
-            encoded_name = quote(relative.name, safe="")
+            # Seafile's fileserver MIME-decodes filename* and then QueryUnescapes it.
+            encoded_name = quote(quote(relative.name, safe=""), safe="")
             disposition = (
                 f"attachment; filename=\"{fallback_name}\"; filename*=UTF-8''{encoded_name}"
             )
+            last_response: httpx.Response | None = None
             with source.open("rb") as file_handle:
                 if size == 0:
                     await _check_cancel(should_cancel)
-                    await self._upload_chunk(
+                    last_response = await self._upload_chunk(
                         client,
                         upload_url,
                         file_handle.read(0),
@@ -553,7 +572,7 @@ class SeafileApiProvider(StorageProvider):
                         raise SeafileApiError(None)
                     end = offset + len(chunk) - 1
                     content_range = f"bytes {offset}-{end}/{size}"
-                    await self._upload_chunk(
+                    last_response = await self._upload_chunk(
                         client,
                         upload_url,
                         chunk,
@@ -566,6 +585,13 @@ class SeafileApiProvider(StorageProvider):
                     offset = end + 1
                     if progress_callback is not None:
                         await progress_callback(offset, size)
+            actual_name = (
+                relative.name
+                if last_response is None
+                else self._uploaded_name(last_response)
+            )
+            parent = safe_path.rsplit("/", 1)[0] or "/"
+            return self._normalize_path(f"{parent.rstrip('/')}/{actual_name}")
 
     async def _upload_chunk(
         self,
@@ -577,22 +603,36 @@ class SeafileApiProvider(StorageProvider):
         content_disposition: str,
         replace: bool,
         content_range: str | None,
-    ) -> None:
+    ) -> httpx.Response:
         headers = {"Content-Disposition": content_disposition}
         if content_range:
             headers["Content-Range"] = content_range
-        await self._request(
+        return await self._request(
             client,
             "POST",
             "",
             absolute_url=upload_url,
             data={"parent_dir": parent_dir, "replace": "1" if replace else "0"},
-            files={"file": (_ascii_fallback(file_name), chunk, "application/octet-stream")},
+            files={"file": (file_name, chunk, "application/octet-stream")},
             headers=headers,
         )
 
+    @staticmethod
+    def _uploaded_name(response: httpx.Response) -> str:
+        try:
+            payload = response.json()
+        except ValueError:
+            raise SeafileApiError(502, safe_message="Invalid Seafile upload response") from None
+        if not isinstance(payload, list) or len(payload) != 1:
+            raise SeafileApiError(502, safe_message="Invalid Seafile upload response")
+        result = payload[0]
+        actual_name = result.get("name") if isinstance(result, dict) else None
+        if not isinstance(actual_name, str) or not actual_name or "/" in actual_name:
+            raise SeafileApiError(502, safe_message="Invalid Seafile upload response")
+        return actual_name
+
     def _raise_for_status(self, response: httpx.Response) -> None:
-        if response.status_code >= 400:
+        if not 200 <= response.status_code < 300:
             raise SeafileApiError(
                 response.status_code, _retry_after(response.headers.get("Retry-After"))
             )

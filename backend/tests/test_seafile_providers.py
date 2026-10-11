@@ -1,7 +1,10 @@
 import hashlib
 import re
 import uuid
+from email.parser import BytesParser
+from email.policy import default
 from pathlib import Path
+from urllib.parse import unquote, unquote_plus
 
 import httpx
 import pytest
@@ -190,7 +193,18 @@ async def test_api_resumable_upload_starts_at_existing_offset_and_uses_bounded_c
             return httpx.Response(200, json={"uploadedBytes": 2})
         if request.url.path == "/upload-api/upload-token":
             upload_requests.append(request)
-            return httpx.Response(200, json={"success": True})
+            start, end, total = map(
+                int,
+                re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", request.headers["Content-Range"])
+                .groups(),
+            )
+            del start
+            if end + 1 < total:
+                return httpx.Response(200, json={"success": True})
+            return httpx.Response(
+                200,
+                json=[{"name": "résumé file.bin", "id": "object", "size": total}],
+            )
         return httpx.Response(404)
 
     provider = _provider(httpx.MockTransport(handler), library="Archive", chunk_size=64 * 1024)
@@ -214,7 +228,11 @@ async def test_api_resumable_upload_starts_at_existing_offset_and_uses_bounded_c
     ]
     assert b"a" * 64_000 in upload_requests[0].content
     disposition = upload_requests[0].headers["Content-Disposition"]
-    assert "filename*=" in disposition and "r%C3%A9sum%C3%A9%20file.bin" in disposition
+    encoded_filename = re.search(r"filename\*=UTF-8''([^;]+)", disposition)
+    assert encoded_filename is not None
+    assert unquote_plus(
+        unquote(encoded_filename.group(1), encoding="utf-8"), encoding="utf-8"
+    ) == "résumé file.bin"
     assert all(
         request.headers["Authorization"] == f"Token {ACCOUNT}" for request in upload_requests
     )
@@ -234,7 +252,9 @@ async def test_api_upload_supports_zero_byte_file_without_invalid_content_range(
         if request.url.path == f"/api/v2.1/repos/{REPOSITORY_ID}/file-uploaded-bytes/":
             return httpx.Response(200, json={"uploadedBytes": 0})
         if request.url.path == "/upload-api/upload-token":
-            return httpx.Response(200, json={"success": True})
+            return httpx.Response(
+                200, json=[{"name": "empty.bin", "id": "object", "size": 0}]
+            )
         return httpx.Response(404)
 
     provider = _provider(httpx.MockTransport(handler), library="Archive")
@@ -246,6 +266,174 @@ async def test_api_upload_supports_zero_byte_file_without_invalid_content_range(
     upload = next(request for request in requests if request.url.path == "/upload-api/upload-token")
     assert "Content-Range" not in upload.headers
     assert b"\r\n\r\n0\r\n" in upload.content
+
+
+@pytest.mark.asyncio
+async def test_api_upload_returns_actual_server_name_when_skip_race_uses_unique_name(
+    tmp_path: Path,
+):
+    upload_request: httpx.Request | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upload_request
+        if request.url.path == f"/api/v2.1/repos/{REPOSITORY_ID}/file-uploaded-bytes/":
+            return httpx.Response(200, json={"uploadedBytes": 0})
+        if request.url.path == f"/api2/repos/{REPOSITORY_ID}/upload-link/":
+            return httpx.Response(200, json=f"{BASE_URL}/upload-api/upload-token")
+        if request.url.path == "/upload-api/upload-token":
+            upload_request = request
+            return httpx.Response(
+                200,
+                json=[{"name": "raced (1).txt", "id": "object", "size": 7}],
+            )
+        return httpx.Response(404)
+
+    provider = _provider(httpx.MockTransport(handler), library="Archive")
+    source = tmp_path / "raced.txt"
+    source.write_bytes(b"payload")
+
+    actual_path = await provider.upload_file(source, "/raced.txt", replace=False)
+
+    assert actual_path == "/raced (1).txt"
+    assert upload_request is not None
+    assert b'name="replace"\r\n\r\n0\r\n' in upload_request.content
+
+
+@pytest.mark.asyncio
+async def test_api_request_rejects_redirect_status():
+    provider = _provider(
+        httpx.MockTransport(
+            lambda _request: httpx.Response(302, headers={"Location": f"{BASE_URL}/api2/repos/"})
+        ),
+        library="Archive",
+    )
+
+    with pytest.raises(SeafileApiError) as error:
+        await provider.list_items("/")
+
+    assert error.value.status_code == 302
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file_name", "contents"),
+    [
+        ("vacío 0 bytes.txt", b""),
+        ("a+b.txt", b"payload"),
+        ("literal %2F.txt", b"payload"),
+        ('café "foto".bin', b"payload"),
+    ],
+)
+async def test_api_upload_preserves_special_names_for_empty_and_chunked_files(
+    tmp_path: Path, file_name: str, contents: bytes
+):
+    upload_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/api2/repos/{REPOSITORY_ID}/dir/":
+            return httpx.Response(200, json=[])
+        if request.url.path == f"/api2/repos/{REPOSITORY_ID}/upload-link/":
+            return httpx.Response(200, json=f"{BASE_URL}/upload-api/upload-token")
+        if request.url.path == f"/api/v2.1/repos/{REPOSITORY_ID}/file-uploaded-bytes/":
+            return httpx.Response(200, json={"uploadedBytes": 0})
+        if request.url.path == "/upload-api/upload-token":
+            upload_requests.append(request)
+            return httpx.Response(
+                200,
+                json=[{"name": file_name, "id": "object", "size": len(contents)}],
+            )
+        return httpx.Response(404)
+
+    provider = _provider(
+        httpx.MockTransport(handler), library="Archive", chunk_size=64 * 1024
+    )
+    source = tmp_path / file_name
+    source.write_bytes(contents)
+
+    await provider.upload_file(source, f"/{file_name}", replace=True)
+
+    assert upload_requests
+    for request in upload_requests:
+        if "Content-Range" in request.headers:
+            raw_encoded_name = re.search(
+                r"filename\*=UTF-8''([^;]+)", request.headers["Content-Disposition"]
+            )
+            assert raw_encoded_name is not None
+            # The fileserver applies MIME decoding and then url.QueryUnescape.
+            mime_decoded = unquote(raw_encoded_name.group(1), encoding="utf-8")
+            assert unquote_plus(mime_decoded, encoding="utf-8") == file_name
+        else:
+            multipart = BytesParser(policy=default).parsebytes(
+                b"Content-Type: "
+                + request.headers["Content-Type"].encode("ascii")
+                + b"\r\nMIME-Version: 1.0\r\n\r\n"
+                + request.content
+            )
+            file_parts = [
+                part
+                for part in multipart.iter_parts()
+                if part.get_param("name", header="content-disposition") == "file"
+            ]
+            assert len(file_parts) == 1
+            assert file_parts[0].get_filename() == file_name
+
+
+@pytest.mark.asyncio
+async def test_api_download_rejects_redirect_instead_of_saving_redirect_body(tmp_path: Path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/api2/repos/{REPOSITORY_ID}/file/":
+            return httpx.Response(200, json=f"{BASE_URL}/seafhttp/redirect")
+        if request.url.path == "/seafhttp/redirect":
+            return httpx.Response(
+                302,
+                headers={"Location": f"{BASE_URL}/seafhttp/final"},
+                content=b"not the requested file",
+            )
+        if request.url.path == "/seafhttp/final":
+            return httpx.Response(200, content=b"real file")
+        return httpx.Response(404)
+
+    provider = _provider(httpx.MockTransport(handler), library="Archive")
+    target = tmp_path / "download.bin"
+
+    with pytest.raises(SeafileApiError) as error:
+        await provider.download_file("/report.txt", target)
+
+    assert error.value.status_code == 302
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["download", "sha256"])
+async def test_api_stream_network_failure_is_retryable_and_sanitized(
+    tmp_path: Path, operation: str
+):
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"partial"
+            raise httpx.ReadError("private network details")
+
+        async def aclose(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/api2/repos/{REPOSITORY_ID}/file/":
+            return httpx.Response(200, json=f"{BASE_URL}/seafhttp/broken")
+        if request.url.path == "/seafhttp/broken":
+            return httpx.Response(200, stream=BrokenStream())
+        return httpx.Response(404)
+
+    provider = _provider(httpx.MockTransport(handler), library="Archive")
+    target = tmp_path / "partial.bin"
+
+    with pytest.raises(SeafileApiError) as error:
+        if operation == "download":
+            await provider.download_file("/report.txt", target)
+        else:
+            await provider.sha256("/report.txt")
+
+    assert error.value.retryable is True
+    assert "private network details" not in str(error.value)
 
 
 @pytest.mark.asyncio
