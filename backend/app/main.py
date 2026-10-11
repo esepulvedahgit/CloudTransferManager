@@ -20,9 +20,15 @@ from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.sessions import SessionMiddleware
 
+from app.providers.base import ConnectionTestResult
 from app.providers.megacmd import MegaCmdProvider
 from app.providers.mock import MockStorageProvider
 from app.providers.rclone import RcloneGoogleDriveProvider
+from app.providers.seafile_auth import (
+    SeafileAuthClient,
+    SeafileAuthenticationError,
+    normalize_seafile_base_url,
+)
 from app.security.credentials import CredentialCipher
 from app.security.passwords import PasswordService
 from app.services.audit import AuditLogger
@@ -85,7 +91,8 @@ class PasswordReset(BaseModel):
 
 class ConnectionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    provider_type: str = Field(pattern="^(MOCK|MEGA|GOOGLE_DRIVE)$")
+    provider_type: str = Field(pattern="^(MOCK|MEGA|GOOGLE_DRIVE|SEAFILE)$")
+    adapter_type: str = Field(default="RCLONE", pattern="^(RCLONE|SEAFILE_API)$")
     credentials: dict[str, str] | None = None
     is_global: bool = True
 
@@ -93,7 +100,12 @@ class ConnectionCreate(BaseModel):
 class ConnectionUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     is_global: bool | None = None
+    adapter_type: str | None = Field(default=None, pattern="^(RCLONE|SEAFILE_API)$")
     credentials: dict[str, str] | None = None
+
+
+class ConnectionTestRequest(BaseModel):
+    otp: str | None = Field(default=None, min_length=1, max_length=32)
 
 
 _GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -245,10 +257,13 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 status_code=503, detail="No se pudieron cargar las credenciales"
             ) from exc
 
-    def provider_for(connection: ConnectionRecord) -> Any:
+    def provider_for(
+        connection: ConnectionRecord,
+        credentials_override: dict[str, Any] | None = None,
+    ) -> Any:
         if connection.provider_type == "MOCK":
             return MockStorageProvider()
-        credentials = credentials_for(connection)
+        credentials = credentials_override or credentials_for(connection)
         provider_type = connection.provider_type
         if provider_type == "MEGA":
             return MegaCmdProvider(
@@ -263,7 +278,42 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 credentials,
                 RcloneRunner(config.rclone_binary, config.transfer_temp_path),
             )
+        if provider_type == "SEAFILE":
+            runner = RcloneRunner(
+                config.rclone_binary,
+                config.transfer_temp_path,
+                config.transfer_staging_path,
+            )
+            if connection.adapter_type == "SEAFILE_API":
+                provider_class = globals().get("SeafileApiProvider")
+                if provider_class is None:
+                    from app.providers.seafile_api import SeafileApiProvider
+
+                    provider_class = SeafileApiProvider
+                return provider_class(connection.id, credentials)
+            provider_class = globals().get("SeafileRcloneProvider")
+            if provider_class is None:
+                from app.providers.seafile import SeafileRcloneProvider
+
+                provider_class = SeafileRcloneProvider
+            return provider_class(connection.id, credentials, runner)
         raise HTTPException(status_code=422, detail="Proveedor no soportado")
+
+    def validate_seafile_credentials(credentials: dict[str, str]) -> dict[str, str]:
+        allowed = {"url", "username", "password", "library", "library_password"}
+        if set(credentials) - allowed:
+            raise ValueError("Unsupported Seafile credential field")
+        normalized = dict(credentials)
+        for field_name in ("url", "username", "password"):
+            value = normalized.get(field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("Seafile URL, username, and password are required")
+            if any(character in value for character in "\r\n\x00"):
+                raise ValueError("Invalid Seafile credential value")
+        normalized["url"] = normalize_seafile_base_url(normalized["url"])
+        if config.app_env.lower() == "production" and not normalized["url"].startswith("https://"):
+            raise ValueError("Seafile connections in production require HTTPS")
+        return normalized
 
     def transfer_event(record: TransferRecord) -> dict[str, Any]:
         data = record.public_dict()
@@ -743,6 +793,10 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         del user_csrf
         encrypted_credentials = b""
         connection_id = uuid.uuid4()
+        if payload.provider_type != "SEAFILE" and payload.adapter_type != "RCLONE":
+            raise HTTPException(
+                status_code=422, detail="El adaptador API solo está disponible para Seafile"
+            )
         if payload.provider_type != "MOCK":
             if not payload.credentials:
                 raise HTTPException(status_code=422, detail="Se requieren credenciales")
@@ -750,6 +804,8 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 validation_credentials = dict(payload.credentials)
                 if payload.provider_type == "MEGA":
                     MegaCmdProvider.validate_credentials(validation_credentials)
+                elif payload.provider_type == "SEAFILE":
+                    validation_credentials = validate_seafile_credentials(validation_credentials)
                 else:
                     validation_credentials.setdefault("refresh_token", "oauth-pending")
                     RcloneGoogleDriveProvider(
@@ -771,6 +827,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             connection_id=connection_id,
             encrypted_credentials=encrypted_credentials,
             is_global=payload.is_global,
+            adapter_type=payload.adapter_type,
         )
         if connection.provider_type != "MOCK":
             connection.status = "INACTIVE"
@@ -782,7 +839,11 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             resource_type="connection",
             resource_id=str(connection.id),
             result="SUCCESS",
-            metadata={"provider_type": connection.provider_type, "is_global": connection.is_global},
+            metadata={
+                "provider_type": connection.provider_type,
+                "adapter_type": connection.adapter_type,
+                "is_global": connection.is_global,
+            },
         )
         return cast(dict[str, Any], connection.public_dict())
 
@@ -935,6 +996,16 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=404, detail="Conexión no encontrada")
         if not payload.model_fields_set:
             raise HTTPException(status_code=422, detail="No hay cambios para aplicar")
+        if payload.adapter_type is not None:
+            if connection.provider_type != "SEAFILE" and payload.adapter_type != "RCLONE":
+                raise HTTPException(
+                    status_code=422, detail="El adaptador API solo está disponible para Seafile"
+                )
+            if payload.adapter_type != connection.adapter_type:
+                connection.adapter_type = payload.adapter_type
+                connection.status = "INACTIVE"
+                connection.last_tested_at = None
+                connection.last_test_status = None
         if payload.name is not None:
             connection.name = payload.name.strip()
         if payload.is_global is not None:
@@ -947,6 +1018,8 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             try:
                 if connection.provider_type == "MEGA":
                     MegaCmdProvider.validate_credentials(payload.credentials)
+                elif connection.provider_type == "SEAFILE":
+                    payload.credentials = validate_seafile_credentials(payload.credentials)
                 else:
                     RcloneGoogleDriveProvider(
                         connection.id,
@@ -976,6 +1049,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             result="SUCCESS",
             metadata={
                 "credentials_updated": payload.credentials is not None,
+                "adapter_type": connection.adapter_type,
                 "is_global": connection.is_global,
             },
         )
@@ -1068,6 +1142,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
     async def test_connection(
         connection_id: uuid.UUID,
         request: Request,
+        payload: ConnectionTestRequest | None = None,
         user: UserAccount = Depends(admin_user),
         user_csrf: None = Depends(csrf_guard),
     ) -> dict[str, Any]:
@@ -1075,7 +1150,42 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         connection = await app.state.store.aget_connection(connection_id)
         if connection is None:
             raise HTTPException(status_code=404, detail="Conexión no encontrada")
-        result = await provider_for(connection).test_connection()
+        if connection.provider_type == "SEAFILE":
+            try:
+                credentials = credentials_for(connection)
+                auth_client = SeafileAuthClient(credentials["url"])
+                otp = payload.otp.strip() if payload and payload.otp else None
+                token = credentials.get("auth_token")
+                if otp:
+                    token = await auth_client.obtain_token(
+                        credentials["username"], credentials["password"], otp
+                    )
+                elif not token or not await auth_client.ping(token):
+                    token = await auth_client.obtain_token(
+                        credentials["username"], credentials["password"]
+                    )
+                credentials["auth_token"] = token
+                connection.encrypted_credentials = CredentialCipher.from_secret_file(
+                    config.master_encryption_key_file
+                ).encrypt(connection.id, credentials)
+                result = await provider_for(connection, credentials).test_connection()
+            except SeafileAuthenticationError:
+                result = ConnectionTestResult(
+                    success=False,
+                    message=(
+                        "No se pudo autenticar con Seafile. Verifica las credenciales y el "
+                        "código 2FA."
+                    ),
+                    error_code="SEAFILE_AUTHENTICATION_FAILED",
+                )
+            except (KeyError, OSError, ValueError):
+                result = ConnectionTestResult(
+                    success=False,
+                    message="No fue posible verificar la conexión Seafile",
+                    error_code="PROVIDER_CONNECTION_FAILED",
+                )
+        else:
+            result = await provider_for(connection).test_connection()
         connection.last_tested_at = datetime.now(UTC)
         connection.last_test_status = "SUCCESS" if result.success else "FAILURE"
         connection.status = "ACTIVE" if result.success else "ERROR"

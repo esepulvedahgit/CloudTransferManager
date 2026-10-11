@@ -73,6 +73,7 @@ class DatabaseStore:
             id=row.id,
             name=row.name,
             provider_type=row.provider_type,
+            adapter_type=row.adapter_type,
             created_by=row.created_by,
             encrypted_credentials=bytes(row.encrypted_credentials),
             status=row.status,
@@ -193,12 +194,14 @@ class DatabaseStore:
         connection_id: uuid.UUID,
         encrypted_credentials: bytes,
         is_global: bool = True,
+        adapter_type: str = "RCLONE",
     ) -> ConnectionRecord:
         async with self.sessions() as session:
             row = StorageConnection(
                 id=connection_id,
                 name=name,
                 provider_type=provider_type,
+                adapter_type=adapter_type,
                 created_by=created_by,
                 encrypted_credentials=encrypted_credentials,
                 is_global=is_global,
@@ -337,6 +340,7 @@ class DatabaseStore:
                 if row is None or row.deleted_at is not None:
                     raise ConnectionUnavailableError("not_found")
                 row.name = connection.name
+                row.adapter_type = connection.adapter_type
                 row.status = connection.status
                 row.last_tested_at = connection.last_tested_at
                 row.last_test_status = connection.last_test_status

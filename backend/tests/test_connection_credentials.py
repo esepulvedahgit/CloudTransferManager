@@ -1,11 +1,14 @@
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 
+import app.main as main
 from app.main import create_app
+from app.providers.base import ConnectionTestResult
 from app.security.credentials import CredentialCipher
 from app.security.passwords import PasswordService
 from app.services.memory_store import MemoryStore
@@ -208,3 +211,159 @@ async def test_google_oauth_callback_exchanges_and_encrypts_tokens(monkeypatch, 
     assert credentials["refresh_token"] == "refresh-token"
     assert credentials["access_token"] == "access-token"
     assert connection.status == "INACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_seafile_api_connection_uses_transient_otp_and_persists_only_encrypted_token(
+    monkeypatch, tmp_path: Path
+):
+    master_key_file = tmp_path / "master_key"
+    master_key_file.write_bytes(b"m" * 32)
+    store = MemoryStore()
+    store.add_user(
+        username="admin",
+        email="admin@example.test",
+        password_hash=PasswordService().hash("SafePassword123!"),
+        role="ADMIN",
+    )
+    auth_calls: list[tuple[str, str, str | None]] = []
+
+    class FakeAuthClient:
+        def __init__(self, base_url: str):
+            assert base_url == "https://seafile.example.test"
+
+        async def obtain_token(self, username: str, password: str, otp: str | None = None) -> str:
+            auth_calls.append((username, password, otp))
+            return "seafile-account-token"
+
+        async def ping(self, token: str) -> bool:
+            return token == "seafile-account-token"
+
+    class FakeApiProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def test_connection(self):
+            return ConnectionTestResult(success=True, message="Conexión verificada exitosamente")
+
+    monkeypatch.setattr(main, "SeafileAuthClient", FakeAuthClient, raising=False)
+    monkeypatch.setattr(main, "SeafileApiProvider", FakeApiProvider, raising=False)
+
+    app = create_app(
+        Settings(
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+            master_encryption_key_file=str(master_key_file),
+        ),
+        store=store,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        csrf = (await client.get("/api/v1/auth/csrf")).json()["csrf_token"]
+        await client.post(
+            "/api/v1/auth/login",
+            json={"username_or_email": "admin", "password": "SafePassword123!"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        headers = {"X-CSRF-Token": client.cookies["ctm_csrf"]}
+        created = await client.post(
+            "/api/v1/connections",
+            json={
+                "name": "Seafile API",
+                "provider_type": "SEAFILE",
+                "adapter_type": "SEAFILE_API",
+                "credentials": {
+                    "url": "https://seafile.example.test",
+                    "username": "operator@example.test",
+                    "password": "seafile-password",
+                    "library": "Archive",
+                    "library_password": "library-secret",
+                },
+            },
+            headers=headers,
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["adapter_type"] == "SEAFILE_API"
+        tested = await client.post(
+            f"/api/v1/connections/{created.json()['id']}/test",
+            json={"otp": "654321"},
+            headers=headers,
+        )
+
+    assert tested.status_code == 200, tested.text
+    assert tested.json()["success"] is True
+    assert auth_calls == [("operator@example.test", "seafile-password", "654321")]
+    assert "654321" not in tested.text
+    assert "seafile-account-token" not in tested.text
+    connection = store.connections[next(iter(store.connections))]
+    credentials = CredentialCipher(b"m" * 32).decrypt(
+        connection.id, connection.encrypted_credentials
+    )
+    assert credentials["auth_token"] == "seafile-account-token"
+    assert "otp" not in credentials
+    assert "654321" not in repr(credentials)
+    assert connection.adapter_type == "SEAFILE_API"
+    assert connection.status == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_changing_seafile_adapter_requires_a_new_connection_test(tmp_path: Path):
+    master_key_file = tmp_path / "master_key"
+    master_key_file.write_bytes(b"m" * 32)
+    store = MemoryStore()
+    store.add_user(
+        username="admin",
+        email="admin@example.test",
+        password_hash=PasswordService().hash("SafePassword123!"),
+        role="ADMIN",
+    )
+    app = create_app(
+        Settings(
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+            master_encryption_key_file=str(master_key_file),
+        ),
+        store=store,
+    )
+    connection_id = uuid.uuid4()
+    encrypted = CredentialCipher(b"m" * 32).encrypt(
+        connection_id,
+        {
+            "url": "https://seafile.example.test",
+            "username": "operator@example.test",
+            "password": "seafile-password",
+            "auth_token": "account-token",
+        },
+    )
+    connection = store.create_connection(
+        "Seafile",
+        "SEAFILE",
+        next(iter(store.users)),
+        connection_id=connection_id,
+        encrypted_credentials=encrypted,
+        adapter_type="RCLONE",
+    )
+    connection.status = "ACTIVE"
+    connection.last_test_status = "SUCCESS"
+    connection.last_tested_at = datetime.now(UTC)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        csrf = (await client.get("/api/v1/auth/csrf")).json()["csrf_token"]
+        await client.post(
+            "/api/v1/auth/login",
+            json={"username_or_email": "admin", "password": "SafePassword123!"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        response = await client.patch(
+            f"/api/v1/connections/{connection_id}",
+            json={"adapter_type": "SEAFILE_API"},
+            headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["adapter_type"] == "SEAFILE_API"
+    assert response.json()["status"] == "INACTIVE"
+    assert response.json()["last_test_status"] is None

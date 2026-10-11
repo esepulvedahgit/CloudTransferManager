@@ -41,6 +41,7 @@ async def test_database_store_persists_user_and_encrypted_connection(tmp_path):
         user.id,
         connection_id,
         b"\x01\x02encrypted",
+        adapter_type="RCLONE",
     )
     transfer = await store.acreate_transfer(
         user.id, connection.id, connection.id, ["/source"], "/destination"
@@ -67,6 +68,7 @@ async def test_database_store_persists_user_and_encrypted_connection(tmp_path):
     assert loaded_user.username == "persistent"
     assert loaded_connection is not None
     assert loaded_connection.encrypted_credentials == b"\x01\x02encrypted"
+    assert loaded_connection.adapter_type == "RCLONE"
     assert loaded_transfer is not None
     assert loaded_transfer.current_speed_bps == 512
     assert loaded_events[0]["technical_details"] == {

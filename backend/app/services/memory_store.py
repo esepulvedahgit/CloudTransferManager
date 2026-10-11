@@ -44,6 +44,7 @@ class ConnectionRecord:
     name: str
     provider_type: str
     created_by: uuid.UUID
+    adapter_type: str = "RCLONE"
     encrypted_credentials: bytes = b""
     credentials_configured: bool = False
     status: str = "ACTIVE"
@@ -57,6 +58,7 @@ class ConnectionRecord:
             "id": str(self.id),
             "name": self.name,
             "provider_type": self.provider_type,
+            "adapter_type": self.adapter_type,
             "is_global": self.is_global,
             "status": self.status,
             "credentials_configured": bool(self.encrypted_credentials),
@@ -180,11 +182,13 @@ class MemoryStore:
         connection_id: uuid.UUID | None = None,
         encrypted_credentials: bytes = b"",
         is_global: bool = True,
+        adapter_type: str = "RCLONE",
     ) -> ConnectionRecord:
         record = ConnectionRecord(
             id=connection_id or uuid.uuid4(),
             name=name,
             provider_type=provider_type,
+            adapter_type=adapter_type,
             created_by=created_by,
             encrypted_credentials=encrypted_credentials,
             is_global=is_global,
@@ -362,9 +366,16 @@ class MemoryStore:
         connection_id: uuid.UUID,
         encrypted_credentials: bytes,
         is_global: bool = True,
+        adapter_type: str = "RCLONE",
     ) -> ConnectionRecord:
         return self.create_connection(
-            name, provider_type, created_by, connection_id, encrypted_credentials, is_global
+            name,
+            provider_type,
+            created_by,
+            connection_id,
+            encrypted_credentials,
+            is_global,
+            adapter_type,
         )
 
     async def asave_connection(self, connection: ConnectionRecord) -> None:

@@ -55,7 +55,11 @@ class StorageConnection(Base):
     __tablename__ = "storage_connections"
     __table_args__ = (
         CheckConstraint(
-            "provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE')", name="ck_storage_provider_type"
+            "provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE')",
+            name="ck_storage_provider_type",
+        ),
+        CheckConstraint(
+            "adapter_type IN ('RCLONE', 'SEAFILE_API')", name="ck_storage_adapter_type"
         ),
         CheckConstraint("status IN ('ACTIVE', 'INACTIVE', 'ERROR')", name="ck_connection_status"),
     )
@@ -63,6 +67,7 @@ class StorageConnection(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(128))
     provider_type: Mapped[str] = mapped_column(String(32))
+    adapter_type: Mapped[str] = mapped_column(String(32), default="RCLONE", server_default="RCLONE")
     status: Mapped[str] = mapped_column(String(16), default="ACTIVE")
     encrypted_credentials: Mapped[bytes] = mapped_column(LargeBinary, default=b"")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
