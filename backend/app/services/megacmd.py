@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-MegaCmdAction = Literal["logout", "ls", "get", "put", "df", "quit", "version"]
+MegaCmdAction = Literal["logout", "ls", "get", "put", "mkdir", "df", "quit", "version"]
 LineCallback = Callable[[str], Awaitable[None]]
 CancelCheck = Callable[[], Awaitable[bool]]
 
@@ -80,7 +80,7 @@ class MegaCmdOutputLimitError(MegaCmdError):
 class MegaCmdRunner:
     """Runs a small, explicit set of MEGAcmd clients without invoking a shell."""
 
-    _allowed_actions = frozenset({"logout", "ls", "get", "put", "df", "quit", "version"})
+    _allowed_actions = frozenset({"logout", "ls", "get", "put", "mkdir", "df", "quit", "version"})
     _max_output_bytes = 64 * 1024
     _max_log_line_bytes = 64 * 1024
     _terminate_grace_seconds = 1.0
@@ -147,11 +147,7 @@ class MegaCmdRunner:
             self._validate_token(value)
 
         if action == "ls":
-            if (
-                len(values) != 3
-                or values[0] != "-l"
-                or values[1] != self._ls_time_format
-            ):
+            if len(values) != 3 or values[0] != "-l" or values[1] != self._ls_time_format:
                 raise ValueError("Invalid MEGAcmd arguments for ls")
             values[2] = self._normalize_remote_path(values[2])
         elif action == "get":
@@ -164,6 +160,10 @@ class MegaCmdRunner:
                 raise ValueError("Invalid MEGAcmd arguments for put")
             values[1] = self._absolute_local_path(values[1])
             values[2] = self._normalize_remote_path(values[2])
+        elif action == "mkdir":
+            if len(values) != 2 or values[0] != "-p":
+                raise ValueError("Invalid MEGAcmd arguments for mkdir")
+            values[1] = self._normalize_remote_path(values[1])
         elif action == "df":
             if values not in ([], ["-h"]):
                 raise ValueError("Invalid MEGAcmd arguments for df")
@@ -237,9 +237,7 @@ class MegaCmdRunner:
                             continue
                         pending.extend(chunk[:newline])
                         if len(pending) <= self._max_log_line_bytes:
-                            await callback(
-                                pending.decode("utf-8", errors="replace").rstrip("\r\n")
-                            )
+                            await callback(pending.decode("utf-8", errors="replace").rstrip("\r\n"))
                         pending.clear()
                         chunk = chunk[newline + 1 :]
                 if pending and callback is not None and not discarding_long_line:
@@ -279,12 +277,8 @@ class MegaCmdRunner:
                 raise MegaCmdCommandError(
                     process.returncode or 0, stdout_result[0] + stderr_result[0]
                 )
-            if Path(argv[0]).name == "mega-ls" and (
-                stdout_result[1] or stderr_result[1]
-            ):
-                raise MegaCmdOutputLimitError(
-                    "La salida MEGAcmd excedió el límite configurado"
-                )
+            if Path(argv[0]).name == "mega-ls" and (stdout_result[1] or stderr_result[1]):
+                raise MegaCmdOutputLimitError("La salida MEGAcmd excedió el límite configurado")
             return stdout_result[0], stderr_result[0]
         except (MegaCmdError, asyncio.CancelledError):
             raise
@@ -322,9 +316,7 @@ class MegaCmdRunner:
         except ProcessLookupError:
             pass
         try:
-            await asyncio.wait_for(
-                asyncio.shield(wait_task), timeout=self._terminate_grace_seconds
-            )
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=self._terminate_grace_seconds)
         except TimeoutError:
             try:
                 process.kill()
@@ -400,9 +392,7 @@ class MegaCmdRunner:
         return f'"{escaped}"'
 
     @staticmethod
-    def _redact(
-        output: tuple[bytes, bytes], secrets: Sequence[str]
-    ) -> tuple[bytes, bytes]:
+    def _redact(output: tuple[bytes, bytes], secrets: Sequence[str]) -> tuple[bytes, bytes]:
         redacted: list[bytes] = []
         for chunk in output:
             for secret in sorted((value for value in secrets if value), key=len, reverse=True):

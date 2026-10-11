@@ -146,6 +146,10 @@ async def test_api_lists_all_libraries_and_resolves_unicode_and_space_paths():
 @pytest.mark.asyncio
 async def test_api_streams_file_download_and_sha256_without_buffering_response():
     data = b"large streamed contents"
+    progress: list[tuple[int, int | None]] = []
+
+    async def on_progress(current: int, total: int | None) -> None:
+        progress.append((current, total))
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == f"/api2/repos/{REPOSITORY_ID}/file/":
@@ -155,14 +159,13 @@ async def test_api_streams_file_download_and_sha256_without_buffering_response()
             return httpx.Response(200, content=data)
         return httpx.Response(404)
 
-    provider = _provider(
-        httpx.MockTransport(handler), library="Archive"
-    )
+    provider = _provider(httpx.MockTransport(handler), library="Archive")
     destination = Path("/tmp/seafile-download-test.txt")
     try:
-        await provider.download_file("/report.txt", destination)
+        await provider.download_file("/report.txt", destination, progress_callback=on_progress)
         assert destination.read_bytes() == data
         assert await provider.sha256("/report.txt") == hashlib.sha256(data).hexdigest()
+        assert progress[-1][0] == len(data)
     finally:
         destination.unlink(missing_ok=True)
 
@@ -190,13 +193,20 @@ async def test_api_resumable_upload_starts_at_existing_offset_and_uses_bounded_c
             return httpx.Response(200, json={"success": True})
         return httpx.Response(404)
 
-    provider = _provider(
-        httpx.MockTransport(handler), library="Archive", chunk_size=64 * 1024
-    )
+    provider = _provider(httpx.MockTransport(handler), library="Archive", chunk_size=64 * 1024)
     source = tmp_path / "résumé file.bin"
     source.write_bytes(b"a" * 131_074)
+    progress: list[tuple[int, int | None]] = []
 
-    await provider.upload_file(source, "/nested/résumé file.bin", replace=True)
+    async def on_progress(current: int, total: int | None) -> None:
+        progress.append((current, total))
+
+    await provider.upload_file(
+        source,
+        "/nested/résumé file.bin",
+        replace=True,
+        progress_callback=on_progress,
+    )
 
     assert [request.headers["Content-Range"] for request in upload_requests] == [
         "bytes 2-65537/131074",
@@ -206,9 +216,9 @@ async def test_api_resumable_upload_starts_at_existing_offset_and_uses_bounded_c
     disposition = upload_requests[0].headers["Content-Disposition"]
     assert "filename*=" in disposition and "r%C3%A9sum%C3%A9%20file.bin" in disposition
     assert all(
-        request.headers["Authorization"] == f"Token {ACCOUNT}"
-        for request in upload_requests
+        request.headers["Authorization"] == f"Token {ACCOUNT}" for request in upload_requests
     )
+    assert progress == [(65_538, 131_074), (131_074, 131_074)]
 
 
 @pytest.mark.asyncio
@@ -295,6 +305,26 @@ async def test_api_provider_honors_cancellation_and_rejects_path_traversal(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_api_readback_hash_and_directory_creation_honor_cancellation():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/api2/repos/{REPOSITORY_ID}/file/":
+            return httpx.Response(200, json=f"{BASE_URL}/seafhttp/files/report")
+        if request.url.path == "/seafhttp/files/report":
+            return httpx.Response(200, content=b"x" * (2 * 1024 * 1024))
+        return httpx.Response(200, json=[])
+
+    provider = _provider(httpx.MockTransport(handler), library="Archive")
+
+    async def cancel() -> bool:
+        return True
+
+    with pytest.raises(SeafileApiCancelledError):
+        await provider.sha256("/report.txt", should_cancel=cancel)
+    with pytest.raises(SeafileApiCancelledError):
+        await provider.mkdir("/nested/child", should_cancel=cancel)
+
+
+@pytest.mark.asyncio
 async def test_api_upload_resumes_at_server_offset_and_rejects_offset_past_eof(tmp_path: Path):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == f"/api2/repos/{REPOSITORY_ID}/dir/":
@@ -333,7 +363,5 @@ def _provider(
         transport=transport,
         chunk_size=chunk_size,
     )
-    provider._libraries = [
-        {"id": REPOSITORY_ID, "name": library or "Archive", "encrypted": False}
-    ]
+    provider._libraries = [{"id": REPOSITORY_ID, "name": library or "Archive", "encrypted": False}]
     return provider

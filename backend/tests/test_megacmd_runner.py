@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from app.providers.megacmd import MegaCmdSession
 from app.services.megacmd import MegaCmdCommandError, MegaCmdOutputLimitError, MegaCmdTimeoutError
 from app.settings import Settings
 
@@ -161,8 +162,7 @@ async def test_runner_rejects_truncated_directory_listing(tmp_path: Path):
     binary_dir.mkdir()
     _executable(
         binary_dir / "mega-ls",
-        "import sys\n"
-        "sys.stdout.write('---- 1 4 2026-10-10T12:30:00 filename.txt\\n' * 3000)\n",
+        "import sys\nsys.stdout.write('---- 1 4 2026-10-10T12:30:00 filename.txt\\n' * 3000)\n",
     )
 
     with pytest.raises(MegaCmdOutputLimitError, match="límite"):
@@ -208,6 +208,37 @@ def test_settings_expose_megacmd_binary_and_disk_backed_staging_paths():
 
     assert settings.megacmd_binary_dir == "/opt/mega/bin"
     assert settings.transfer_staging_path == "/data/staging"
+
+
+def test_mkdir_is_limited_to_parent_creation_and_a_normalized_remote_path(tmp_path: Path):
+    runner = _runner_type()(str(tmp_path))
+
+    assert runner._build_command("mkdir", ["-p", "/backup/nested"]) == [
+        str(tmp_path / "mega-mkdir"),
+        "-p",
+        "/backup/nested",
+    ]
+    with pytest.raises(ValueError, match="traversal"):
+        runner._build_command("mkdir", ["-p", "/backup/../outside"])
+
+
+@pytest.mark.asyncio
+async def test_session_mkdir_uses_allowlisted_argv(tmp_path: Path):
+    class CapturingRunner:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, action, arguments, **kwargs):
+            self.calls.append((action, arguments, kwargs))
+            return b"", b""
+
+    runner = CapturingRunner()
+    session = MegaCmdSession("user", "password", runner, tmp_path)
+    session.home = tmp_path / "session"
+
+    await session.mkdir("/backup/nested")
+
+    assert runner.calls[0][0:2] == ("mkdir", ["-p", "/backup/nested"])
 
 
 @pytest.mark.asyncio
@@ -286,8 +317,7 @@ async def test_login_sends_credentials_only_over_stdin_and_redacts_echoed_output
     binary_dir.mkdir()
     _executable(
         binary_dir / "mega-cmd",
-        "import sys\n"
-        "sys.stdout.write(sys.stdin.read())\n",
+        "import sys\nsys.stdout.write(sys.stdin.read())\n",
     )
     calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     real_exec = asyncio.create_subprocess_exec

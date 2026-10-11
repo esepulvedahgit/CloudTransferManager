@@ -107,7 +107,9 @@ class MegaCmdSession:
             try:
                 async with asyncio.timeout(self._cleanup_timeout_seconds):
                     await self.runner.run(
-                        "logout", [], home=self.home,
+                        "logout",
+                        [],
+                        home=self.home,
                         timeout_seconds=max(0.01, self._cleanup_timeout_seconds - 2),
                     )
             except Exception:
@@ -116,7 +118,9 @@ class MegaCmdSession:
             try:
                 async with asyncio.timeout(self._cleanup_timeout_seconds):
                     await self.runner.run(
-                        "quit", [], home=self.home,
+                        "quit",
+                        [],
+                        home=self.home,
                         timeout_seconds=max(0.01, self._cleanup_timeout_seconds - 2),
                     )
             except Exception:
@@ -233,6 +237,10 @@ class MegaCmdSession:
             should_cancel=should_cancel,
         )
 
+    async def mkdir(self, remote_path: str) -> None:
+        safe_remote_path = MockStorageProvider.normalize_path(remote_path)
+        await self._run("mkdir", ["-p", safe_remote_path])
+
     async def _run(
         self,
         action: str,
@@ -322,9 +330,7 @@ class MegaCmdProvider(StorageProvider):
         try:
             async with self.open_session() as session:
                 await session.list_items("/", page_size=1)
-            return ConnectionTestResult(
-                success=True, message="Conexión verificada exitosamente"
-            )
+            return ConnectionTestResult(success=True, message="Conexión verificada exitosamente")
         except Exception:
             return ConnectionTestResult(
                 success=False,

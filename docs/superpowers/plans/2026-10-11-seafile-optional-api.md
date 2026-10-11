@@ -73,7 +73,7 @@
 - [x] **Step 2: Run provider tests and confirm expected failures.** Run: `cd backend && .venv/bin/pytest tests/test_seafile_providers.py tests/test_rclone_providers.py -q`. Expected: initial collection failure for the missing provider modules; after implementation, tests pass.
 - [x] **Step 3: Implement both providers.** Use Seafile CE endpoints (`/api2/auth/ping/`, `/api2/repos/`, `/api2/repos/{repo_id}/`, `/api2/repos/{repo_id}/dir/`, `/api2/repos/{repo_id}/file/`, `/api2/repos/{repo_id}/upload-link/`, `/api/v2.1/repos/{repo_id}/file-uploaded-bytes/`, and the upload-link fileserver URL). Stream downloads and bounded chunks; resume from `uploadedBytes`; call the library decrypt API only for a selected encrypted library. Restrict transfer URLs to the configured server host and sanitize HTTP errors. Wire `provider_for` to the saved adapter without fallback.
 - [x] **Step 4: Run provider tests.** Run: `cd backend && .venv/bin/pytest tests/test_seafile_providers.py tests/test_rclone_providers.py -q`. Expected: pass without contacting an external Seafile server.
-- [ ] **Step 5: Commit** as `feat: add Seafile rclone and API providers`.
+- [x] **Step 5: Commit** as `feat: add Seafile rclone and API providers`.
 
 ### Task 3: API transfer execution, integrity, cancellation, and retries
 
@@ -88,10 +88,10 @@
 - Consumes: Task 2 provider transfer methods and existing `temporary_staging_area`, `RcloneRunner`, `MegaCmdProvider`, and transfer progress/state helpers.
 - Produces: Executor routing to the direct API only when a connection is saved as `SEAFILE_API`; direct Rclone-to-Rclone remains remote-to-remote; API-involved copies use one-file staging and API destinations are SHA-256 readback-verified before progress increments.
 
-- [ ] **Step 1: Write failing transfer tests** for API source to Rclone destination, Rclone source to API destination, API-to-API, no implicit fallback after API auth failure, destination checksum mismatch, API retry/resume, cancellation cleanup, nested/empty directory handling, and transfer completion only after verification.
-- [ ] **Step 2: Run tests and confirm failures.** Run: `cd backend && .venv/bin/pytest tests/test_seafile_transfers.py -q`. Expected: API transfers are not currently routed.
-- [ ] **Step 3: Implement explicit route selection and staged copies.** Preserve existing Mega/Google behavior; use per-file helper methods for Seafile API and Rclone endpoints; carry cancellation into streaming and retry loops; do not add API delete/move/sync or silent adapter changes.
-- [ ] **Step 4: Run transfer tests.** Run: `cd backend && .venv/bin/pytest tests/test_seafile_transfers.py tests/test_transfer_executor.py tests/test_staging.py -q`. Expected: all pass and staging is removed after all terminal outcomes.
+- [x] **Step 1: Write failing transfer tests** for API source to Rclone destination, Rclone source to API destination, API-to-API, no implicit fallback after API auth failure, destination checksum mismatch, API retry/resume, cancellation cleanup, nested/empty directory handling, and transfer completion only after verification.
+- [x] **Step 2: Run tests and confirm failures.** Run: `cd backend && .venv/bin/pytest tests/test_seafile_transfers.py -q`. Expected: API transfers are not currently routed.
+- [x] **Step 3: Implement explicit route selection and staged copies.** Preserve existing Mega/Google behavior; use per-file helper methods for Seafile API and Rclone endpoints; carry cancellation into streaming and retry loops; do not add API delete/move/sync or silent adapter changes.
+- [x] **Step 4: Run transfer tests.** Run: `cd backend && .venv/bin/pytest tests/test_seafile_transfers.py tests/test_transfer_executor.py tests/test_staging.py -q`. Expected: all pass and staging is removed after all terminal outcomes.
 - [ ] **Step 5: Commit** as `feat: execute verified Seafile API transfers`.
 
 ### Task 4: Admin UI, API contract docs, compatibility harness, and full verification

@@ -22,6 +22,7 @@ from app.providers.base import (
 from app.providers.seafile_auth import normalize_seafile_base_url
 
 CancelCheck = Callable[[], Awaitable[bool]]
+ProgressCallback = Callable[[int, int | None], Awaitable[None]]
 
 
 class SeafileApiError(RuntimeError):
@@ -187,9 +188,7 @@ class SeafileApiProvider(StorageProvider):
             info.get("enc_version")
         )
 
-    async def _ensure_unlocked(
-        self, client: httpx.AsyncClient, library: dict[str, Any]
-    ) -> None:
+    async def _ensure_unlocked(self, client: httpx.AsyncClient, library: dict[str, Any]) -> None:
         repository_id = library["id"]
         if self._unlocked_repositories.get(repository_id, 0) > time.monotonic():
             return
@@ -354,8 +353,9 @@ class SeafileApiProvider(StorageProvider):
     async def get_quota(self) -> StorageQuota | None:
         return None
 
-    async def mkdir(self, path: str) -> None:
+    async def mkdir(self, path: str, should_cancel: CancelCheck | None = None) -> None:
         safe_path = self._normalize_path(path)
+        await _check_cancel(should_cancel)
         if safe_path == "/":
             return
         async with await self._client() as client:
@@ -367,6 +367,7 @@ class SeafileApiProvider(StorageProvider):
             for part in PurePosixPath(repository_path).parts:
                 if part == "/":
                     continue
+                await _check_cancel(should_cancel)
                 current = f"{current}/{part}"
                 parent = current.rsplit("/", 1)[0] or "/"
                 entries = await self._directory_entries(client, library, parent)
@@ -388,6 +389,7 @@ class SeafileApiProvider(StorageProvider):
         path: str,
         target: Path,
         should_cancel: CancelCheck | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         safe_path = self._normalize_path(path)
         await _check_cancel(should_cancel)
@@ -400,13 +402,27 @@ class SeafileApiProvider(StorageProvider):
             ) as response:
                 self._raise_for_status(response)
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                transferred = 0
+                content_length = response.headers.get("Content-Length")
+                try:
+                    total = max(0, int(content_length)) if content_length is not None else None
+                except ValueError:
+                    total = None
                 with target.open("wb") as output:
                     async for chunk in response.aiter_bytes(1024 * 1024):
                         await _check_cancel(should_cancel)
                         output.write(chunk)
+                        transferred += len(chunk)
+                        if progress_callback is not None:
+                            await progress_callback(transferred, total)
 
-    async def sha256(self, path: str) -> str:
+    async def sha256(
+        self,
+        path: str,
+        should_cancel: CancelCheck | None = None,
+    ) -> str:
         safe_path = self._normalize_path(path)
+        await _check_cancel(should_cancel)
         digest = hashlib.sha256()
         async with await self._client() as client:
             library, repository_path, _full_path = await self._resolve_library(client, safe_path)
@@ -417,6 +433,7 @@ class SeafileApiProvider(StorageProvider):
             ) as response:
                 self._raise_for_status(response)
                 async for chunk in response.aiter_bytes(1024 * 1024):
+                    await _check_cancel(should_cancel)
                     digest.update(chunk)
         return digest.hexdigest()
 
@@ -460,6 +477,7 @@ class SeafileApiProvider(StorageProvider):
         path: str,
         replace: bool = True,
         should_cancel: CancelCheck | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         safe_path = self._normalize_path(path)
         await _check_cancel(should_cancel)
@@ -469,7 +487,7 @@ class SeafileApiProvider(StorageProvider):
         parent_path = relative.parent.as_posix()
         if not parent_path.startswith("/"):
             parent_path = f"/{parent_path}"
-        await self.mkdir(parent_path)
+        await self.mkdir(parent_path, should_cancel=should_cancel)
         size = source.stat().st_size
         async with await self._client() as client:
             library, repository_parent, _full_path = await self._resolve_library(
@@ -485,9 +503,7 @@ class SeafileApiProvider(StorageProvider):
             payload = _json_response(response)
             offset = payload.get("uploadedBytes") if isinstance(payload, dict) else None
             if not isinstance(offset, int) or offset < 0 or offset > size:
-                raise SeafileApiError(
-                    400, safe_message="Invalid Seafile upload offset"
-                )
+                raise SeafileApiError(400, safe_message="Invalid Seafile upload offset")
             response = await self._request(
                 client,
                 "GET",
@@ -512,8 +528,7 @@ class SeafileApiProvider(StorageProvider):
             fallback_name = _ascii_fallback(relative.name)
             encoded_name = quote(relative.name, safe="")
             disposition = (
-                f'attachment; filename="{fallback_name}"; '
-                f"filename*=UTF-8''{encoded_name}"
+                f"attachment; filename=\"{fallback_name}\"; filename*=UTF-8''{encoded_name}"
             )
             with source.open("rb") as file_handle:
                 if size == 0:
@@ -528,6 +543,8 @@ class SeafileApiProvider(StorageProvider):
                         replace,
                         None,
                     )
+                    if progress_callback is not None:
+                        await progress_callback(0, 0)
                 while offset < size:
                     await _check_cancel(should_cancel)
                     file_handle.seek(offset)
@@ -547,6 +564,8 @@ class SeafileApiProvider(StorageProvider):
                         content_range,
                     )
                     offset = end + 1
+                    if progress_callback is not None:
+                        await progress_callback(offset, size)
 
     async def _upload_chunk(
         self,

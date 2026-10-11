@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import random
 import uuid
 from collections.abc import Awaitable, Callable
@@ -11,6 +12,12 @@ from app.providers.base import StorageItem
 from app.providers.megacmd import MegaCmdProvider
 from app.providers.mock import MockStorageProvider
 from app.providers.rclone import RcloneGoogleDriveProvider
+from app.providers.seafile import SeafileRcloneProvider
+from app.providers.seafile_api import (
+    SeafileApiCancelledError,
+    SeafileApiError,
+    SeafileApiProvider,
+)
 from app.security.credentials import CredentialCipher
 from app.services.megacmd import (
     MegaCmdCancelledError,
@@ -74,8 +81,14 @@ class TransferExecutor:
 
         try:
             await self._run_rclone(record, source, destination)
-        except (RcloneCancelledError, MegaCmdCancelledError):
+        except (RcloneCancelledError, MegaCmdCancelledError, SeafileApiCancelledError):
             await self._cancel(record)
+        except SeafileApiError as exc:
+            await self._fail(
+                record,
+                error_code=self._seafile_error_code(exc),
+                technical_details={"http_status": exc.status_code},
+            )
         except Exception as exc:
             await self._fail(
                 record,
@@ -156,6 +169,10 @@ class TransferExecutor:
                 credentials,
                 self.runner,
             )
+        if connection.provider_type == "SEAFILE":
+            if connection.adapter_type == "SEAFILE_API":
+                return SeafileApiProvider(connection.id, credentials)
+            return SeafileRcloneProvider(connection.id, credentials, self.runner)
         raise ValueError("Unsupported provider")
 
     async def _run_rclone(
@@ -166,6 +183,17 @@ class TransferExecutor:
     ) -> None:
         source = self._provider(source_connection)
         destination = self._provider(destination_connection)
+        if self._uses_seafile_api(source_connection) or self._uses_seafile_api(
+            destination_connection
+        ):
+            await self._run_seafile_api_cross_provider(
+                record,
+                source_connection,
+                destination_connection,
+                source,
+                destination,
+            )
+            return
         if (
             source_connection.provider_type == "MEGA"
             or destination_connection.provider_type == "MEGA"
@@ -188,9 +216,7 @@ class TransferExecutor:
             source_items.append(item)
 
         path_count = max(len(source_items), 1)
-        file_count_available = bool(source_items) and all(
-            not item.is_dir for item in source_items
-        )
+        file_count_available = bool(source_items) and all(not item.is_dir for item in source_items)
         byte_weights_available = bool(source_items) and all(
             not item.is_dir and item.size_bytes is not None for item in source_items
         )
@@ -295,9 +321,13 @@ class TransferExecutor:
                         if isinstance(local_progress, (int, float)):
                             clamped_local_progress = min(max(local_progress, 0), 100)
                             aggregate_progress = (
-                                path_weight_base
-                                + path_weight_for_job * clamped_local_progress / 100
-                            ) * 100 / total_weight_for_job
+                                (
+                                    path_weight_base
+                                    + path_weight_for_job * clamped_local_progress / 100
+                                )
+                                * 100
+                                / total_weight_for_job
+                            )
                             record.progress_percent = max(
                                 record.progress_percent,
                                 min(round(aggregate_progress, 2), 99.99),
@@ -353,6 +383,449 @@ class TransferExecutor:
         record.status = "COMPLETED"
         record.completed_at = datetime.now(UTC)
         await self.publish(record)
+
+    @staticmethod
+    def _uses_seafile_api(connection: ConnectionRecord) -> bool:
+        return connection.provider_type == "SEAFILE" and connection.adapter_type == "SEAFILE_API"
+
+    async def _run_seafile_api_cross_provider(
+        self,
+        record: TransferRecord,
+        source_connection: ConnectionRecord,
+        destination_connection: ConnectionRecord,
+        source: Any,
+        destination: Any,
+    ) -> None:
+        """Stage API-involved copies one file at a time; never switch adapters on errors."""
+        source_is_mega = source_connection.provider_type == "MEGA"
+        destination_is_mega = destination_connection.provider_type == "MEGA"
+        api_destination = self._uses_seafile_api(destination_connection)
+        destination_is_rclone = (
+            destination_connection.provider_type
+            in {
+                "GOOGLE_DRIVE",
+                "SEAFILE",
+            }
+            and not api_destination
+        )
+
+        async with AsyncExitStack() as stack:
+            mega_session = None
+            if source_is_mega or destination_is_mega:
+                mega_provider = source if source_is_mega else destination
+                mega_session = await stack.enter_async_context(
+                    mega_provider.open_session(
+                        transfer_id=record.id,
+                        should_cancel=self.should_cancel,
+                    )
+                )
+
+            source_listing = mega_session if source_is_mega else source
+            try:
+                files, directories = await self._collect_files(
+                    source_listing,
+                    record.source_paths,
+                    include_selected_folder=True,
+                )
+            except FileNotFoundError:
+                await self._fail(record, error_code="SOURCE_ITEM_NOT_FOUND")
+                return
+
+            record.files_total = len(files)
+            sizes_known = all(item.size_bytes is not None for item, _path in files)
+            record.bytes_total = sum(item.size_bytes or 0 for item, _path in files)
+            record.bytes_transferred = 0
+            record.files_completed = 0
+            record.status = "RUNNING"
+            await self.publish(record)
+
+            destination_root = MockStorageProvider.normalize_path(record.destination_path)
+            if directories:
+                if await self.should_cancel():
+                    await self._cancel(record)
+                    return
+                ordered_directories = sorted(
+                    directories,
+                    key=lambda value: (len(PurePosixPath(value).parts), value),
+                )
+                if api_destination:
+                    for relative_directory in ordered_directories:
+                        if await self.should_cancel():
+                            await self._cancel(record)
+                            return
+                        safe_relative = self._safe_relative_path(relative_directory)
+                        target = MockStorageProvider.normalize_path(
+                            f"{destination_root.rstrip('/')}/{safe_relative}"
+                        )
+                        await destination.mkdir(target, should_cancel=self.should_cancel)
+                elif destination_is_mega:
+                    assert mega_session is not None
+                    for relative_directory in ordered_directories:
+                        if await self.should_cancel():
+                            await self._cancel(record)
+                            return
+                        safe_relative = self._safe_relative_path(relative_directory)
+                        target = MockStorageProvider.normalize_path(
+                            f"{destination_root.rstrip('/')}/{safe_relative}"
+                        )
+                        await mega_session.mkdir(target)
+                elif destination_is_rclone:
+                    async with temporary_staging_area(
+                        Path(self.settings.transfer_staging_path),
+                        transfer_id=record.id,
+                        expected_size=0,
+                    ) as staging_area:
+                        for relative_directory in ordered_directories:
+                            safe_relative = self._safe_relative_path(relative_directory)
+                            staging_area.joinpath(*PurePosixPath(safe_relative).parts).mkdir(
+                                parents=True, exist_ok=True
+                            )
+                        await self.runner.copy_local_directory_to_remote(
+                            staging_area,
+                            destination.remote_path(destination_root),
+                            destination.config_content(),
+                            record.id,
+                            should_cancel=self.should_cancel,
+                            conflict_policy=record.conflict_policy,
+                        )
+
+            for item, relative_path in files:
+                if await self.should_cancel():
+                    await self._cancel(record)
+                    return
+                safe_relative = self._safe_relative_path(relative_path)
+                relative = PurePosixPath(safe_relative)
+                relative_parent = relative.parent.as_posix()
+                destination_folder = (
+                    destination_root
+                    if relative_parent == "."
+                    else MockStorageProvider.normalize_path(
+                        f"{destination_root.rstrip('/')}/{relative_parent}"
+                    )
+                )
+                destination_file = MockStorageProvider.normalize_path(
+                    f"{destination_folder.rstrip('/')}/{relative.name}"
+                )
+
+                if destination_is_mega:
+                    assert mega_session is not None
+                    if await mega_session.get_item(destination_file) is not None:
+                        record.warning_count += 1
+                        record.files_completed += 1
+                        self._update_transfer_progress(record, files, completed_file=True)
+                        await self.publish(record)
+                        continue
+                elif destination_is_rclone:
+                    existing = await destination.get_item(destination_file)
+                    if existing is not None and record.conflict_policy == "SKIP":
+                        record.warning_count += 1
+                        record.files_completed += 1
+                        self._update_transfer_progress(record, files, completed_file=True)
+                        await self.publish(record)
+                        continue
+                    if existing is not None and existing.is_dir:
+                        await self._fail(record, error_code="DESTINATION_PATH_IS_DIRECTORY")
+                        return
+                elif api_destination:
+                    existing = await destination.get_item(destination_file)
+                    if existing is not None and record.conflict_policy == "SKIP":
+                        record.warning_count += 1
+                        record.files_completed += 1
+                        self._update_transfer_progress(record, files, completed_file=True)
+                        await self.publish(record)
+                        continue
+                    if existing is not None and existing.is_dir:
+                        await self._fail(record, error_code="DESTINATION_PATH_IS_DIRECTORY")
+                        return
+
+                record.current_item = item.path
+                record.current_speed_bps = None
+                record.estimated_remaining_seconds = None
+                await self.publish(record)
+                byte_base = record.bytes_transferred
+                completed = False
+                already_identical = False
+                size_added_for_file = False
+                for attempt in range(1, self.settings.transfer_max_retries + 2):
+                    if await self.should_cancel():
+                        await self._cancel(record)
+                        return
+                    record.attempt_count = max(record.attempt_count, attempt)
+                    record.status = "RUNNING" if attempt == 1 else "RETRYING"
+                    if attempt > 1:
+                        record.bytes_transferred = byte_base
+                        await self.publish(record)
+                    local_file_bytes = 0
+
+                    async def on_progress(
+                        line: str,
+                        byte_base_for_file: int = byte_base,
+                    ) -> None:
+                        nonlocal local_file_bytes
+                        metrics = parse_rclone_stats_line(line)
+                        if metrics is None:
+                            metrics = parse_mega_progress_line(line)
+                        if metrics is None:
+                            return
+                        current_bytes = metrics.get("bytes_transferred")
+                        if isinstance(current_bytes, int):
+                            local_file_bytes = max(local_file_bytes, current_bytes)
+                            record.bytes_transferred = byte_base_for_file + local_file_bytes
+                        speed = metrics.get("current_speed_bps")
+                        if isinstance(speed, int):
+                            record.current_speed_bps = speed
+                        if record.bytes_total and record.bytes_transferred < record.bytes_total:
+                            record.progress_percent = max(
+                                record.progress_percent,
+                                min(
+                                    round(record.bytes_transferred * 100 / record.bytes_total, 2),
+                                    99.99,
+                                ),
+                            )
+                        await self.publish(record)
+
+                    async def on_api_progress(
+                        current: int,
+                        total: int | None,
+                        byte_base_for_api: int = byte_base,
+                        item_for_api: StorageItem = item,
+                        completed_files: int = record.files_completed,
+                    ) -> None:
+                        nonlocal local_file_bytes
+                        local_file_bytes = max(local_file_bytes, current)
+                        record.bytes_transferred = byte_base_for_api + local_file_bytes
+                        if total is not None and item_for_api.size_bytes is None:
+                            remaining = sum(
+                                remaining_item.size_bytes or 0
+                                for remaining_item, _path in files[completed_files + 1 :]
+                            )
+                            record.bytes_total = max(
+                                record.bytes_total,
+                                byte_base_for_api + total + remaining,
+                            )
+                        if sizes_known and record.bytes_total:
+                            record.progress_percent = max(
+                                record.progress_percent,
+                                min(
+                                    round(
+                                        record.bytes_transferred * 100 / record.bytes_total,
+                                        2,
+                                    ),
+                                    99.99,
+                                ),
+                            )
+                        elif files:
+                            expected_size = item_for_api.size_bytes or total or 0
+                            file_progress = (
+                                min(local_file_bytes / expected_size, 1.0)
+                                if expected_size > 0
+                                else 0.0
+                            )
+                            aggregate_progress = (
+                                (record.files_completed + file_progress)
+                                * 100
+                                / max(record.files_total, 1)
+                            )
+                            record.progress_percent = max(
+                                record.progress_percent,
+                                min(round(aggregate_progress, 2), 99.99),
+                            )
+                        await self.publish(record)
+
+                    retryable = False
+                    try:
+                        async with temporary_staging_area(
+                            Path(self.settings.transfer_staging_path),
+                            transfer_id=record.id,
+                            expected_size=item.size_bytes,
+                        ) as staging_area:
+                            if self._uses_seafile_api(source_connection):
+                                local_file = staging_area / item.name
+                                await source.download_file(
+                                    item.path,
+                                    local_file,
+                                    should_cancel=self.should_cancel,
+                                    progress_callback=on_api_progress,
+                                )
+                            elif source_is_mega:
+                                assert mega_session is not None
+                                local_file = await mega_session.download_file(
+                                    item.path,
+                                    staging_area,
+                                    line_callback=on_progress,
+                                    should_cancel=self.should_cancel,
+                                )
+                            else:
+                                await self.runner.copy_remote_to_local(
+                                    source.remote_path(item.path),
+                                    staging_area,
+                                    source.config_content(),
+                                    record.id,
+                                    line_callback=on_progress,
+                                    should_cancel=self.should_cancel,
+                                )
+                                local_file = staging_area / item.name
+
+                            file_size = local_file.stat().st_size
+                            source_digest = await _sha256_file(local_file, self.should_cancel)
+                            if item.size_bytes is None and not size_added_for_file:
+                                remaining_known_size = sum(
+                                    next_item.size_bytes or 0
+                                    for next_item, _path in files[record.files_completed + 1 :]
+                                )
+                                record.bytes_total = max(
+                                    record.bytes_total,
+                                    byte_base + file_size + remaining_known_size,
+                                )
+                                size_added_for_file = True
+                            if api_destination:
+                                if (
+                                    existing is not None
+                                    and record.conflict_policy == "OVERWRITE_IF_DIFFERENT"
+                                ):
+                                    destination_digest = await destination.sha256(
+                                        destination_file,
+                                        should_cancel=self.should_cancel,
+                                    )
+                                    if destination_digest == source_digest:
+                                        completed = True
+                                        already_identical = True
+                                        break
+                                await destination.upload_file(
+                                    local_file,
+                                    destination_file,
+                                    replace=True,
+                                    should_cancel=self.should_cancel,
+                                    progress_callback=on_api_progress,
+                                )
+                                destination_digest = await destination.sha256(
+                                    destination_file,
+                                    should_cancel=self.should_cancel,
+                                )
+                                if destination_digest != source_digest:
+                                    await self._fail(
+                                        record,
+                                        error_code="SEAFILE_INTEGRITY_MISMATCH",
+                                        message=(
+                                            "La verificación de integridad de Seafile no coincide."
+                                        ),
+                                        technical_details={"path": relative.as_posix()},
+                                    )
+                                    return
+                            elif destination_is_mega:
+                                assert mega_session is not None
+                                await mega_session.upload_file(
+                                    local_file,
+                                    destination_folder,
+                                    line_callback=on_progress,
+                                    should_cancel=self.should_cancel,
+                                )
+                            else:
+                                await self.runner.copy_local_to_remote(
+                                    local_file,
+                                    destination.remote_path(destination_folder),
+                                    destination.config_content(),
+                                    record.id,
+                                    line_callback=on_progress,
+                                    should_cancel=self.should_cancel,
+                                    conflict_policy=record.conflict_policy,
+                                )
+                        completed = True
+                        break
+                    except (RcloneCancelledError, MegaCmdCancelledError, SeafileApiCancelledError):
+                        raise
+                    except (
+                        RcloneCommandError,
+                        MegaCmdCommandError,
+                        MegaCmdTimeoutError,
+                        SeafileApiError,
+                    ) as exc:
+                        retryable = self._is_retryable_transfer_error(exc)
+                        if not retryable or attempt > self.settings.transfer_max_retries:
+                            code = (
+                                self._seafile_error_code(exc)
+                                if isinstance(exc, SeafileApiError)
+                                else (
+                                    "RCLONE_RETRIES_EXHAUSTED"
+                                    if isinstance(exc, RcloneCommandError) and retryable
+                                    else "RCLONE_COMMAND_FAILED"
+                                    if isinstance(exc, RcloneCommandError)
+                                    else "MEGACMD_RETRIES_EXHAUSTED"
+                                    if retryable
+                                    else "MEGACMD_COMMAND_FAILED"
+                                )
+                            )
+                            await self._fail(
+                                record,
+                                error_code=code,
+                                message="No se pudo completar la copia con el proveedor.",
+                                technical_details={
+                                    "attempt": attempt,
+                                    "retryable": retryable,
+                                    "http_status": exc.status_code
+                                    if isinstance(exc, SeafileApiError)
+                                    else None,
+                                },
+                            )
+                            return
+                        record.status = "RETRYING"
+                        record.error_count += 1
+                        record.current_speed_bps = None
+                        record.estimated_remaining_seconds = None
+                        await self.publish(record)
+                        delay = (
+                            exc.retry_after
+                            if isinstance(exc, SeafileApiError) and exc.retry_after is not None
+                            else min(5 * (2 ** (attempt - 1)) + random.random(), 300)
+                        )
+                        if not await self._wait_for_retry(record, delay):
+                            return
+                    if completed:
+                        break
+
+                if not completed:
+                    await self._fail(record)
+                    return
+                actual_size = (
+                    item.size_bytes if item.size_bytes is not None else local_file.stat().st_size
+                )
+                if not already_identical:
+                    record.bytes_transferred = max(
+                        record.bytes_transferred,
+                        byte_base + actual_size,
+                    )
+                record.files_completed += 1
+                self._update_transfer_progress(record, files, completed_file=True)
+                record.current_speed_bps = None
+                record.estimated_remaining_seconds = None
+                await self.publish(record)
+
+        record.current_item = None
+        record.current_speed_bps = None
+        record.estimated_remaining_seconds = None
+        record.progress_percent = 100.0
+        record.status = "COMPLETED_WITH_WARNINGS" if record.warning_count else "COMPLETED"
+        record.completed_at = datetime.now(UTC)
+        await self.publish(record)
+
+    @staticmethod
+    def _safe_relative_path(path: str) -> str:
+        relative = PurePosixPath(path)
+        if (
+            not path
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or "\\" in path
+            or "\x00" in path
+        ):
+            raise ValueError("Unsafe relative transfer path")
+        return relative.as_posix()
+
+    @staticmethod
+    def _seafile_error_code(error: SeafileApiError) -> str:
+        if error.status_code in {401, 403}:
+            return "SEAFILE_API_AUTHENTICATION_FAILED"
+        return "SEAFILE_API_RETRIES_EXHAUSTED" if error.retryable else "SEAFILE_API_REQUEST_FAILED"
 
     async def _run_mega_cross_provider(
         self,
@@ -505,31 +978,33 @@ class TransferExecutor:
                             record.current_speed_bps = speed
                             elapsed = max(
                                 (
-                                    datetime.now(UTC)
-                                    - (record.started_at or datetime.now(UTC))
+                                    datetime.now(UTC) - (record.started_at or datetime.now(UTC))
                                 ).total_seconds(),
                                 0.0,
                             )
                             if elapsed > 0:
-                                record.average_speed_bps = int(
-                                    record.bytes_transferred / elapsed
-                                )
+                                record.average_speed_bps = int(record.bytes_transferred / elapsed)
                         eta = metrics.get("estimated_remaining_seconds")
                         if isinstance(eta, int):
                             record.estimated_remaining_seconds = eta
                         elif sizes_known and record.current_speed_bps:
-                            record.estimated_remaining_seconds = max(
-                                record.bytes_total - record.bytes_transferred, 0
-                            ) // record.current_speed_bps
+                            record.estimated_remaining_seconds = (
+                                max(record.bytes_total - record.bytes_transferred, 0)
+                                // record.current_speed_bps
+                            )
                         percent = metrics.get("progress_percent")
                         if isinstance(percent, (float, int)):
                             if sizes_known and record.bytes_total:
                                 progress = record.bytes_transferred * 100 / record.bytes_total
                             else:
                                 progress = (
-                                    record.files_completed
-                                    + min(max(float(percent), 0), 100) / 100
-                                ) * 100 / max(record.files_total, 1)
+                                    (
+                                        record.files_completed
+                                        + min(max(float(percent), 0), 100) / 100
+                                    )
+                                    * 100
+                                    / max(record.files_total, 1)
+                                )
                             record.progress_percent = max(
                                 record.progress_percent, min(round(progress, 2), 99.99)
                             )
@@ -667,6 +1142,8 @@ class TransferExecutor:
         visited_directories: set[str] = set()
 
         async def walk_directory(path: str, relative_directory: PurePosixPath) -> None:
+            if await self.should_cancel():
+                raise SeafileApiCancelledError("Transfer cancelled")
             if path in visited_directories:
                 return
             visited_directories.add(path)
@@ -675,6 +1152,8 @@ class TransferExecutor:
             cursor: str | None = None
             seen_cursors: set[str] = set()
             while True:
+                if await self.should_cancel():
+                    raise SeafileApiCancelledError("Transfer cancelled")
                 page = await provider.list_items(path, cursor=cursor, page_size=200)
                 for child in page.items:
                     child_path = MockStorageProvider.normalize_path(child.path)
@@ -694,6 +1173,8 @@ class TransferExecutor:
                 cursor = page.next_cursor
 
         for requested_path in selected_paths:
+            if await self.should_cancel():
+                raise SeafileApiCancelledError("Transfer cancelled")
             normalized = MockStorageProvider.normalize_path(requested_path)
             item = await provider.get_item(normalized)
             if item is None:
@@ -740,7 +1221,7 @@ class TransferExecutor:
 
     @staticmethod
     def _is_retryable_transfer_error(
-        error: RcloneCommandError | MegaCmdCommandError | MegaCmdTimeoutError,
+        error: RcloneCommandError | MegaCmdCommandError | MegaCmdTimeoutError | SeafileApiError,
     ) -> bool:
         return error.retryable
 
@@ -773,3 +1254,16 @@ class TransferExecutor:
             provider_error_code=error_code,
             correlation_id=record.id,
         )
+
+
+async def _sha256_file(path: Path, should_cancel: Callable[[], Awaitable[bool]]) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while True:
+            chunk = await asyncio.to_thread(source.read, 1024 * 1024)
+            if not chunk:
+                break
+            if await should_cancel():
+                raise SeafileApiCancelledError("Seafile transfer cancelled")
+            digest.update(chunk)
+    return digest.hexdigest()
