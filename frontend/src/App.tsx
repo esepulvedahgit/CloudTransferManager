@@ -129,11 +129,12 @@ const theme = createTheme({
 
 const loginSchema = z.object({ username_or_email: z.string().min(1), password: z.string().min(1) });
 
-function InterfaceIcon({ name }: { name: 'folder' | 'file' | 'copy' | 'refresh' | 'archive' | 'settings' | 'key' | 'logout' }) {
+function InterfaceIcon({ name }: { name: 'folder' | 'file' | 'copy' | 'transfer' | 'refresh' | 'archive' | 'settings' | 'key' | 'logout' }) {
   const paths = {
     folder: <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h5l2 2h8A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z" />,
     file: <path d="M7 3.75h7l4 4v12.5H7a2 2 0 0 1-2-2v-12.5a2 2 0 0 1 2-2Zm7 0v4h4M8.5 12h7M8.5 15h7" />,
     copy: <path d="M8 8V4.75A1.75 1.75 0 0 1 9.75 3h9.5A1.75 1.75 0 0 1 21 4.75v9.5A1.75 1.75 0 0 1 19.25 16H16M4.75 8H14A2 2 0 0 1 16 10v9.25A1.75 1.75 0 0 1 14.25 21h-9.5A1.75 1.75 0 0 1 3 19.25v-9.5A1.75 1.75 0 0 1 4.75 8Z" />,
+    transfer: <><path d="M3.5 6.5h5v11h-5zM15.5 6.5h5v11h-5z" /><path d="M9 12h6m-2.5-2.5L15 12l-2.5 2.5" /></>,
     refresh: <path d="M20 7v5h-5M4 17v-5h5m10.25-3A7 7 0 0 0 6.1 6.1L4 8m16 8-2.1 1.9A7 7 0 0 1 4.75 15" />,
     archive: <path d="M4 7h16v13H4zM3 4h18v3H3zm5 7h8" />,
     settings: <><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z" /><path d="m19.4 15 .1.1 1.2.9-1.5 2.6-1.4-.6a8 8 0 0 1-1.8 1l-.2 1.5h-3l-.3-1.5a8 8 0 0 1-1.8-1l-1.4.6-1.5-2.6 1.2-.9a7 7 0 0 1 0-2.1l-1.2-.9 1.5-2.6 1.4.6a8 8 0 0 1 1.8-1l.3-1.5h3l.2 1.5a8 8 0 0 1 1.8 1l1.4-.6 1.5 2.6-1.2.9a7 7 0 0 1 0 2Z" transform="translate(-1 -1) scale(.98)" /></>,
@@ -1209,6 +1210,9 @@ function TransferWorkspace({
   const [sourcePath, setSourcePath] = useState('/');
   const [destinationPath, setDestinationPath] = useState('/');
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const sourceConnection = connectionById.get(sourceId);
+  const destinationConnection = connectionById.get(destinationId);
+  const canTransfer = Boolean(sourceId && destinationId && sourceId !== destinationId && selectedPaths.length > 0);
   const [conflictPolicy, setConflictPolicy] = useState<'SKIP' | 'OVERWRITE_IF_DIFFERENT'>('OVERWRITE_IF_DIFFERENT');
   const [sendEmailNotification, setSendEmailNotification] = useState(false);
   const [mobileStep, setMobileStep] = useState(0);
@@ -1514,17 +1518,61 @@ function TransferWorkspace({
             </Paper>
             <Box className={`mobile-panel mobile-panel-${mobileStep}`}>{panels}</Box>
 
-        <Paper className="transfer-action" elevation={0}>
-          <Box className="transfer-action-copy">
-            <Box className="copy-icon" aria-hidden="true"><InterfaceIcon name="copy" /></Box>
-            <Box>
-              <Typography fontWeight={700}>Listo para copiar</Typography>
-              <Typography variant="body2" color="text.secondary">
-                {selectedPaths.length} elementos · destino {destinationPath}
+        <Paper className="transfer-action" elevation={0} role="group" aria-label="Resumen de transferencia">
+          <Box className="transfer-action-overview">
+            <Box className="transfer-symbol" role="img" aria-label="Transferencia de archivos">
+              <InterfaceIcon name="transfer" />
+            </Box>
+            <Box className="transfer-action-copy">
+              <Box className="transfer-action-heading">
+                <Typography variant="h6" component="h2">
+                  {canTransfer ? 'Listo para transferir' : 'Prepara tu transferencia'}
+                </Typography>
+                <Chip
+                  className="transfer-selection-chip"
+                  size="small"
+                  label={selectedPaths.length === 1
+                    ? '1 elemento'
+                    : `${selectedPaths.length} elementos`}
+                />
+              </Box>
+              <Typography variant="body2" color="text.secondary" className="transfer-selection-summary">
+                {selectedPaths.length === 0
+                  ? 'Selecciona elementos en el origen para preparar la copia.'
+                  : canTransfer
+                    ? `${selectedPaths.length} ${selectedPaths.length === 1 ? 'elemento listo' : 'elementos listos'} para copiar`
+                    : sourceId === destinationId
+                      ? 'Elige una conexión distinta como destino.'
+                      : 'Selecciona una conexión de destino para habilitar la copia.'}
               </Typography>
+              <Box className="transfer-route" aria-label="Ruta de transferencia">
+                <Box className="transfer-route-point">
+                  <Typography variant="overline">ORIGEN</Typography>
+                  <Box className="transfer-route-connection">
+                    <ProviderLogo provider={sourceConnection?.provider_type ?? ''} decorative={false} />
+                    <Typography variant="body2" title={sourceConnection?.name ?? 'Selecciona un origen'}>
+                      {sourceConnection?.name ?? 'Selecciona un origen'}
+                    </Typography>
+                  </Box>
+                </Box>
+                <span className="transfer-route-arrow" aria-hidden="true">→</span>
+                <Box className="transfer-route-point">
+                  <Typography variant="overline">DESTINO</Typography>
+                  <Box className="transfer-route-connection">
+                    <ProviderLogo provider={destinationConnection?.provider_type ?? ''} decorative={false} />
+                    <Typography variant="body2" title={destinationConnection?.name ?? 'Selecciona un destino'}>
+                      {destinationConnection?.name ?? 'Selecciona un destino'}
+                    </Typography>
+                  </Box>
+                  <Typography variant="caption" className="transfer-destination-path" title={destinationPath}>
+                    <InterfaceIcon name="folder" />
+                    {destinationPath === '/' ? 'Carpeta raíz' : destinationPath}
+                  </Typography>
+                </Box>
+              </Box>
             </Box>
           </Box>
-          <Stack className="transfer-options" spacing={0.5}>
+          <Stack className="transfer-options" spacing={0.75}>
             <FormControl size="small" fullWidth>
               <InputLabel id="conflict-policy-label">Si ya existe</InputLabel>
               <Select
@@ -1543,9 +1591,11 @@ function TransferWorkspace({
             />
           </Stack>
           <Button
+            className="transfer-submit"
             variant="contained"
             size="large"
-            disabled={!sourceId || !destinationId || sourceId === destinationId || selectedPaths.length === 0 || busy}
+            startIcon={<InterfaceIcon name="copy" />}
+            disabled={!canTransfer || busy}
             onClick={startTransfer}
           >
             {busy ? <CircularProgress size={22} color="inherit" /> : 'Iniciar transferencia'}

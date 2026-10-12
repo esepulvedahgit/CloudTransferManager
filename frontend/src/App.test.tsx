@@ -465,6 +465,49 @@ describe('Cloud Transfer Manager', () => {
     expect(screen.queryByRole('button', { name: /Agregar conexión/i })).not.toBeInTheDocument();
   });
 
+  it('summarizes the selected route, providers and destination before transfer', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [
+        { id: 'source', name: 'Drive de operaciones', provider_type: 'GOOGLE_DRIVE', status: 'ACTIVE', credentials_configured: true },
+        { id: 'destination', name: 'MEGA de respaldo', provider_type: 'MEGA', status: 'ACTIVE', credentials_configured: true },
+      ] });
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (path.includes('/connections/source/items')) return jsonResponse({
+        items: [{ name: 'informe.csv', path: '/informe.csv', is_dir: false, size_bytes: 120, modified_at: null, mime_type: 'text/csv', provider_type: 'GOOGLE_DRIVE' }],
+        next_cursor: null,
+        total_count: 1,
+      });
+      if (path.includes('/connections/destination/items')) return jsonResponse({ items: [], next_cursor: null, total_count: 0 });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    const summary = screen.getByRole('group', { name: 'Resumen de transferencia' });
+    expect(within(summary).getByRole('heading', { name: 'Prepara tu transferencia' })).toBeVisible();
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Seleccionar informe.csv' }));
+
+    expect(within(summary).getByRole('heading', { name: 'Listo para transferir' })).toBeVisible();
+    expect(within(summary).getByRole('img', { name: 'Transferencia de archivos' })).toBeVisible();
+    expect(summary.querySelector('.cloud-network-mark')).not.toBeInTheDocument();
+    expect(within(summary).getByText('1 elemento listo para copiar')).toBeVisible();
+    expect(within(summary).getByRole('img', { name: 'Google Drive' })).toBeVisible();
+    expect(within(summary).getByRole('img', { name: 'MEGA' })).toBeVisible();
+    expect(within(summary).getByText('Drive de operaciones')).toBeVisible();
+    expect(within(summary).getByText('MEGA de respaldo')).toBeVisible();
+    expect(within(summary).getByText('Carpeta raíz')).toBeVisible();
+    expect(within(summary).getByRole('combobox', { name: 'Si ya existe' })).toBeVisible();
+    expect(within(summary).getByText('Avisarme por correo al terminar')).toBeVisible();
+  });
+
   it('loads the next explorer page when a directory has more than 50 items', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);

@@ -352,3 +352,76 @@ button, input { font: inherit; }
   .header-navigation .MuiTab-root { transition: none; }
 }
 
+.transfer-action {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, .68fr) auto;
+  align-items: center;
+  gap: clamp(16px, 2vw, 28px);
+  overflow: hidden;
+  padding: 18px 20px;
+  border: 1px solid #d9e6f7;
+  background: linear-gradient(110deg, #fff 0%, #f7faff 58%, #edf4ff 100%) !important;
+  box-shadow: var(--soft-shadow);
+}
+.transfer-action::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: linear-gradient(180deg, #397ef1, #8ce4da);
+  content: '';
+}
+.transfer-action-overview { display: flex; align-items: flex-start; gap: 14px; min-width: 0; }
+.transfer-symbol {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  place-items: center;
+  border: 1px solid #d6e9e8;
+  border-radius: 13px;
+  background: #edf7f6;
+  color: #27878b;
+}
+.transfer-symbol .MuiSvgIcon-root { width: 21px; height: 21px; }
+.transfer-action-copy { display: flex; flex: 1; flex-direction: column; align-items: stretch; gap: 3px; min-width: 0; }
+.transfer-action-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.transfer-action-heading .MuiTypography-h6 { font-size: 17px; font-weight: 750; letter-spacing: -.025em; }
+.transfer-selection-chip.MuiChip-root { height: 24px; flex: 0 0 auto; border: 1px solid #d8e6fc; background: #eaf2ff; color: #2458bd; font-size: 11px; font-weight: 700; }
+.transfer-selection-summary { min-height: 20px; }
+.transfer-route { display: grid; grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr); align-items: center; gap: 9px; margin-top: 8px; }
+.transfer-route-point { min-width: 0; }
+.transfer-route-point > .MuiTypography-overline { display: block; color: #8796aa; font-size: 9px; font-weight: 750; line-height: 1.5; letter-spacing: .12em; }
+.transfer-route-connection { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.transfer-route-connection .provider-logo,
+.transfer-route-connection .provider-logo-fallback { width: 20px; height: 20px; flex-basis: 20px; }
+.transfer-route-connection .MuiTypography-root { overflow: hidden; color: #344761; font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-route-arrow { color: #3b91a0; font-size: 19px; text-align: center; }
+.transfer-destination-path { display: flex; align-items: center; gap: 5px; overflow: hidden; margin: 3px 0 0 27px; color: #74849a; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-destination-path .MuiSvgIcon-root { width: 14px; height: 14px; flex: 0 0 14px; color: #8a9bb1; }
+.transfer-options { width: min(250px, 24vw); flex: 0 0 auto; }
+.transfer-options .MuiFormControlLabel-root { margin-left: -5px; }
+.transfer-options .MuiFormControlLabel-label { line-height: 1.35; }
+.transfer-submit.MuiButton-root { min-width: 190px; min-height: 48px; padding-inline: 18px; white-space: nowrap; }
+
+@media (max-width: 1024px) {
+  .transfer-action { grid-template-columns: minmax(0, 1fr) minmax(210px, .65fr); gap: 16px 22px; }
+  .transfer-action-overview { grid-column: 1 / -1; }
+  .transfer-options { grid-column: 1; width: 100%; }
+  .transfer-submit.MuiButton-root { grid-column: 2; justify-self: end; }
+}
+
+@media (max-width: 767px) {
+  .transfer-action { grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 16px; }
+  .transfer-action-overview { grid-column: 1; gap: 11px; }
+  .transfer-symbol { width: 38px; height: 38px; flex-basis: 38px; border-radius: 11px; }
+  .transfer-action-heading { align-items: flex-start; flex-wrap: wrap; gap: 5px 9px; }
+  .transfer-action-heading .MuiTypography-h6 { font-size: 16px; }
+  .transfer-route { grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr); gap: 5px; }
+  .transfer-route-connection { gap: 5px; }
+  .transfer-route-connection .MuiTypography-root { font-size: 11px; }
+  .transfer-destination-path { margin-left: 25px; font-size: 10px; }
+  .transfer-options { grid-column: 1; width: 100%; }
+  .transfer-submit.MuiButton-root { grid-column: 1; justify-self: stretch; width: 100%; min-height: 48px; }
+}
+
