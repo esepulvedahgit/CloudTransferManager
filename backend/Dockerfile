@@ -33,7 +33,12 @@ RUN mkdir -p /var/lib/cloud-transfer/tmp /var/lib/cloud-transfer/staging /var/lo
     && chown -R ctm:ctm /app /var/lib/cloud-transfer /var/log/cloud-transfer \
     && chmod 0700 /var/lib/cloud-transfer/staging
 
+# The entrypoint needs root only to stage file-backed Docker Secrets (0600), then it
+# immediately drops privileges to ctm before starting the application or worker.
+#trivy:ignore:DS-0002
 USER root
 ENTRYPOINT ["/usr/local/bin/ctm-entrypoint"]
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+HEALTHCHECK --interval=20s --timeout=5s --retries=5 --start-period=30s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"

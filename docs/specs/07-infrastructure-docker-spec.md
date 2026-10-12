@@ -22,7 +22,7 @@ Definir la topología de contenedores, la gestión de volúmenes persistentes, l
                                           |
         +-------------------------------+-------------------------------+
         |                               |                               |
-        v :8000                         v :80                           |
+        v :8000                         v :8080                         |
 +---------------+               +---------------+                       |
 |    backend    |               |   frontend    |                       |
 |   (FastAPI)   |               | (Nginx/React) |                       |
@@ -46,12 +46,14 @@ Definir la topología de contenedores, la gestión de volúmenes persistentes, l
 - `postgres`, `redis`, `backend` y `worker` residen en la red interna `ctm_internal` sin mapeo de puertos al host.
 - `reverse-proxy` también se conecta a la red dedicada `ctm_proxy_edge` (bridge no interno). Docker Engine 29 no materializa los puertos publicados para contenedores conectados únicamente a una red `internal`; mantener `ctm_internal` aislada evita dar salida externa a los servicios privados.
 - `0.0.0.0` escucha en todas las interfaces del host, no restringe el origen a la LAN. La restricción LAN-only depende del firewall del host y de no configurar reenvío de esos puertos en el router.
+- El frontend usa `nginxinc/nginx-unprivileged`, escucha en `8080` y ejecuta Nginx como UID `101`; el reverse proxy y el healthcheck apuntan a ese puerto.
+- La imagen del backend define un healthcheck HTTP predeterminado; Compose lo reemplaza para `backend` y lo desactiva en `worker`, que no expone HTTP.
 
 ---
 
 ## 3. Configuración de Secretos (Docker Secrets)
 
-Para evitar almacenar credenciales sensibles en variables de entorno, Compose monta los secretos como archivos en `/run/secrets/`. El entrypoint del backend y worker, iniciado como root, los copia a un `tmpfs` privado en `/run/ctm-secrets/`, con propietario `ctm` y permisos `0600`; después baja privilegios antes de ejecutar la aplicación. Esto evita depender de remapeos de UID/GID que Compose no ofrece para secretos respaldados por archivos locales.
+Para evitar almacenar credenciales sensibles en variables de entorno, Compose monta los secretos como archivos en `/run/secrets/`. El entrypoint del backend y worker, iniciado brevemente como root, los copia a un `tmpfs` privado en `/run/ctm-secrets/`, con propietario `ctm` y permisos `0600`; después baja privilegios mediante `gosu` antes de ejecutar la aplicación. El proceso de aplicación y Celery corren como `ctm` (UID `10001`). La excepción de Trivy `DS-0002` está limitada a esta instrucción `USER root` y documenta ese bootstrap requerido. Esto evita depender de remapeos de UID/GID que Compose no ofrece para secretos respaldados por archivos locales.
 - `master_key`: Clave simétrica de 256 bits para cifrar las credenciales de proveedores.
 - `postgres_password`: Contraseña de la base de datos PostgreSQL.
 - `smtp_password`: Contraseña para autenticar con el servidor de correo.

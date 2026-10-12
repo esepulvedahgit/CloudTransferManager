@@ -23,9 +23,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     expose:
-      - "80"
+      - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
       interval: 20s
       timeout: 3s
       retries: 3
@@ -79,6 +79,8 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    healthcheck:
+      disable: true
     command:
       [
         "celery",
