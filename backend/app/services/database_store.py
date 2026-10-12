@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.models import (
     AuditEvent,
     Base,
+    SMTPSettings,
     StorageConnection,
     TransferCounter,
     TransferEvent,
@@ -23,6 +24,7 @@ from app.services.memory_store import (
     ConnectionInUseError,
     ConnectionRecord,
     ConnectionUnavailableError,
+    SMTPSettingsRecord,
     TransferRecord,
     UserAccount,
 )
@@ -51,6 +53,49 @@ class DatabaseStore:
         async with self.engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
         return True
+
+    @staticmethod
+    def _smtp_settings(row: SMTPSettings) -> SMTPSettingsRecord:
+        return SMTPSettingsRecord(
+            id=row.id,
+            host=row.host,
+            port=row.port,
+            use_tls=row.use_tls,
+            from_address=row.from_address,
+            encrypted_credentials=bytes(row.encrypted_credentials),
+        )
+
+    async def aget_smtp_settings(self) -> SMTPSettingsRecord | None:
+        async with self.sessions() as session:
+            row = await session.scalar(select(SMTPSettings).where(SMTPSettings.scope == "global"))
+            return self._smtp_settings(row) if row else None
+
+    async def asave_smtp_settings(self, settings: SMTPSettingsRecord) -> SMTPSettingsRecord:
+        async with self.sessions() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else "postgresql"
+            insert = pg_insert if dialect == "postgresql" else sqlite_insert
+            statement = insert(SMTPSettings).values(
+                id=settings.id,
+                scope="global",
+                host=settings.host,
+                port=settings.port,
+                use_tls=settings.use_tls,
+                from_address=settings.from_address,
+                encrypted_credentials=settings.encrypted_credentials,
+            )
+            statement = statement.on_conflict_do_update(
+                index_elements=[SMTPSettings.scope],
+                set_={
+                    "host": settings.host,
+                    "port": settings.port,
+                    "use_tls": settings.use_tls,
+                    "from_address": settings.from_address,
+                    "encrypted_credentials": settings.encrypted_credentials,
+                },
+            ).returning(SMTPSettings)
+            row = (await session.scalars(statement)).one()
+            await session.commit()
+            return self._smtp_settings(row)
 
     @staticmethod
     def _user(row: User) -> UserAccount:

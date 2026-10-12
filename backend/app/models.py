@@ -84,6 +84,23 @@ class StorageConnection(Base):
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"))
 
 
+class SMTPSettings(Base):
+    __tablename__ = "smtp_settings"
+    __table_args__ = (
+        CheckConstraint("scope = 'global'", name="ck_smtp_settings_global_scope"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scope: Mapped[str] = mapped_column(
+        String(16), unique=True, default="global", server_default="global"
+    )
+    host: Mapped[str] = mapped_column(String(255))
+    port: Mapped[int] = mapped_column(Integer)
+    use_tls: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    from_address: Mapped[str] = mapped_column(String(255))
+    encrypted_credentials: Mapped[bytes] = mapped_column(LargeBinary)
+
+
 class UserConnectionGrant(Base):
     __tablename__ = "user_connection_grants"
 

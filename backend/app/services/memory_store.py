@@ -68,6 +68,16 @@ class ConnectionRecord:
 
 
 @dataclass
+class SMTPSettingsRecord:
+    id: uuid.UUID
+    host: str
+    port: int
+    use_tls: bool
+    from_address: str
+    encrypted_credentials: bytes
+
+
+@dataclass
 class TransferRecord:
     id: uuid.UUID
     public_id: str
@@ -131,6 +141,7 @@ class MemoryStore:
     def __init__(self) -> None:
         self.users: dict[uuid.UUID, UserAccount] = {}
         self.connections: dict[uuid.UUID, ConnectionRecord] = {}
+        self.smtp_settings: SMTPSettingsRecord | None = None
         self.transfers: dict[uuid.UUID, TransferRecord] = {}
         self.connection_grants: set[tuple[uuid.UUID, uuid.UUID]] = set()
         self.transfer_events: dict[uuid.UUID, list[dict[str, Any]]] = {}
@@ -138,6 +149,13 @@ class MemoryStore:
 
     async def acheck(self) -> bool:
         return True
+
+    async def aget_smtp_settings(self) -> SMTPSettingsRecord | None:
+        return self.smtp_settings
+
+    async def asave_smtp_settings(self, settings: SMTPSettingsRecord) -> SMTPSettingsRecord:
+        self.smtp_settings = settings
+        return settings
 
     def add_user(
         self,
