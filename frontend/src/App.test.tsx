@@ -534,6 +534,7 @@ describe('Cloud Transfer Manager', () => {
         conflict_policy: 'OVERWRITE_IF_DIFFERENT',
         send_email_notification: false,
       };
+      let completedTransfer: typeof transfer | null = null;
       const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
         if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
@@ -549,7 +550,9 @@ describe('Cloud Transfer Manager', () => {
           { id: 'destination', name: 'Destino', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
         ] });
         if (path.endsWith('/transfers') && init?.method === 'POST') return jsonResponse(transfer, 201);
-        if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+        if (path.endsWith('/transfers')) {
+          return jsonResponse({ items: completedTransfer ? [completedTransfer] : [] });
+        }
         if (path.includes('/connections/source/items')) return jsonResponse({ items: [
           { name: 'origen.txt', path: '/origen.txt', is_dir: false, size_bytes: 4, modified_at: null, mime_type: 'text/plain', provider_type: 'MOCK' },
         ], next_cursor: null, total_count: 1 });
@@ -581,10 +584,27 @@ describe('Cloud Transfer Manager', () => {
       await waitFor(() => expect(screen.getByText('RUNNING')).toBeVisible());
       expect(destinationItemsRequests).toBe(1);
 
-      eventSource.emit({ ...transfer, status: terminalStatus, progress_percent: 100, files_completed: 1, bytes_transferred: 4 });
+      completedTransfer = {
+        ...transfer,
+        status: terminalStatus,
+        progress_percent: 100,
+        files_completed: 1,
+        bytes_transferred: 4,
+      };
+      eventSource.emit(completedTransfer);
 
       expect(await screen.findByText('archivo-copiado.txt')).toBeVisible();
+      if (terminalStatus === 'COMPLETED') {
+        expect(screen.getByText('100.0%')).toBeVisible();
+        await new Promise((resolve) => window.setTimeout(resolve, 2_500));
+        expect(screen.getByText('100.0%')).toBeVisible();
+        await new Promise((resolve) => window.setTimeout(resolve, 750));
+        expect(screen.queryByText('100.0%')).not.toBeInTheDocument();
+        expect(screen.queryByText(/TRANSFERENCIA ACTIVA · TRF-2026-000001/)).not.toBeInTheDocument();
+        expect(screen.getByText('TRF-2026-000001')).toBeVisible();
+      }
     },
+    10_000,
   );
 
   it('requires the user to change an initial password before normal use', async () => {

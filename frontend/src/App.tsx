@@ -91,6 +91,7 @@ type Transfer = {
   completed_at?: string | null;
 };
 const terminalTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED'];
+const terminalProgressDisplayMs = 3_000;
 type LoginForm = { username_or_email: string; password: string };
 type ConnectionForm = {
   name: string;
@@ -1234,6 +1235,38 @@ function TransferWorkspace({
   }, [activeTransfer, latestTransfer]);
 
   useEffect(() => {
+    if (!activeTransfer || !terminalTransferStatuses.includes(activeTransfer.status)) return;
+
+    const terminalTransfer = activeTransfer;
+    queryClient.setQueryData<{ items: Transfer[] }>(['transfers'], (current) => {
+      const items = current?.items ?? [];
+      const existingTransfer = items.some((transfer) => transfer.id === terminalTransfer.id);
+      return {
+        ...(current ?? {}),
+        items: existingTransfer
+          ? items.map((transfer) => (
+            transfer.id === terminalTransfer.id
+              ? { ...transfer, ...terminalTransfer }
+              : transfer
+          ))
+          : [terminalTransfer, ...items],
+      };
+    });
+    void queryClient.invalidateQueries({ queryKey: ['transfers'] });
+    void queryClient.invalidateQueries({
+      queryKey: ['items', terminalTransfer.destination_connection_id, terminalTransfer.destination_path],
+    });
+
+    const timeout = window.setTimeout(() => {
+      setActiveTransfer((current) => (
+        current?.id === terminalTransfer.id ? null : current
+      ));
+    }, terminalProgressDisplayMs);
+
+    return () => window.clearTimeout(timeout);
+  }, [activeTransfer, queryClient]);
+
+  useEffect(() => {
     const oauthResult = new URLSearchParams(window.location.search).get('google_oauth');
     if (!oauthResult) return;
     setNotice(oauthResult === 'success'
@@ -1293,10 +1326,6 @@ function TransferWorkspace({
       setActiveTransfer(update);
       if (terminalTransferStatuses.includes(update.status)) {
         stream.close();
-        void queryClient.invalidateQueries({ queryKey: ['transfers'] });
-        void queryClient.invalidateQueries({
-          queryKey: ['items', update.destination_connection_id, update.destination_path],
-        });
       }
     };
     return () => stream.close();

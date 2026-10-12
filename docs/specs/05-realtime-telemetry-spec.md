@@ -52,6 +52,7 @@ Proporcionar una experiencia fluida y transparente en la interfaz web mostrando 
 - El parser de MEGAcmd acepta únicamente métricas numéricas reconocidas; salida desconocida se ignora. `current_item` conserva la ruta remota y nunca expone una ruta local de staging ni la línea cruda del proceso.
 - **Resiliencia ante Desconexión:** El hook del frontend debe implementar reconexión automática con backoff si se pierde temporalmente la conexión SSE.
 - **Persistencia en Segundo Plano:** Cerrar o refrescar la pestaña del navegador **NUNCA** cancela el trabajo en ejecución. Al volver a abrir la página, el frontend se suscribe nuevamente al stream y recupera el estado.
+- **Cierre del progreso terminal:** Al terminar una transferencia, mostrar su estado final durante 3 segundos, refrescar el historial y la carpeta destino y después retirar la tarjeta de progreso activo. El registro permanece en el historial.
 
 ---
 
