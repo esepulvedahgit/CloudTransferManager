@@ -15,7 +15,7 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.sessions import SessionMiddleware
@@ -40,10 +40,21 @@ from app.services.memory_store import (
     ConnectionRecord,
     ConnectionUnavailableError,
     MemoryStore,
+    SMTPSettingsRecord,
     TransferRecord,
     UserAccount,
 )
 from app.services.rclone import RcloneRunner
+from app.services.smtp_config import (
+    SMTPConnectionError,
+    SMTPServerConfig,
+    decrypt_smtp_credentials,
+    encrypt_smtp_credentials,
+    environment_smtp_config,
+    test_smtp_connection,
+    validate_smtp_host,
+    validate_smtp_sender,
+)
 from app.services.transfer_executor import TransferExecutor
 from app.settings import Settings, get_settings
 
@@ -106,6 +117,36 @@ class ConnectionUpdate(BaseModel):
 
 class ConnectionTestRequest(BaseModel):
     otp: str | None = Field(default=None, min_length=1, max_length=32)
+
+
+class SMTPSettingsRequest(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    use_tls: bool
+    from_address: str = Field(min_length=3, max_length=255)
+    username: SecretStr | None = Field(default=None, max_length=255)
+    password: SecretStr | None = Field(default=None, max_length=1024)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        return validate_smtp_host(value)
+
+    @field_validator("from_address")
+    @classmethod
+    def validate_from_address(cls, value: str) -> str:
+        return validate_smtp_sender(value)
+
+    @model_validator(mode="after")
+    def validate_credential_pair(self) -> "SMTPSettingsRequest":
+        username = self.username.get_secret_value().strip() if self.username else ""
+        password = self.password.get_secret_value() if self.password else ""
+        if bool(username) != bool(password):
+            raise ValueError("SMTP username and password must be supplied together")
+        for value in (username, password):
+            if any(character in value for character in "\r\n\x00"):
+                raise ValueError("Invalid SMTP credential")
+        return self
 
 
 _GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -743,6 +784,137 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             result="SUCCESS",
         )
         return {"message": "Contraseña restablecida"}
+
+    def smtp_credentials_for_record(record: SMTPSettingsRecord | None) -> tuple[str, str]:
+        if record is not None and record.encrypted_credentials:
+            try:
+                return decrypt_smtp_credentials(config, record)
+            except (OSError, ValueError):
+                raise HTTPException(
+                    status_code=503, detail="No se pudieron cargar las credenciales SMTP"
+                ) from None
+        environment = environment_smtp_config(config)
+        return environment.username, environment.password
+
+    def smtp_settings_response(record: SMTPSettingsRecord | None) -> dict[str, Any]:
+        if record is None:
+            environment = environment_smtp_config(config)
+            return {
+                "host": environment.host,
+                "port": environment.port,
+                "use_tls": environment.use_tls,
+                "from_address": environment.from_address,
+                "credentials_configured": bool(environment.username and environment.password),
+            }
+        return {
+            "host": record.host,
+            "port": record.port,
+            "use_tls": record.use_tls,
+            "from_address": record.from_address,
+            "credentials_configured": bool(record.encrypted_credentials),
+        }
+
+    def smtp_request_credentials(payload: SMTPSettingsRequest) -> tuple[str, str] | None:
+        username = payload.username.get_secret_value().strip() if payload.username else ""
+        password = payload.password.get_secret_value() if payload.password else ""
+        return (username, password) if username and password else None
+
+    @app.get("/api/v1/settings/smtp")
+    async def get_smtp_settings(
+        _admin: UserAccount = Depends(admin_user),
+    ) -> dict[str, Any]:
+        record = await app.state.store.aget_smtp_settings()
+        return smtp_settings_response(record)
+
+    @app.put("/api/v1/settings/smtp")
+    async def update_smtp_settings(
+        payload: SMTPSettingsRequest,
+        request: Request,
+        admin: UserAccount = Depends(admin_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        previous = await app.state.store.aget_smtp_settings()
+        settings_id = previous.id if previous else uuid.uuid4()
+        credentials = smtp_request_credentials(payload)
+        if credentials is not None:
+            try:
+                encrypted_credentials = encrypt_smtp_credentials(
+                    config, settings_id, credentials[0], credentials[1]
+                )
+            except (OSError, ValueError):
+                raise HTTPException(
+                    status_code=503, detail="No se pudieron guardar las credenciales SMTP"
+                ) from None
+        elif previous is not None:
+            encrypted_credentials = previous.encrypted_credentials
+        else:
+            environment = environment_smtp_config(config)
+            if environment.username and environment.password:
+                try:
+                    encrypted_credentials = encrypt_smtp_credentials(
+                        config, settings_id, environment.username, environment.password
+                    )
+                except (OSError, ValueError):
+                    raise HTTPException(
+                        status_code=503, detail="No se pudieron guardar las credenciales SMTP"
+                    ) from None
+            else:
+                encrypted_credentials = b""
+
+        record = SMTPSettingsRecord(
+            id=settings_id,
+            host=payload.host,
+            port=payload.port,
+            use_tls=payload.use_tls,
+            from_address=payload.from_address,
+            encrypted_credentials=encrypted_credentials,
+        )
+        await app.state.store.asave_smtp_settings(record)
+        changed_fields = (
+            ["host", "port", "use_tls", "from_address"]
+            if previous is None
+            else [
+                name
+                for name in ("host", "port", "use_tls", "from_address")
+                if getattr(previous, name) != getattr(record, name)
+            ]
+        )
+        await audit_request(
+            request,
+            actor_user_id=admin.id,
+            action="SMTP_SETTINGS_UPDATED",
+            resource_type="settings",
+            resource_id=str(record.id),
+            result="SUCCESS",
+            metadata={"changed_fields": changed_fields},
+        )
+        return smtp_settings_response(record)
+
+    @app.post("/api/v1/settings/smtp/test")
+    async def test_smtp_settings(
+        payload: SMTPSettingsRequest,
+        _admin: UserAccount = Depends(admin_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        credentials = smtp_request_credentials(payload)
+        if credentials is None:
+            stored = await app.state.store.aget_smtp_settings()
+            credentials = smtp_credentials_for_record(stored)
+        server_config = SMTPServerConfig(
+            host=payload.host,
+            port=payload.port,
+            username=credentials[0],
+            password=credentials[1],
+            from_address=payload.from_address,
+            use_tls=payload.use_tls,
+        )
+        try:
+            await asyncio.to_thread(test_smtp_connection, server_config)
+        except SMTPConnectionError:
+            return {"success": False, "message": "No se pudo conectar con SMTP"}
+        return {"success": True, "message": "Conexión SMTP correcta"}
 
     @app.get("/api/v1/audit-events")
     async def list_audit_events(

@@ -77,7 +77,39 @@ Todas las mutaciones requieren el encabezado `X-CSRF-Token`. Obtenerlo con `GET 
 
 ---
 
-## 3. Conexiones (`/connections`)
+## 3. Configuración SMTP (`/settings/smtp`) [Solo ADMIN]
+
+Todas las rutas requieren una sesión de administrador. `PUT` y `POST .../test` también requieren `X-CSRF-Token`.
+
+### `GET /api/v1/settings/smtp`
+- Devuelve `host`, `port`, `use_tls`, `from_address` y `credentials_configured`.
+- Nunca devuelve el usuario SMTP ni la contraseña. Antes del primer guardado muestra los valores no secretos del entorno actual.
+
+### `PUT /api/v1/settings/smtp`
+- **Request Body:**
+```json
+{
+  "host": "smtp.example.test",
+  "port": 587,
+  "use_tls": true,
+  "from_address": "notificaciones@example.test",
+  "username": "",
+  "password": ""
+}
+```
+- `port` debe estar entre 1 y 65535; `host` y `from_address` se validan antes de guardar. Usuario y contraseña se envían juntos o se omiten juntos. Si ambos quedan vacíos, se conservan las credenciales actuales.
+- Usuario y contraseña se cifran juntos con AES-256-GCM envelope usando la clave maestra montada desde Docker Secret. Ni la respuesta ni la auditoría contienen sus valores.
+- **Response `200 OK`:** devuelve los mismos campos seguros de `GET` y el indicador `credentials_configured`.
+- Registra `SMTP_SETTINGS_UPDATED` con una lista de nombres de campos modificados, sin valores sensibles.
+
+### `POST /api/v1/settings/smtp/test`
+- Acepta el mismo cuerpo que `PUT` y prueba el borrador sin guardarlo ni enviar un correo. Si se omiten las credenciales, usa las guardadas o las disponibles en el entorno.
+- Negocia SMTP y STARTTLS según `use_tls`, y autentica cuando hay credenciales configuradas.
+- **Response `200 OK`:** `{ "success": true, "message": "Conexión SMTP correcta" }` o `{ "success": false, "message": "No se pudo conectar con SMTP" }`. Los detalles de la respuesta del servidor no se devuelven.
+
+---
+
+## 4. Conexiones (`/connections`)
 
 `GET /api/v1/connections` devuelve únicamente las conexiones globales o asignadas al usuario. Los campos de credenciales nunca forman parte de las respuestas.
 Las conexiones MEGA, Google Drive y Seafile nuevas quedan `INACTIVE` hasta superar la prueba; las simuladas quedan activas. Un administrador puede ejecutar la prueba desde el explorador o mediante el endpoint siguiente.
@@ -167,7 +199,7 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 
 ---
 
-## 4. Explorador (`/connections/{id}/items`)
+## 5. Explorador (`/connections/{id}/items`)
 
 ### `GET /api/v1/connections/{connection_id}/items`
 - **Query Params:** `path=/`, `cursor=`, `page_size=50`, `sort=name`, `direction=asc`, `search=`
@@ -199,7 +231,7 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 
 ---
 
-## 5. Transferencias (`/transfers`)
+## 6. Transferencias (`/transfers`)
 
 ### `POST /api/v1/transfers`
 - **Request Body:**
@@ -241,7 +273,7 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 ### `POST /api/v1/transfers/{transfer_id}/cancel`
 - **Response `200 OK`:** Envía orden de cancelación inmediata al worker.
 
-## 6. Auditoría (`/audit-events`) [Solo ADMIN]
+## 7. Auditoría (`/audit-events`) [Solo ADMIN]
 
 ### `GET /api/v1/audit-events?limit=100`
 - Devuelve los eventos de auditoría más recientes, con secretos sanitizados.
