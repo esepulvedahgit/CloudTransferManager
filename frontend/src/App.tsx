@@ -22,6 +22,7 @@ import {
   Paper,
   Select,
   Stack,
+  SvgIcon,
   Tab,
   Tabs,
   TextField,
@@ -72,7 +73,9 @@ type Transfer = {
   id: string;
   public_id: string;
   status: string;
+  source_connection_id?: string;
   destination_connection_id: string;
+  source_paths?: string[];
   destination_path: string;
   progress_percent: number;
   files_completed: number;
@@ -83,6 +86,9 @@ type Transfer = {
   average_speed_bps: number | null;
   current_speed_bps: number | null;
   estimated_remaining_seconds?: number | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
 };
 const terminalTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED'];
 type LoginForm = { username_or_email: string; password: string };
@@ -122,6 +128,55 @@ const theme = createTheme({
 
 const loginSchema = z.object({ username_or_email: z.string().min(1), password: z.string().min(1) });
 
+function InterfaceIcon({ name }: { name: 'folder' | 'file' | 'copy' | 'refresh' | 'archive' | 'settings' | 'key' | 'logout' }) {
+  const paths = {
+    folder: <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h5l2 2h8A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z" />,
+    file: <path d="M7 3.75h7l4 4v12.5H7a2 2 0 0 1-2-2v-12.5a2 2 0 0 1 2-2Zm7 0v4h4M8.5 12h7M8.5 15h7" />,
+    copy: <path d="M8 8V4.75A1.75 1.75 0 0 1 9.75 3h9.5A1.75 1.75 0 0 1 21 4.75v9.5A1.75 1.75 0 0 1 19.25 16H16M4.75 8H14A2 2 0 0 1 16 10v9.25A1.75 1.75 0 0 1 14.25 21h-9.5A1.75 1.75 0 0 1 3 19.25v-9.5A1.75 1.75 0 0 1 4.75 8Z" />,
+    refresh: <path d="M20 7v5h-5M4 17v-5h5m10.25-3A7 7 0 0 0 6.1 6.1L4 8m16 8-2.1 1.9A7 7 0 0 1 4.75 15" />,
+    archive: <path d="M4 7h16v13H4zM3 4h18v3H3zm5 7h8" />,
+    settings: <><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z" /><path d="m19.4 15 .1.1 1.2.9-1.5 2.6-1.4-.6a8 8 0 0 1-1.8 1l-.2 1.5h-3l-.3-1.5a8 8 0 0 1-1.8-1l-1.4.6-1.5-2.6 1.2-.9a7 7 0 0 1 0-2.1l-1.2-.9 1.5-2.6 1.4.6a8 8 0 0 1 1.8-1l.3-1.5h3l.2 1.5a8 8 0 0 1 1.8 1l1.4-.6 1.5 2.6-1.2.9a7 7 0 0 1 0 2Z" transform="translate(-1 -1) scale(.98)" /></>,
+    key: <path d="M14.5 9a5 5 0 1 1-1.47-3.54L21 13v3h-3v3h-3v-3h-3l-2.1-2.1M7.5 9h.01" />,
+    logout: <path d="M10 5H5v14h5m4-3 4-4-4-4m4 4H9" />,
+  };
+  return <SvgIcon fontSize="small" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</g></SvgIcon>;
+}
+
+function CloudNetworkMark() {
+  return (
+    <svg className="cloud-network-mark" viewBox="0 0 48 48" role="img" aria-label="Cloud Transfer Manager" focusable="false">
+      <path
+        className="cloud-network-outline"
+        d="M14.7 36h18a8.25 8.25 0 0 0 .45-16.49A11.6 11.6 0 0 0 10.8 17.6 8.5 8.5 0 0 0 14.7 36Z"
+      />
+      <path className="cloud-network-links" d="m15.5 27.5 7-7 9 7-9 5.5-7-5.5Zm7-7v12.5m-7-5.5h16" />
+      <circle className="cloud-network-node" cx="15.5" cy="27.5" r="2.7" />
+      <circle className="cloud-network-node" cx="22.5" cy="20.5" r="2.7" />
+      <circle className="cloud-network-node cloud-network-node-accent" cx="31.5" cy="27.5" r="2.7" />
+      <circle className="cloud-network-node" cx="22.5" cy="33" r="2.7" />
+    </svg>
+  );
+}
+
+const providerAssets: Record<string, { label: string; src: string }> = {
+  MEGA: { label: 'MEGA', src: '/brand/mega.svg' },
+  GOOGLE_DRIVE: { label: 'Google Drive', src: '/brand/google-drive.png' },
+  SEAFILE: { label: 'Seafile', src: '/brand/seafile.svg' },
+};
+
+function ProviderLogo({ provider, decorative = true }: { provider: string; decorative?: boolean }) {
+  const asset = providerAssets[provider];
+  if (!asset) return <span className="provider-logo-fallback" aria-hidden="true">☁</span>;
+  return (
+    <img
+      className={`provider-logo${decorative ? ' provider-logo-decorative' : ''}`}
+      src={asset.src}
+      alt={decorative ? '' : asset.label}
+      aria-hidden={decorative || undefined}
+    />
+  );
+}
+
 function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -152,7 +207,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
     <Box className="login-shell">
       <Box className="login-aside">
         <Stack direction="row" alignItems="center" spacing={1.5}>
-          <Box className="brand-mark" aria-hidden="true">CT</Box>
+          <Box className="brand-mark"><CloudNetworkMark /></Box>
           <Typography variant="h6" component="h1" fontWeight={750}>Cloud Transfer Manager</Typography>
         </Stack>
         <Typography variant="overline" className="eyebrow">TRANSFERENCIAS PRIVADAS</Typography>
@@ -160,10 +215,14 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
         <Typography className="login-copy">
           Explora tus conexiones de almacenamiento y mueve información con trazabilidad de principio a fin.
         </Typography>
-        <Box className="login-visual" aria-hidden="true">
-          <Box className="cloud-node">MEGA</Box>
+        <Box className="login-visual">
+          <Box className="cloud-node"><ProviderLogo provider="MEGA" decorative={false} /><span>MEGA</span></Box>
           <Box className="transfer-line"><span /><span /><span /></Box>
-          <Box className="cloud-node drive-node">DRIVE</Box>
+          <Box className="cloud-node drive-node"><ProviderLogo provider="GOOGLE_DRIVE" decorative={false} /><span>Google Drive</span></Box>
+          <Box className="provider-strip" role="group" aria-label="Proveedores disponibles">
+            <ProviderLogo provider="SEAFILE" decorative={false} />
+            <Typography variant="caption">Seafile</Typography>
+          </Box>
           <Box className="visual-caption">Transferencias seguras · Progreso en vivo</Box>
         </Box>
       </Box>
@@ -322,7 +381,12 @@ function ConnectionDialog({
 
   return (
     <Dialog open={open} onClose={close} fullWidth maxWidth="sm" aria-labelledby="connection-dialog-title">
-      <DialogTitle id="connection-dialog-title">Agregar conexión</DialogTitle>
+      <DialogTitle id="connection-dialog-title">
+        Agregar conexión
+        <Typography component="span" display="block" variant="body2" color="text.secondary" sx={{ mt: 0.5, fontWeight: 400, letterSpacing: 0 }}>
+          Configura el acceso y define quién podrá usar este almacenamiento.
+        </Typography>
+      </DialogTitle>
       <Box component="form" onSubmit={handleSubmit(submit)} noValidate>
         <DialogContent>
           <Stack spacing={2}>
@@ -339,10 +403,10 @@ function ConnectionDialog({
                 control={control}
                 render={({ field }) => (
                   <Select {...field} labelId="provider-label" label="Proveedor">
-                    <MenuItem value="MEGA">MEGA</MenuItem>
-                    <MenuItem value="GOOGLE_DRIVE">Google Drive</MenuItem>
-                    <MenuItem value="SEAFILE">Seafile</MenuItem>
-                    <MenuItem value="MOCK">Simulado (pruebas)</MenuItem>
+                    <MenuItem value="MEGA"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MEGA" />MEGA</Stack></MenuItem>
+                    <MenuItem value="GOOGLE_DRIVE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="GOOGLE_DRIVE" />Google Drive</Stack></MenuItem>
+                    <MenuItem value="SEAFILE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="SEAFILE" />Seafile</Stack></MenuItem>
+                    <MenuItem value="MOCK"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MOCK" />Simulado (pruebas)</Stack></MenuItem>
                   </Select>
                 )}
               />
@@ -478,7 +542,12 @@ function ChangePasswordDialog({
   };
   return (
     <Dialog open={open} onClose={canClose ? onClose : undefined} fullWidth maxWidth="xs" aria-labelledby="password-dialog-title">
-      <DialogTitle id="password-dialog-title">Cambia tu contraseña</DialogTitle>
+      <DialogTitle id="password-dialog-title">
+        Cambia tu contraseña
+        <Typography component="span" display="block" variant="body2" color="text.secondary" sx={{ mt: 0.5, fontWeight: 400, letterSpacing: 0 }}>
+          Elige una clave de al menos 12 caracteres.
+        </Typography>
+      </DialogTitle>
       <Box component="form" onSubmit={handleSubmit(submit)} noValidate>
         <DialogContent>
           <Stack spacing={2}>
@@ -582,10 +651,15 @@ function AdminDialog({
 
   return (
     <Dialog open={open} onClose={onClose} fullWidth maxWidth="md" aria-labelledby="admin-dialog-title">
-      <DialogTitle id="admin-dialog-title">Administración</DialogTitle>
+      <DialogTitle id="admin-dialog-title">
+        Administración
+        <Typography component="span" display="block" variant="body2" color="text.secondary" sx={{ mt: 0.5, fontWeight: 400, letterSpacing: 0 }}>
+          Gestiona usuarios, accesos privados y actividad reciente.
+        </Typography>
+      </DialogTitle>
       <DialogContent>
         <Stack spacing={3}>
-          <Box>
+          <Box className="admin-section">
             <Typography variant="h6" sx={{ mb: 1.5 }}>Crear usuario</Typography>
             <Box component="form" onSubmit={handleSubmit(createUser)} noValidate>
               <Stack spacing={1.5}>
@@ -608,7 +682,7 @@ function AdminDialog({
             </Box>
           </Box>
 
-          <Box>
+          <Box className="admin-section">
             <Typography variant="h6" sx={{ mb: 1 }}>Usuarios</Typography>
             <Paper variant="outlined" className="admin-list">
               {usersQuery.isLoading && <LinearProgress />}
@@ -616,7 +690,7 @@ function AdminDialog({
                 <Box className="admin-user-row" key={managedUser.id}>
                   <Box>
                     <Typography fontWeight={650}>{managedUser.username}</Typography>
-                    <Typography variant="caption" color="text.secondary">{managedUser.email} · {managedUser.role}</Typography>
+                    <Typography variant="caption" color="text.secondary">{managedUser.email} · {managedUser.role === 'ADMIN' ? 'Administrador' : 'Usuario'}</Typography>
                   </Box>
                   {managedUser.is_active
                     ? <Button size="small" color="error" disabled={managedUser.id === currentUserId} onClick={() => void deactivate(managedUser.id)}>Desactivar</Button>
@@ -626,7 +700,7 @@ function AdminDialog({
             </Paper>
           </Box>
 
-          <Box>
+          <Box className="admin-section">
             <Typography variant="h6" sx={{ mb: 1 }}>Acceso a conexiones privadas</Typography>
             {privateConnections.length === 0
               ? <Typography variant="body2" color="text.secondary">No hay conexiones privadas pendientes de asignación.</Typography>
@@ -640,20 +714,29 @@ function AdminDialog({
                   <FormControl fullWidth size="small">
                     <InputLabel id="grant-connection-label">Conexión</InputLabel>
                     <Select labelId="grant-connection-label" label="Conexión" value={selectedConnection} onChange={(event) => setSelectedConnection(event.target.value)}>
-                      {privateConnections.map((connection) => <MenuItem key={connection.id} value={connection.id}>{connection.name}</MenuItem>)}
+                      {privateConnections.map((connection) => (
+                        <MenuItem key={connection.id} value={connection.id}>
+                          <Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider={connection.provider_type} />{connection.name}</Stack>
+                        </MenuItem>
+                      ))}
                     </Select>
                   </FormControl>
                   <Button variant="outlined" disabled={!selectedUser || !selectedConnection} onClick={() => void grantConnection()}>Asignar</Button>
                 </Stack>}
           </Box>
 
-          <Box>
+          <Box className="admin-section">
             <Typography variant="h6" sx={{ mb: 1 }}>Auditoría reciente</Typography>
             <Paper variant="outlined" className="admin-list">
               {(auditQuery.data?.items ?? []).slice(0, 5).map((event) => (
                 <Box className="admin-user-row" key={event.id}>
                   <Typography variant="body2">{event.action.replaceAll('_', ' ')}</Typography>
-                  <Typography variant="caption" color="text.secondary">{event.result}</Typography>
+                  <Box className="audit-event-meta">
+                    <Typography variant="caption" color="text.secondary">{event.result}</Typography>
+                    <Typography component="time" dateTime={event.created_at} variant="caption" color="text.secondary">
+                      {formatRequestedAt(event.created_at) ?? 'Fecha no disponible'}
+                    </Typography>
+                  </Box>
                 </Box>
               ))}
             </Paper>
@@ -681,6 +764,49 @@ function formatBytes(size: number | null): string {
     index += 1;
   }
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[index]}`;
+}
+
+function formatRequestedAt(value?: string | null): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return new Intl.DateTimeFormat('es-CL', { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+}
+
+function formatTransferDuration(transfer: Transfer): string {
+  const isTerminal = terminalTransferStatuses.includes(transfer.status);
+  if (!transfer.started_at) {
+    return isTerminal ? 'Duración no disponible' : 'En cola';
+  }
+  if (isTerminal && !transfer.completed_at) return 'Duración no disponible';
+  const start = new Date(transfer.started_at).getTime();
+  const end = transfer.completed_at ? new Date(transfer.completed_at).getTime() : Date.now();
+  if (Number.isNaN(start) || Number.isNaN(end)) return 'Duración no disponible';
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  const elapsed = hours > 0
+    ? `${hours} h ${minutes} min`
+    : minutes > 0
+      ? `${minutes} min ${remainingSeconds} s`
+      : `${remainingSeconds} s`;
+  return transfer.completed_at ? `Duración: ${elapsed}` : `En curso · ${elapsed}`;
+}
+
+function transferStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    QUEUED: 'En cola',
+    VALIDATING: 'Validando',
+    RUNNING: 'En curso',
+    RETRYING: 'Reintentando',
+    CANCELLING: 'Cancelando',
+    COMPLETED: 'Completada',
+    COMPLETED_WITH_WARNINGS: 'Completada con avisos',
+    FAILED: 'Fallida',
+    CANCELLED: 'Cancelada',
+  };
+  return labels[status] ?? status.replaceAll('_', ' ').toLowerCase();
 }
 
 function providerLabel(provider: string): string {
@@ -714,7 +840,9 @@ function lastTestLabel(connection: Connection): string {
   const result = connection.last_test_status === 'SUCCESS' ? 'Prueba exitosa' : 'Prueba fallida';
   if (!connection.last_tested_at) return result;
   const date = new Date(connection.last_tested_at);
-  return Number.isNaN(date.getTime()) ? result : `${result} · ${date.toLocaleString()}`;
+  return Number.isNaN(date.getTime())
+    ? result
+    : `${result} · ${new Intl.DateTimeFormat('es-CL', { dateStyle: 'medium', timeStyle: 'short' }).format(date)}`;
 }
 
 function ConnectionManagementSection({
@@ -770,7 +898,7 @@ function ConnectionManagementSection({
             Revisa su estado y archiva las que ya no uses. El historial de transferencias se conserva.
           </Typography>
         </Box>
-        <Button variant="contained" onClick={onAdd}>＋ Agregar conexión</Button>
+        <Button variant="contained" onClick={onAdd} startIcon={<span aria-hidden="true">＋</span>}>Agregar conexión</Button>
       </Box>
 
       <Paper className="connection-inventory" elevation={0} role="list" aria-label="Inventario de conexiones">
@@ -802,8 +930,13 @@ function ConnectionManagementSection({
           <Box className="connection-row" component="article" role="listitem" key={connection.id}>
             <Box className="connection-name-field">
               <span className="connection-field-label">Conexión</span>
-              <Typography fontWeight={700}>{connection.name}</Typography>
-              <Typography variant="caption" color="text.secondary">{providerLabel(connection.provider_type)}</Typography>
+              <Box className="connection-identity">
+                <ProviderLogo provider={connection.provider_type} />
+                <Box className="connection-name-field">
+                  <Typography fontWeight={700}>{connection.name}</Typography>
+                  <Typography variant="caption" color="text.secondary">{providerLabel(connection.provider_type)}</Typography>
+                </Box>
+              </Box>
               {connectionAdapterLabel(connection) && (
                 <Typography variant="caption" color="text.secondary">
                   {connectionAdapterLabel(connection)}
@@ -826,6 +959,7 @@ function ConnectionManagementSection({
               <Button
                 color="error"
                 variant="text"
+                startIcon={<InterfaceIcon name="archive" />}
                 aria-label={`Archivar ${connection.name}`}
                 onClick={() => requestArchive(connection)}
               >
@@ -850,7 +984,7 @@ function ConnectionManagementSection({
               ¿Quieres archivar <strong>{selectedConnection?.name}</strong>? Dejará de aparecer en el explorador y se quitarán sus credenciales guardadas.
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              Proveedor: {selectedConnection ? providerLabel(selectedConnection.provider_type) : ''}
+              <span className="dialog-provider"><ProviderLogo provider={selectedConnection?.provider_type ?? ''} />Proveedor: {selectedConnection ? providerLabel(selectedConnection.provider_type) : ''}</span>
             </Typography>
             <Typography color="text.secondary" variant="body2">
               El historial de transferencias se conservará. No se puede archivar una conexión mientras tenga una transferencia activa.
@@ -947,15 +1081,18 @@ function ExplorerPanel({
             }}
           >
             {connections.map((connection) => (
-              <MenuItem key={connection.id} value={connection.id}>{connection.name}</MenuItem>
+              <MenuItem key={connection.id} value={connection.id}>
+                <Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider={connection.provider_type} />{connection.name}</Stack>
+              </MenuItem>
             ))}
           </Select>
         </FormControl>
         {active && (
           <>
             <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-              <Typography variant="caption" color="text.secondary">
-                Estado: {active.status === 'ACTIVE' ? 'activa' : active.status === 'ERROR' ? 'requiere atención' : 'pendiente de prueba'}
+              <Typography className="explorer-connection-status" variant="caption" color="text.secondary">
+                <ProviderLogo provider={active.provider_type} />
+                {providerLabel(active.provider_type)} · {active.status === 'ACTIVE' ? 'activa' : active.status === 'ERROR' ? 'requiere atención' : 'pendiente de prueba'}
               </Typography>
               {isAdmin && (
                 <Button size="small" onClick={() => void testConnection()} disabled={testing}>
@@ -1017,7 +1154,7 @@ function ExplorerPanel({
                     className="file-name"
                     onClick={() => item.is_dir && onPathChange(item.path)}
                     disabled={!item.is_dir}
-                    startIcon={<span aria-hidden="true">{item.is_dir ? '▰' : '↗'}</span>}
+                    startIcon={<InterfaceIcon name={item.is_dir ? 'folder' : 'file'} />}
                   >
                     <span>{item.name}</span>
                   </Button>
@@ -1065,6 +1202,7 @@ function TransferWorkspace({
     refetchInterval: 3_000,
   });
   const connections = connectionsQuery.data?.items ?? [];
+  const connectionById = new Map(connections.map((connection) => [connection.id, connection]));
   const [sourceId, setSourceId] = useState('');
   const [destinationId, setDestinationId] = useState('');
   const [sourcePath, setSourcePath] = useState('/');
@@ -1082,6 +1220,12 @@ function TransferWorkspace({
   const [adminDialogOpen, setAdminDialogOpen] = useState(false);
   const [passwordDialogOpen, setPasswordDialogOpen] = useState(Boolean(user.must_change_password));
   const latestTransfer = useMemo(() => transfersQuery.data?.items[0], [transfersQuery.data]);
+  const historyTransfers = (transfersQuery.data?.items ?? []).map((transfer) => (
+    activeTransfer?.id === transfer.id ? { ...transfer, ...activeTransfer } : transfer
+  ));
+  if (activeTransfer && !historyTransfers.some((transfer) => transfer.id === activeTransfer.id)) {
+    historyTransfers.unshift(activeTransfer);
+  }
 
   useEffect(() => {
     if (!activeTransfer && latestTransfer && ['QUEUED', 'VALIDATING', 'RUNNING', 'RETRYING', 'CANCELLING'].includes(latestTransfer.status)) {
@@ -1260,14 +1404,40 @@ function TransferWorkspace({
       <AppBar position="sticky" elevation={0} className="topbar">
         <Toolbar className="topbar-inner">
           <Stack className="topbar-brand" direction="row" alignItems="center" spacing={1.2}>
-            <Box className="small-brand-mark">CT</Box>
-            <Typography variant="subtitle1" fontWeight={750}>Cloud Transfer Manager</Typography>
+            <Box className="small-brand-mark"><CloudNetworkMark /></Box>
+            <Box className="topbar-wordmark">
+              <Typography variant="subtitle1" fontWeight={750}>Cloud Transfer Manager</Typography>
+              <Typography variant="overline">COPIA ENTRE NUBES</Typography>
+            </Box>
           </Stack>
+          {user.role === 'ADMIN' && (
+            <Tabs
+              className="header-navigation"
+              value={workspaceSection}
+              onChange={(_event, value: 'explorer' | 'connections') => setWorkspaceSection(value)}
+              aria-label="Secciones principales"
+            >
+              <Tab value="explorer" label="Explorador" />
+              <Tab value="connections" label="Conexiones" />
+            </Tabs>
+          )}
           <Stack className="topbar-actions" direction="row" alignItems="center" spacing={1.5}>
-            <Box className="user-badge"><span>{user.username.slice(0, 1).toUpperCase()}</span><Typography variant="body2">{user.username}</Typography></Box>
-            {user.role === 'ADMIN' && <Button color="inherit" size="small" onClick={() => setAdminDialogOpen(true)}>Administración</Button>}
-            <Button color="inherit" size="small" onClick={() => setPasswordDialogOpen(true)}>Cambiar contraseña</Button>
-            <Button color="inherit" size="small" onClick={onLogout}>Cerrar sesión</Button>
+            <Box className="user-badge" aria-label={`Sesión de ${user.username}`}>
+              <span>{user.username.slice(0, 1).toUpperCase()}</span>
+              <Typography variant="body2">{user.username}</Typography>
+            </Box>
+            <Box className="topbar-separator" aria-hidden="true" />
+            {user.role === 'ADMIN' && (
+              <Button color="inherit" size="small" startIcon={<InterfaceIcon name="settings" />} onClick={() => setAdminDialogOpen(true)}>
+                Administración
+              </Button>
+            )}
+            <Button color="inherit" size="small" startIcon={<InterfaceIcon name="key" />} onClick={() => setPasswordDialogOpen(true)}>
+              Cambiar contraseña
+            </Button>
+            <Button color="inherit" size="small" startIcon={<InterfaceIcon name="logout" />} onClick={onLogout}>
+              Cerrar sesión
+            </Button>
           </Stack>
         </Toolbar>
       </AppBar>
@@ -1287,19 +1457,6 @@ function TransferWorkspace({
             </Typography>
           </Box>
         </Box>
-
-        {user.role === 'ADMIN' && (
-          <Paper className="workspace-tabs" elevation={0}>
-            <Tabs
-              value={workspaceSection}
-              onChange={(_event, value: 'explorer' | 'connections') => setWorkspaceSection(value)}
-              aria-label="Secciones principales"
-            >
-              <Tab value="explorer" label="Explorador" />
-              <Tab value="connections" label="Conexiones" />
-            </Tabs>
-          </Paper>
-        )}
 
         {notice && <Alert severity={noticeSeverity} sx={{ mb: 2 }}>{notice}</Alert>}
         {workspaceSection === 'connections' && user.role === 'ADMIN' ? (
@@ -1330,7 +1487,7 @@ function TransferWorkspace({
 
         <Paper className="transfer-action" elevation={0}>
           <Box className="transfer-action-copy">
-            <Box className="copy-icon" aria-hidden="true">↗</Box>
+            <Box className="copy-icon" aria-hidden="true"><InterfaceIcon name="copy" /></Box>
             <Box>
               <Typography fontWeight={700}>Listo para copiar</Typography>
               <Typography variant="body2" color="text.secondary">
@@ -1397,23 +1554,52 @@ function TransferWorkspace({
           <Box>
             <Typography variant="overline" color="text.secondary">ACTIVIDAD</Typography>
             <Typography variant="h6">Historial reciente</Typography>
+            <Typography variant="caption" color="text.secondary">Fecha y hora en tu zona local</Typography>
           </Box>
-          <Button size="small" onClick={() => void transfersQuery.refetch()}>Actualizar</Button>
+          <Button size="small" onClick={() => void transfersQuery.refetch()} startIcon={<InterfaceIcon name="refresh" />}>Actualizar</Button>
         </Box>
         <Paper className="history-card" elevation={0}>
           {transfersQuery.isLoading && <LinearProgress />}
-          {(transfersQuery.data?.items ?? []).slice(0, 8).map((transfer) => (
+          {historyTransfers.slice(0, 8).map((transfer) => {
+            const sourceConnection = transfer.source_connection_id
+              ? connectionById.get(transfer.source_connection_id)
+              : undefined;
+            const destinationConnection = connectionById.get(transfer.destination_connection_id);
+            return (
             <Box className="history-row" key={transfer.id}>
               <Box className="history-status-dot" data-status={transfer.status} />
               <Box className="history-label">
-                <Typography fontWeight={650}>{transfer.public_id}</Typography>
-                <Typography variant="caption" color="text.secondary">{transfer.files_completed} archivos · {formatBytes(transfer.bytes_transferred)}</Typography>
+                <Box className="history-title-line">
+                  <Typography fontWeight={700}>{transfer.public_id}</Typography>
+                  <Chip size="small" className="history-status" data-status={transfer.status} label={transferStatusLabel(transfer.status)} />
+                </Box>
+                <Box className="history-route" aria-label="Ruta de transferencia">
+                  <ProviderLogo provider={sourceConnection?.provider_type ?? ''} />
+                  <span>{sourceConnection?.name ?? (transfer.source_connection_id ? 'Conexión no disponible' : 'Origen')}</span>
+                  <span className="history-route-arrow" aria-hidden="true">→</span>
+                  <ProviderLogo provider={destinationConnection?.provider_type ?? ''} />
+                  <span>{destinationConnection?.name ?? 'Conexión no disponible'}</span>
+                </Box>
+                <Typography variant="caption" color="text.secondary" className="history-counts">
+                  {transfer.files_completed} de {transfer.files_total} archivos · {formatBytes(transfer.bytes_transferred)} de {formatBytes(transfer.bytes_total)}
+                </Typography>
+                <Box className="history-meta">
+                  {formatRequestedAt(transfer.created_at) && (
+                    <Typography component="time" dateTime={transfer.created_at ?? undefined} variant="caption" color="text.secondary">
+                      <span>Solicitada</span>{formatRequestedAt(transfer.created_at)}
+                    </Typography>
+                  )}
+                  <Typography variant="caption" color="text.secondary"><span>Tiempo de transferencia</span>{formatTransferDuration(transfer)}</Typography>
+                </Box>
               </Box>
-              <Typography className="history-status" variant="body2">{transfer.status.replaceAll('_', ' ')}</Typography>
-              <Typography variant="body2" color="text.secondary">{transfer.progress_percent.toFixed(0)}%</Typography>
+              <Box className="history-progress" aria-label={`Avance ${transfer.progress_percent.toFixed(0)} por ciento`}>
+                <Typography variant="body2" fontWeight={700}>{transfer.progress_percent.toFixed(0)}%</Typography>
+                <Box className="history-progress-track"><Box style={{ width: `${Math.max(0, Math.min(100, transfer.progress_percent))}%` }} /></Box>
+              </Box>
             </Box>
-          ))}
-          {!transfersQuery.isLoading && (transfersQuery.data?.items.length ?? 0) === 0 && (
+            );
+          })}
+          {!transfersQuery.isLoading && historyTransfers.length === 0 && (
             <Typography color="text.secondary" sx={{ p: 3 }}>Aún no hay transferencias. Las nuevas aparecerán aquí.</Typography>
           )}
           {latestTransfer && latestTransfer.status === 'RUNNING' && (

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, waitForElementToBeRemoved } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, waitForElementToBeRemoved, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 
@@ -53,6 +53,78 @@ describe('Cloud Transfer Manager', () => {
     expect(screen.getByLabelText(/Contraseña/i)).toBeVisible();
   });
 
+  it('uses the connected-cloud brand mark on the sign-in screen', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(new Response('{"detail":"Autenticación requerida"}', { status: 401 })),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole('img', { name: 'Cloud Transfer Manager' })).toBeVisible();
+  });
+
+  it('shows recognizable logos for MEGA, Google Drive and Seafile on the sign-in page', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(new Response('{"detail":"Autenticación requerida"}', { status: 401 })),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: /Cloud Transfer Manager/i })).toBeVisible();
+    expect(screen.getByRole('img', { name: 'MEGA' })).toBeVisible();
+    expect(screen.getByRole('img', { name: 'Google Drive' })).toBeVisible();
+    expect(screen.getByRole('img', { name: 'Seafile' })).toBeVisible();
+  });
+
+  it('shows the requested date and transfer duration in recent history', async () => {
+    const transfer = {
+      id: 'transfer-history-1',
+      public_id: 'TRF-2026-000001',
+      status: 'COMPLETED',
+      progress_percent: 100,
+      files_total: 1,
+      files_completed: 1,
+      bytes_total: 1024,
+      bytes_transferred: 1024,
+      current_item: null,
+      average_speed_bps: 16,
+      current_speed_bps: null,
+      estimated_remaining_seconds: 0,
+      source_connection_id: 'source',
+      destination_connection_id: 'destination',
+      source_paths: ['/report.csv'],
+      destination_path: '/',
+      conflict_policy: 'OVERWRITE_IF_DIFFERENT',
+      send_email_notification: false,
+      created_at: '2026-10-11T10:15:00.000Z',
+      started_at: '2026-10-11T10:15:10.000Z',
+      completed_at: '2026-10-11T10:16:15.000Z',
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [transfer] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+
+    expect(await screen.findByText('Duración: 1 min 5 s')).toBeVisible();
+    const requestedAt = document.querySelector('time[datetime="2026-10-11T10:15:00.000Z"]');
+    expect(requestedAt).toBeVisible();
+    expect(requestedAt).toHaveTextContent(/2026/);
+  });
+
   it('signs in and opens the transfer workspace', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
@@ -83,6 +155,9 @@ describe('Cloud Transfer Manager', () => {
     fireEvent.click(screen.getByRole('button', { name: /Iniciar sesión/i }));
 
     expect(await screen.findByRole('heading', { name: /Explorador de archivos/i })).toBeVisible();
+    const header = within(screen.getByRole('banner'));
+    expect(header.getByRole('tab', { name: 'Explorador' })).toBeVisible();
+    expect(header.getByRole('tab', { name: 'Conexiones' })).toBeVisible();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/connections', expect.anything()));
   });
 
