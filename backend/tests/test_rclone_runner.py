@@ -58,6 +58,22 @@ def test_rclone_copy_command_applies_only_supported_conflict_policy():
         )
 
 
+def test_rclone_copy_command_can_preserve_empty_selected_folder_structure():
+    runner = RcloneRunner(binary="/usr/bin/rclone", temp_path="/tmp")
+
+    command = runner.build_command(
+        "copy",
+        [
+            "ctm_0123456789abcdef0123456789abcdef:/source",
+            "ctm_fedcba9876543210fedcba9876543210:/destination/source",
+        ],
+        "/tmp/job.conf",
+        create_empty_src_dirs=True,
+    )
+
+    assert command[-1] == "--create-empty-src-dirs"
+
+
 @pytest.mark.parametrize("command", ["delete", "purge", "sync", "move", "serve", "config"])
 def test_rclone_command_builder_rejects_unapproved_commands(command: str):
     runner = RcloneRunner(binary="/usr/bin/rclone", temp_path="/tmp")

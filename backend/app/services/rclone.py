@@ -88,9 +88,13 @@ class RcloneRunner:
         remote_paths: list[str],
         config_path: str,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        *,
+        create_empty_src_dirs: bool = False,
     ) -> list[str]:
         if command not in self._allowed_commands:
             raise ValueError(f"Rclone command is not allowed: {command}")
+        if create_empty_src_dirs and command != "copy":
+            raise ValueError("Empty source directories can only be preserved by copy")
         expected_paths = 2 if command == "copy" else 1
         if len(remote_paths) != expected_paths:
             raise ValueError(f"{command} expects {expected_paths} remote path(s)")
@@ -102,6 +106,8 @@ class RcloneRunner:
             argv.extend(["--use-json-log", "--stats", "1s", "--stats-log-level", "NOTICE"])
             if conflict_policy == "SKIP":
                 argv.append("--ignore-existing")
+            if create_empty_src_dirs:
+                argv.append("--create-empty-src-dirs")
         elif command == "about":
             argv.extend(["--json", "--full"])
         elif command == "size":
@@ -117,6 +123,7 @@ class RcloneRunner:
         line_callback: Callable[[str], Awaitable[None]] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        create_empty_src_dirs: bool = False,
     ) -> tuple[bytes, bytes]:
         if command not in self._allowed_commands:
             raise ValueError(f"Rclone command is not allowed: {command}")
@@ -129,7 +136,11 @@ class RcloneRunner:
             config_content,
             job_id,
             lambda config_path: self.build_command(
-                command, remote_paths, config_path, conflict_policy
+                command,
+                remote_paths,
+                config_path,
+                conflict_policy,
+                create_empty_src_dirs=create_empty_src_dirs,
             ),
             line_callback=line_callback,
             should_cancel=should_cancel,

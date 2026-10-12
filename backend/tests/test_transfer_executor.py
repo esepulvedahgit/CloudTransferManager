@@ -330,13 +330,16 @@ async def test_mega_to_drive_preserves_an_empty_selected_folder(tmp_path):
 
 @pytest.mark.asyncio
 async def test_drive_to_mega_preserves_nested_paths_and_skips_existing_destination(tmp_path):
-    existing = _item("/backup/sub/b.txt", size=3, provider="MEGA")
+    existing = _item("/backup/source/sub/b.txt", size=3, provider="MEGA")
     executor, transfer, providers, runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
         source_type="GOOGLE_DRIVE",
         destination_type="MEGA",
         source_items=_nested_tree("GOOGLE_DRIVE")
-        + [_item("/source/sub/c.txt", size=1, provider="GOOGLE_DRIVE")],
+        + [
+            _item("/source/sub/c.txt", size=1, provider="GOOGLE_DRIVE"),
+            _item("/source/empty", is_dir=True, provider="GOOGLE_DRIVE"),
+        ],
         destination_items=[existing],
         source_paths=["/source"],
     )
@@ -345,8 +348,15 @@ async def test_drive_to_mega_preserves_nested_paths_and_skips_existing_destinati
 
     mega_destination = providers[transfer.destination_connection_id]
     assert mega_destination.open_count == 1
-    assert mega_destination.created_directories == ["/backup/sub"]
-    assert [folder for _local, folder in mega_destination.uploads] == ["/backup", "/backup/sub"]
+    assert mega_destination.created_directories == [
+        "/backup/source",
+        "/backup/source/empty",
+        "/backup/source/sub",
+    ]
+    assert [folder for _local, folder in mega_destination.uploads] == [
+        "/backup/source",
+        "/backup/source/sub",
+    ]
     assert [remote for remote, _local in runner.downloaded] == [
         f"ctm_{providers[transfer.source_connection_id].connection_id.hex}:/source/a.txt",
         f"ctm_{providers[transfer.source_connection_id].connection_id.hex}:/source/sub/c.txt",
@@ -361,20 +371,59 @@ async def test_drive_to_mega_preserves_nested_paths_and_skips_existing_destinati
 
 
 @pytest.mark.asyncio
-async def test_seafile_rclone_to_mega_creates_nested_destination_directories(tmp_path):
+async def test_seafile_rclone_to_mega_preserves_selected_folder_and_empty_directories(tmp_path):
     executor, transfer, providers, _runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
         source_type="SEAFILE",
         destination_type="MEGA",
-        source_items=_nested_tree("SEAFILE"),
+        source_items=_nested_tree("SEAFILE")
+        + [_item("/source/empty", is_dir=True, provider="SEAFILE")],
         source_paths=["/source"],
     )
 
     await executor.execute(transfer.id)
 
     mega_destination = providers[transfer.destination_connection_id]
-    assert mega_destination.created_directories == ["/backup/sub"]
-    assert [folder for _local, folder in mega_destination.uploads] == ["/backup", "/backup/sub"]
+    assert mega_destination.created_directories == [
+        "/backup/source",
+        "/backup/source/empty",
+        "/backup/source/sub",
+    ]
+    assert [folder for _local, folder in mega_destination.uploads] == [
+        "/backup/source",
+        "/backup/source/sub",
+    ]
+    assert transfer.status == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_rclone_to_rclone_copies_selected_folder_into_named_destination(tmp_path):
+    source_items = [
+        _item("/source", is_dir=True, provider="GOOGLE_DRIVE"),
+        _item("/source/empty", is_dir=True, provider="GOOGLE_DRIVE"),
+        _item("/source/nested", is_dir=True, provider="GOOGLE_DRIVE"),
+        _item("/source/nested/file.txt", size=1, provider="GOOGLE_DRIVE"),
+    ]
+    executor, transfer, providers, runner, _snapshots, _store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="GOOGLE_DRIVE",
+        source_items=source_items,
+        source_paths=["/source"],
+        runner=ProgressRunner(),
+    )
+
+    await executor.execute(transfer.id)
+
+    copy_calls = [call for call in runner.calls if call[0] == "copy"]
+    assert len(copy_calls) == 1
+    command, paths, _config, options = copy_calls[0]
+    assert command == "copy"
+    assert paths == [
+        f"ctm_{providers[transfer.source_connection_id].connection_id.hex}:/source",
+        f"ctm_{providers[transfer.destination_connection_id].connection_id.hex}:/backup/source",
+    ]
+    assert options["create_empty_src_dirs"] is True
     assert transfer.status == "COMPLETED"
 
 
@@ -578,6 +627,7 @@ async def test_real_transfer_uses_combined_ephemeral_provider_config_and_copy_on
     assert f"[ctm_{source_id.hex}]" in config
     assert f"[ctm_{destination_id.hex}]" in config
     assert options["conflict_policy"] == "SKIP"
+    assert options["create_empty_src_dirs"] is False
     assert transfer.status == "COMPLETED"
     assert transfer.bytes_transferred == 4
     assert transfer.progress_percent == 100

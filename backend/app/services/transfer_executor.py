@@ -336,17 +336,31 @@ class TransferExecutor:
                         record.current_item = progress.get("current_item")
                         await self.publish(record)
 
+                    source_item = source_items[path_index]
+                    destination_path = MockStorageProvider.normalize_path(
+                        record.destination_path
+                    )
+                    if source_item.is_dir:
+                        selected_folder_name = PurePosixPath(
+                            MockStorageProvider.normalize_path(path)
+                        ).name
+                        if selected_folder_name:
+                            destination_path = MockStorageProvider.normalize_path(
+                                f"{destination_path.rstrip('/')}/{selected_folder_name}"
+                            )
+
                     await self.runner.run(
                         "copy",
                         [
                             source.remote_path(path),
-                            destination.remote_path(record.destination_path),
+                            destination.remote_path(destination_path),
                         ],
                         config_content,
                         record.id,
                         line_callback=on_line,
                         should_cancel=self.should_cancel,
                         conflict_policy=record.conflict_policy,
+                        create_empty_src_dirs=source_item.is_dir,
                     )
                     byte_offset = record.bytes_transferred
                     file_offset = record.files_completed
@@ -918,7 +932,7 @@ class TransferExecutor:
                 files, directories = await self._collect_files(
                     source_listing,
                     record.source_paths,
-                    include_selected_folder=mega_is_source,
+                    include_selected_folder=True,
                 )
             except FileNotFoundError:
                 await self._fail(record, error_code="SOURCE_ITEM_NOT_FOUND")

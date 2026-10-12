@@ -39,11 +39,12 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
    - **Cláusula `finally` garantizada:** El archivo se elimina de forma segura e inmediata al terminar, fallar o cancelarse el trabajo.
 - El directorio temporal se monta como `tmpfs`. Un bloqueo exclusivo del archivo evita ejecuciones concurrentes del mismo trabajo y permite que una redelivery reemplace y limpie un archivo huérfano dejado por una terminación abrupta.
 6. **Staging por archivo:** Las copias cruzadas descargan o copian un solo archivo a un directorio privado, disk-backed y temporal. El archivo y su directorio se eliminan en `finally` antes de procesar el siguiente; el staging no es volumen persistente ni `tmpfs`. Se comprueba espacio libre cuando se conoce el tamaño.
-7. **Selección Seafile:** La conexión guarda `RCLONE` o `SEAFILE_API`. Un error de autenticación, lectura o escritura no provoca fallback ni reautenticación silenciosa con otro adaptador.
-8. **Integridad Seafile API:** Cada archivo subido mediante Seafile API se lee de vuelta en streaming y su SHA-256 se compara con el archivo local antes de incrementar el progreso completado. La verificación añade una lectura completa del destino.
-9. **Conflictos en destino MEGA:** Antes de subir se consulta la ruta exacta; si ya existe, se omite y se suma una advertencia. Nunca se sobrescribe ni elimina el elemento remoto.
-10. **Fallos de limpieza:** No se silencian errores al borrar staging. Si no se puede limpiar un archivo temporal, el trabajo falla y no procesa el siguiente. El HOME de MEGAcmd se retira solo después de confirmar `mega-quit`; si no se logra detener el daemon, se conserva el HOME y se falla de forma saneada.
-11. **Listados completos:** Si la salida de `mega-ls` supera el límite de captura, el listado falla explícitamente; no se usa una lista parcial para navegar ni para declarar completa una transferencia.
+7. **Semántica uniforme de carpetas:** Al seleccionar una carpeta, se crea en el destino una carpeta con el mismo nombre y se copia dentro todo su contenido, conservando subcarpetas y carpetas vacías. Los archivos seleccionados individualmente se copian directamente a la ruta destino. Esto aplica a todas las combinaciones de proveedores y adaptadores; que el motor procese los archivos uno a uno no cambia la estructura final.
+8. **Selección Seafile:** La conexión guarda `RCLONE` o `SEAFILE_API`. Un error de autenticación, lectura o escritura no provoca fallback ni reautenticación silenciosa con otro adaptador.
+9. **Integridad Seafile API:** Cada archivo subido mediante Seafile API se lee de vuelta en streaming y su SHA-256 se compara con el archivo local antes de incrementar el progreso completado. La verificación añade una lectura completa del destino.
+10. **Conflictos en destino MEGA:** Antes de subir se consulta la ruta exacta; si ya existe, se omite y se suma una advertencia. Nunca se sobrescribe ni elimina el elemento remoto.
+11. **Fallos de limpieza:** No se silencian errores al borrar staging. Si no se puede limpiar un archivo temporal, el trabajo falla y no procesa el siguiente. El HOME de MEGAcmd se retira solo después de confirmar `mega-quit`; si no se logra detener el daemon, se conserva el HOME y se falla de forma saneada.
+12. **Listados completos:** Si la salida de `mega-ls` supera el límite de captura, el listado falla explícitamente; no se usa una lista parcial para navegar ni para declarar completa una transferencia.
 
 ---
 
