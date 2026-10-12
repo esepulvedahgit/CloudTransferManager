@@ -713,4 +713,215 @@ describe('Cloud Transfer Manager', () => {
     fireEvent.click(screen.getByRole('button', { name: /Crear usuario/i }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/users', expect.objectContaining({ method: 'POST' })));
   });
+
+  it('shows the SMTP subtab inside administration', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+
+    expect(await screen.findByRole('heading', { name: /Administración/i })).toBeVisible();
+    expect(screen.getByRole('tab', { name: 'General' })).toBeVisible();
+    expect(screen.getByRole('tab', { name: 'Correo SMTP' })).toBeVisible();
+  });
+
+  it('loads SMTP settings without exposing saved credentials in the form', async () => {
+    const safeSettings = {
+      host: 'smtp.example.test',
+      port: 587,
+      use_tls: true,
+      from_address: 'notifications@example.test',
+      credentials_configured: true,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/settings/smtp')) return jsonResponse(safeSettings);
+      if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Correo SMTP' }));
+
+    expect(await screen.findByDisplayValue('smtp.example.test')).toBeVisible();
+    expect(screen.getByLabelText(/Usuario SMTP/i)).toHaveValue('');
+    expect(screen.getByLabelText(/Contraseña SMTP/i)).toHaveValue('');
+    expect(screen.getByText(/Credenciales SMTP configuradas/i)).toBeVisible();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/settings/smtp', expect.anything()));
+  });
+
+  it('saves SMTP settings and sends blank credentials to preserve the stored values', async () => {
+    const safeSettings = {
+      host: 'smtp.example.test',
+      port: 587,
+      use_tls: true,
+      from_address: 'notifications@example.test',
+      credentials_configured: true,
+    };
+    let saveBody: Record<string, unknown> | undefined;
+    let settingsLoads = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/settings/smtp') && init?.method === 'PUT') {
+        saveBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return jsonResponse(safeSettings);
+      }
+      if (path.endsWith('/settings/smtp')) {
+        settingsLoads += 1;
+        return jsonResponse(safeSettings);
+      }
+      if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Correo SMTP' }));
+    fireEvent.change(await screen.findByLabelText(/Servidor SMTP/i), { target: { value: 'mail.example.test' } });
+    fireEvent.click(screen.getByRole('button', { name: /Guardar configuración/i }));
+
+    await waitFor(() => expect(saveBody).toEqual({
+      host: 'mail.example.test',
+      port: 587,
+      use_tls: true,
+      from_address: 'notifications@example.test',
+      username: '',
+      password: '',
+    }));
+    expect(await screen.findByText(/Configuración SMTP guardada/i)).toBeVisible();
+    await waitFor(() => expect(settingsLoads).toBeGreaterThanOrEqual(2));
+  });
+
+  it('tests the unsaved SMTP draft without saving it', async () => {
+    const safeSettings = {
+      host: 'smtp.example.test',
+      port: 587,
+      use_tls: true,
+      from_address: 'notifications@example.test',
+      credentials_configured: false,
+    };
+    let testBody: Record<string, unknown> | undefined;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/settings/smtp/test')) {
+        testBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse({ success: true, message: 'Conexión SMTP correcta' });
+      }
+      if (path.endsWith('/settings/smtp')) return jsonResponse(safeSettings);
+      if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Correo SMTP' }));
+    fireEvent.change(await screen.findByLabelText(/Servidor SMTP/i), { target: { value: 'draft.example.test' } });
+    fireEvent.change(screen.getByLabelText(/Usuario SMTP/i), { target: { value: 'draft-user' } });
+    fireEvent.change(screen.getByLabelText(/Contraseña SMTP/i), { target: { value: 'draft-password' } });
+    fireEvent.click(screen.getByRole('button', { name: /Probar conexión/i }));
+
+    await waitFor(() => expect(testBody).toMatchObject({
+      host: 'draft.example.test',
+      username: 'draft-user',
+      password: 'draft-password',
+    }));
+    expect(await screen.findByText(/Conexión SMTP correcta/i)).toBeVisible();
+    expect(fetchMock).not.toHaveBeenCalledWith('/api/v1/settings/smtp', expect.objectContaining({ method: 'PUT' }));
+  });
+
+  it('shows SMTP test loading, success and error states', async () => {
+    const safeSettings = {
+      host: 'smtp.example.test',
+      port: 587,
+      use_tls: true,
+      from_address: 'notifications@example.test',
+      credentials_configured: false,
+    };
+    let resolveTest: ((response: Response) => void) | undefined;
+    let shouldFail = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/settings/smtp/test')) {
+        if (shouldFail) return jsonResponse({ success: false, message: 'No se pudo conectar con SMTP' });
+        return new Promise<Response>((resolve) => { resolveTest = resolve; });
+      }
+      if (path.endsWith('/settings/smtp')) return jsonResponse(safeSettings);
+      if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Correo SMTP' }));
+    await screen.findByDisplayValue('smtp.example.test');
+    fireEvent.click(screen.getByRole('button', { name: /Probar conexión/i }));
+
+    expect(await screen.findByRole('button', { name: /Probando conexión/i })).toBeDisabled();
+    resolveTest?.(jsonResponse({ success: true, message: 'Conexión SMTP correcta' }));
+    expect(await screen.findByText(/Conexión SMTP correcta/i)).toBeVisible();
+
+    shouldFail = true;
+    fireEvent.click(screen.getByRole('button', { name: /Probar conexión/i }));
+    expect(await screen.findByText(/No se pudo conectar con SMTP/i)).toBeVisible();
+  });
 });

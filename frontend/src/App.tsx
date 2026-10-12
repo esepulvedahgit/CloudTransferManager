@@ -14,6 +14,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  FormHelperText,
   FormControl,
   FormControlLabel,
   InputLabel,
@@ -111,6 +112,14 @@ type ConnectionForm = {
   seafile_library_password: string;
 };
 type PasswordForm = { current_password: string; new_password: string };
+type SmtpSettings = {
+  host: string;
+  port: number;
+  use_tls: boolean;
+  from_address: string;
+  credentials_configured: boolean;
+};
+type SmtpFormValues = SmtpSettings & { username: string; password: string };
 
 const theme = createTheme({
   palette: {
@@ -128,6 +137,25 @@ const theme = createTheme({
 });
 
 const loginSchema = z.object({ username_or_email: z.string().min(1), password: z.string().min(1) });
+const smtpFormSchema = z.object({
+  host: z.string().trim().min(1, 'Ingresa el servidor SMTP.').max(255),
+  port: z.number().int('Ingresa un puerto válido.').min(1, 'El puerto debe ser mayor que 0.').max(65535, 'El puerto no puede superar 65535.'),
+  use_tls: z.boolean(),
+  from_address: z.string().trim().email('Ingresa un correo remitente válido.'),
+  credentials_configured: z.boolean(),
+  username: z.string().max(255),
+  password: z.string().max(1024),
+}).superRefine((values, context) => {
+  const hasUsername = Boolean(values.username.trim());
+  const hasPassword = Boolean(values.password);
+  if (hasUsername !== hasPassword) {
+    context.addIssue({
+      code: 'custom',
+      path: [hasUsername ? 'password' : 'username'],
+      message: 'Completa usuario y contraseña juntos.',
+    });
+  }
+});
 
 function InterfaceIcon({ name }: { name: 'folder' | 'file' | 'copy' | 'transfer' | 'refresh' | 'archive' | 'settings' | 'key' | 'logout' }) {
   const paths = {
@@ -582,22 +610,31 @@ function AdminDialog({
   const queryClient = useQueryClient();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [adminTab, setAdminTab] = useState<'general' | 'smtp'>('general');
+  const [smtpSaving, setSmtpSaving] = useState(false);
+  const [smtpTesting, setSmtpTesting] = useState(false);
+  const [smtpResult, setSmtpResult] = useState<{ severity: 'success' | 'error'; message: string } | null>(null);
   const [selectedUser, setSelectedUser] = useState('');
   const [selectedConnection, setSelectedConnection] = useState('');
   const usersQuery = useQuery({
     queryKey: ['admin-users'],
     queryFn: () => apiRequest<{ items: ManagedUser[]; total_count: number }>('/api/v1/users'),
-    enabled: open,
+    enabled: open && adminTab === 'general',
   });
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
     queryFn: () => apiRequest<{ items: Connection[] }>('/api/v1/connections'),
-    enabled: open,
+    enabled: open && adminTab === 'general',
   });
   const auditQuery = useQuery({
     queryKey: ['audit-events'],
     queryFn: () => apiRequest<{ items: Array<{ id: string; action: string; result: string; created_at: string }> }>('/api/v1/audit-events?limit=20'),
-    enabled: open,
+    enabled: open && adminTab === 'general',
+  });
+  const smtpQuery = useQuery({
+    queryKey: ['admin-smtp-settings'],
+    queryFn: () => apiRequest<SmtpSettings>('/api/v1/settings/smtp'),
+    enabled: open && adminTab === 'smtp',
   });
   const { register, control, handleSubmit, reset, formState: { errors } } = useForm({
     resolver: zodResolver(z.object({
@@ -608,6 +645,30 @@ function AdminDialog({
     })),
     defaultValues: { username: '', email: '', password: '', role: 'USER' as const },
   });
+  const {
+    register: registerSmtp,
+    control: smtpControl,
+    handleSubmit: handleSmtpSubmit,
+    reset: resetSmtp,
+    formState: { errors: smtpErrors },
+  } = useForm<SmtpFormValues>({
+    resolver: zodResolver(smtpFormSchema),
+    defaultValues: {
+      host: '',
+      port: 587,
+      use_tls: true,
+      from_address: '',
+      credentials_configured: false,
+      username: '',
+      password: '',
+    },
+  });
+
+  useEffect(() => {
+    if (smtpQuery.data) {
+      resetSmtp({ ...smtpQuery.data, username: '', password: '' });
+    }
+  }, [smtpQuery.data, resetSmtp]);
 
   const createUser = async (values: { username: string; email: string; password: string; role: 'ADMIN' | 'USER' }) => {
     setBusy(true);
@@ -648,6 +709,56 @@ function AdminDialog({
     }
   };
 
+  const saveSmtpSettings = async (values: SmtpFormValues) => {
+    setSmtpSaving(true);
+    setSmtpResult(null);
+    try {
+      await apiRequest<SmtpSettings>('/api/v1/settings/smtp', {
+        method: 'PUT',
+        body: JSON.stringify({
+          host: values.host,
+          port: values.port,
+          use_tls: values.use_tls,
+          from_address: values.from_address,
+          username: values.username,
+          password: values.password,
+        }),
+      });
+      await queryClient.invalidateQueries({ queryKey: ['admin-smtp-settings'] });
+      setSmtpResult({ severity: 'success', message: 'Configuración SMTP guardada.' });
+    } catch {
+      setSmtpResult({ severity: 'error', message: 'No se pudo guardar la configuración SMTP.' });
+    } finally {
+      setSmtpSaving(false);
+    }
+  };
+
+  const testSmtpSettings = async (values: SmtpFormValues) => {
+    setSmtpTesting(true);
+    setSmtpResult(null);
+    try {
+      const result = await apiRequest<{ success: boolean; message: string }>(
+        '/api/v1/settings/smtp/test',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            host: values.host,
+            port: values.port,
+            use_tls: values.use_tls,
+            from_address: values.from_address,
+            username: values.username,
+            password: values.password,
+          }),
+        },
+      );
+      setSmtpResult({ severity: result.success ? 'success' : 'error', message: result.message });
+    } catch {
+      setSmtpResult({ severity: 'error', message: 'No se pudo probar la conexión SMTP.' });
+    } finally {
+      setSmtpTesting(false);
+    }
+  };
+
   const users = usersQuery.data?.items ?? [];
   const privateConnections = (connectionsQuery.data?.items ?? []).filter((connection) => !connection.is_global);
 
@@ -660,7 +771,18 @@ function AdminDialog({
         </Typography>
       </DialogTitle>
       <DialogContent>
-        <Stack spacing={3}>
+        <Tabs
+          className="admin-tabs"
+          value={adminTab}
+          onChange={(_event, value: 'general' | 'smtp') => setAdminTab(value)}
+          aria-label="Pestañas de administración"
+          variant="scrollable"
+          allowScrollButtonsMobile
+        >
+          <Tab value="general" label="General" />
+          <Tab value="smtp" label="Correo SMTP" />
+        </Tabs>
+        {adminTab === 'general' && <Stack spacing={3}>
           <Box className="admin-section">
             <Typography variant="h6" sx={{ mb: 1.5 }}>Crear usuario</Typography>
             <Box component="form" onSubmit={handleSubmit(createUser)} noValidate>
@@ -744,7 +866,106 @@ function AdminDialog({
             </Paper>
           </Box>
           {error && <Alert severity="error">{error}</Alert>}
-        </Stack>
+        </Stack>}
+        {adminTab === 'smtp' && (
+          <Box className="admin-section smtp-settings-section">
+            <Stack spacing={2.5}>
+              <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'flex-start', sm: 'center' }} spacing={1}>
+                <Box>
+                  <Typography variant="h6">Servidor SMTP</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Configura el correo que envía las notificaciones de transferencia.
+                  </Typography>
+                </Box>
+                {smtpQuery.data && (
+                  <Chip
+                    size="small"
+                    color={smtpQuery.data.credentials_configured ? 'success' : 'default'}
+                    label={smtpQuery.data.credentials_configured ? 'Credenciales SMTP configuradas' : 'Sin credenciales'}
+                  />
+                )}
+              </Stack>
+              {smtpQuery.isLoading && <LinearProgress aria-label="Cargando configuración SMTP" />}
+              {smtpQuery.isError && <Alert severity="error">No se pudo cargar la configuración SMTP.</Alert>}
+              {smtpQuery.data && (
+                <Box component="form" onSubmit={handleSmtpSubmit(saveSmtpSettings)} noValidate>
+                  <Stack spacing={2.5}>
+                    <Box className="smtp-settings-grid">
+                      <TextField
+                        label="Servidor SMTP"
+                        {...registerSmtp('host')}
+                        error={Boolean(smtpErrors.host)}
+                        helperText={smtpErrors.host?.message ?? ' '}
+                        autoComplete="url"
+                      />
+                      <TextField
+                        label="Puerto"
+                        type="number"
+                        inputProps={{ min: 1, max: 65535 }}
+                        {...registerSmtp('port', { valueAsNumber: true })}
+                        error={Boolean(smtpErrors.port)}
+                        helperText={smtpErrors.port?.message ?? ' '}
+                      />
+                      <TextField
+                        label="Usuario SMTP"
+                        autoComplete="username"
+                        {...registerSmtp('username')}
+                        error={Boolean(smtpErrors.username)}
+                        helperText={smtpErrors.username?.message ?? ' '}
+                      />
+                      <TextField
+                        label="Contraseña SMTP"
+                        type="password"
+                        autoComplete="new-password"
+                        {...registerSmtp('password')}
+                        error={Boolean(smtpErrors.password)}
+                        helperText={smtpErrors.password?.message ?? ' '}
+                      />
+                      <TextField
+                        label="Correo remitente"
+                        type="email"
+                        {...registerSmtp('from_address')}
+                        error={Boolean(smtpErrors.from_address)}
+                        helperText={smtpErrors.from_address?.message ?? ' '}
+                      />
+                    </Box>
+                    <FormHelperText className="smtp-credentials-hint">
+                      Deja usuario y contraseña vacíos para conservar las credenciales guardadas.
+                    </FormHelperText>
+                    <Box className="smtp-tls-option">
+                      <Controller
+                        name="use_tls"
+                        control={smtpControl}
+                        render={({ field }) => (
+                          <FormControlLabel
+                            control={<Checkbox {...field} checked={field.value} />}
+                            label="Usar STARTTLS"
+                          />
+                        )}
+                      />
+                      <Typography variant="caption" color="text.secondary">
+                        Cifra la conexión entre la aplicación y el servidor de correo.
+                      </Typography>
+                    </Box>
+                    {smtpResult && <Alert severity={smtpResult.severity}>{smtpResult.message}</Alert>}
+                    <Stack direction={{ xs: 'column-reverse', sm: 'row' }} justifyContent="flex-end" spacing={1.25}>
+                      <Button
+                        variant="outlined"
+                        disabled={smtpSaving || smtpTesting}
+                        onClick={handleSmtpSubmit(testSmtpSettings)}
+                      >
+                        {smtpTesting ? <><CircularProgress size={16} color="inherit" />&nbsp; Probando conexión</> : 'Probar conexión'}
+                      </Button>
+                      <Button type="submit" variant="contained" disabled={smtpSaving || smtpTesting}>
+                        {smtpSaving ? <><CircularProgress size={16} color="inherit" />&nbsp; Guardando</> : 'Guardar configuración'}
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </Box>
+              )}
+            </Stack>
+          </Box>
+        )}
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2.5 }}><Button onClick={onClose}>Cerrar</Button></DialogActions>
     </Dialog>

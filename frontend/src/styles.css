@@ -224,6 +224,12 @@ button, input { font: inherit; }
 .admin-section { padding: 18px; border: 1px solid #e6ecf4; border-radius: 14px; background: #fbfcfe; }
 .admin-section > .MuiTypography-h6 { margin-bottom: 14px; font-weight: 700; }
 .admin-list { border-radius: 12px !important; }
+.admin-tabs { min-height: 44px; margin: 0 0 18px; border-bottom: 1px solid #e6ecf4; }
+.admin-tabs .MuiTab-root { min-height: 44px; padding: 9px 16px; font-weight: 650; }
+.smtp-settings-section { background: #fff; }
+.smtp-settings-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(150px, .75fr); gap: 8px 16px; }
+.smtp-credentials-hint { margin: -10px 0 0 !important; }
+.smtp-tls-option { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; }
 .audit-event-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
 .progress-card { border-radius: 16px !important; box-shadow: var(--soft-shadow); }
 .transfer-action { border-radius: 16px !important; }
@@ -265,6 +271,8 @@ button, input { font: inherit; }
   .history-route { flex-wrap: wrap; row-gap: 4px; }
   .history-status.MuiChip-root { font-size: 10px; }
   .history-heading { align-items: center; }
+  .smtp-settings-grid { grid-template-columns: minmax(0, 1fr); }
+  .smtp-settings-grid > * { min-width: 0; }
   .MuiDialogTitle-root { padding: 20px 20px 12px !important; }
   .MuiDialogContent-root { padding: 8px 20px 18px !important; }
   .MuiDialogActions-root { padding: 10px 18px !important; }
