@@ -5,6 +5,7 @@ import ssl
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from app.security.credentials import CredentialCipher
 from app.services.memory_store import SMTPSettingsRecord
@@ -56,6 +57,28 @@ def environment_smtp_config(settings: Settings) -> SMTPServerConfig:
         password=password,
         from_address=settings.smtp_from_address,
         use_tls=settings.smtp_use_tls,
+    )
+
+
+async def load_smtp_server_config(store: Any, settings: Settings) -> SMTPServerConfig:
+    record = await store.aget_smtp_settings()
+    if record is None:
+        return environment_smtp_config(settings)
+
+    username = ""
+    password = ""
+    if record.encrypted_credentials:
+        try:
+            username, password = decrypt_smtp_credentials(settings, record)
+        except Exception:
+            raise ValueError("Saved SMTP credentials could not be loaded") from None
+    return SMTPServerConfig(
+        host=record.host,
+        port=record.port,
+        username=username,
+        password=password,
+        from_address=record.from_address,
+        use_tls=record.use_tls,
     )
 
 

@@ -13,6 +13,7 @@ from app.services.notifications import (
     enqueue_transfer_notification,
     send_transfer_email,
 )
+from app.services.smtp_config import load_smtp_server_config
 from app.services.transfer_executor import TransferExecutor
 from app.settings import get_settings
 
@@ -106,8 +107,10 @@ async def _send_notification(transfer_id: uuid.UUID) -> None:
         destination = await store.aget_connection(transfer.destination_connection_id)
         if user is None or source is None or destination is None:
             return
+        smtp = await load_smtp_server_config(store, current_settings)
         send_transfer_email(
             current_settings,
+            smtp,
             user.email,
             transfer,
             source.name,
