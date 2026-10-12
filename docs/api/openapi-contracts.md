@@ -98,6 +98,7 @@ Todas las rutas requieren una sesión de administrador. `PUT` y `POST .../test` 
 }
 ```
 - `port` debe estar entre 1 y 65535; `host` y `from_address` se validan antes de guardar. Usuario y contraseña se envían juntos o se omiten juntos. Si ambos quedan vacíos, se conservan las credenciales actuales.
+- Los errores de validación devuelven `422` con un mensaje genérico; la respuesta nunca repite los valores recibidos, incluidas las credenciales.
 - Usuario y contraseña se cifran juntos con AES-256-GCM envelope usando la clave maestra montada desde Docker Secret. Ni la respuesta ni la auditoría contienen sus valores.
 - **Response `200 OK`:** devuelve los mismos campos seguros de `GET` y el indicador `credentials_configured`.
 - Registra `SMTP_SETTINGS_UPDATED` con una lista de nombres de campos modificados, sin valores sensibles.

@@ -153,6 +153,13 @@ class MemoryStore:
     async def aget_smtp_settings(self) -> SMTPSettingsRecord | None:
         return self.smtp_settings
 
+    async def acreate_smtp_settings_if_absent(
+        self, settings: SMTPSettingsRecord
+    ) -> SMTPSettingsRecord:
+        if self.smtp_settings is None:
+            self.smtp_settings = settings
+        return self.smtp_settings
+
     async def asave_smtp_settings(self, settings: SMTPSettingsRecord) -> SMTPSettingsRecord:
         self.smtp_settings = settings
         return settings

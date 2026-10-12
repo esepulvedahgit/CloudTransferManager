@@ -1,9 +1,13 @@
+import asyncio
+import smtplib
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
 import pytest
 
 import app.main as main
+import app.services.smtp_config as smtp_config_module
 from app.main import create_app
 from app.security.credentials import CredentialCipher
 from app.security.passwords import PasswordService
@@ -232,13 +236,219 @@ async def test_smtp_update_rejects_invalid_fields(tmp_path, overrides):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "overrides"),
+    [
+        ("put", {"username": "", "password": "password-only-secret"}),
+        ("put", {"username": "smtp-user", "password": "line\nsecret-value"}),
+        ("put", {"username": "smtp-user", "password": "oversized-secret-" + "x" * 1024}),
+        ("test", {"username": "", "password": "test-password-secret"}),
+        ("test", {"username": "smtp-user", "password": "test\nsecret-value"}),
+    ],
+)
+async def test_smtp_validation_errors_never_echo_credentials(tmp_path, path, overrides):
+    client, store, _settings = await authenticated_client(tmp_path)
+    try:
+        if path == "put":
+            response = await client.put(
+                "/api/v1/settings/smtp", json=smtp_payload(**overrides)
+            )
+        else:
+            response = await client.post(
+                "/api/v1/settings/smtp/test", json=smtp_payload(**overrides)
+            )
+
+        assert response.status_code == 422
+        assert "secret" not in response.text
+        assert "smtp-user" not in response.text
+        assert await store.aget_smtp_settings() is None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"host": "[smtp.example.test]"},
+        {"from_address": "sender@example..test"},
+        {"from_address": "sender@example.test\x00hidden"},
+    ],
+)
+async def test_smtp_rejects_malformed_host_and_sender(tmp_path, overrides):
+    client, store, _settings = await authenticated_client(tmp_path)
+    try:
+        response = await client.put(
+            "/api/v1/settings/smtp", json=smtp_payload(**overrides)
+        )
+        assert response.status_code == 422
+        assert await store.aget_smtp_settings() is None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_smtp_normalizes_bracketed_ipv6_host(tmp_path):
+    client, _store, _settings = await authenticated_client(tmp_path)
+    try:
+        response = await client.put(
+            "/api/v1/settings/smtp", json=smtp_payload(host="[::1]")
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["host"] == "::1"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["put", "test"])
+@pytest.mark.parametrize("host", ["fe80::1%\x00", "[fe80::1%\x00]"])
+async def test_smtp_rejects_control_characters_in_ipv6_scope(
+    tmp_path, monkeypatch, path, host
+):
+    client, store, _settings = await authenticated_client(tmp_path)
+    connection_attempts = []
+    monkeypatch.setattr(
+        main,
+        "test_smtp_connection",
+        lambda config: connection_attempts.append(config),
+    )
+    try:
+        if path == "put":
+            response = await client.put(
+                "/api/v1/settings/smtp", json=smtp_payload(host=host)
+            )
+        else:
+            response = await client.post(
+                "/api/v1/settings/smtp/test", json=smtp_payload(host=host)
+            )
+
+        assert response.status_code == 422
+        assert await store.aget_smtp_settings() is None
+        assert connection_attempts == []
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_smtp_partial_update_preserves_existing_ciphertext(tmp_path):
+    client, store, _settings = await authenticated_client(tmp_path)
+    try:
+        created = await client.put("/api/v1/settings/smtp", json=smtp_payload())
+        assert created.status_code == 200, created.text
+        saved_before = await store.aget_smtp_settings()
+        assert saved_before is not None
+
+        rejected = await client.put(
+            "/api/v1/settings/smtp",
+            json=smtp_payload(username="smtp-user", password=""),
+        )
+
+        assert rejected.status_code == 422
+        assert PASSWORD not in rejected.text
+        assert await store.aget_smtp_settings() == saved_before
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_smtp_saves_encrypt_with_persisted_record_id(tmp_path):
+    class FirstSaveRaceStore(MemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.initial_reads = 0
+            self.both_reads_finished = asyncio.Event()
+
+        async def aget_smtp_settings(self):
+            snapshot = self.smtp_settings
+            self.initial_reads += 1
+            if self.initial_reads == 2:
+                self.both_reads_finished.set()
+            await self.both_reads_finished.wait()
+            return snapshot
+
+        async def acreate_smtp_settings_if_absent(self, settings):
+            if self.smtp_settings is None:
+                self.smtp_settings = settings
+            return self.smtp_settings
+
+        async def asave_smtp_settings(self, settings):
+            if self.smtp_settings is not None:
+                settings = replace(settings, id=self.smtp_settings.id)
+            self.smtp_settings = settings
+            return settings
+
+    store = FirstSaveRaceStore()
+    store.add_user(
+        username="operator",
+        email="operator@example.test",
+        password_hash=PasswordService().hash("Original-password123!"),
+        role="ADMIN",
+    )
+    key_file = tmp_path / "master_key"
+    key_file.write_bytes(b"k" * 32)
+    settings = Settings(
+        app_secret_key="test-secret",
+        session_cookie_secure=False,
+        master_encryption_key_file=str(key_file),
+    )
+    app = create_app(settings, store)
+    clients = []
+    for _ in range(2):
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        )
+        csrf = (await client.get("/api/v1/auth/csrf")).json()["csrf_token"]
+        await client.post(
+            "/api/v1/auth/login",
+            json={"username_or_email": "operator", "password": "Original-password123!"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        client.headers["X-CSRF-Token"] = client.cookies["ctm_csrf"]
+        clients.append(client)
+    try:
+        responses = await asyncio.gather(
+            *[
+                client.put(
+                    "/api/v1/settings/smtp",
+                    json=smtp_payload(
+                        host=f"smtp{index}.example.test",
+                        username=f"smtp-user-{index}",
+                        password=f"unique-password-{index}",
+                    ),
+                )
+                for index, client in enumerate(clients)
+            ]
+        )
+        assert all(response.status_code == 200 for response in responses)
+        persisted = await store.aget_smtp_settings()
+        assert persisted is not None
+        credentials = CredentialCipher.from_secret_file(
+            settings.master_encryption_key_file
+        ).decrypt(persisted.id, persisted.encrypted_credentials)
+        assert credentials["username"].startswith("smtp-user-")
+        audit_ids = [
+            event["resource_id"]
+            for event in store.audit_events
+            if event["action"] == "SMTP_SETTINGS_UPDATED"
+        ]
+        assert audit_ids == [str(persisted.id), str(persisted.id)]
+    finally:
+        for client in clients:
+            await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_smtp_test_returns_generic_failure(tmp_path, monkeypatch):
     client, store, _settings = await authenticated_client(tmp_path)
 
-    def fail(_config):
-        raise main.SMTPConnectionError("SMTP connection failed")
+    class FailingSMTP:
+        def __init__(self, *_args, **_kwargs):
+            raise smtplib.SMTPAuthenticationError(
+                535, f"authentication rejected {PASSWORD}".encode()
+            )
 
-    monkeypatch.setattr(main, "test_smtp_connection", fail, raising=False)
+    monkeypatch.setattr(smtp_config_module.smtplib, "SMTP", FailingSMTP)
     try:
         response = await client.post("/api/v1/settings/smtp/test", json=smtp_payload())
         assert response.status_code == 200

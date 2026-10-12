@@ -14,7 +14,9 @@ from urllib.parse import urlencode, urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
@@ -203,6 +205,21 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         raise RuntimeError("APP_SECRET_KEY must be configured in production")
     session_secret = configured_secret or secrets.token_urlsafe(48)
     app = FastAPI(title="Cloud Transfer Manager", version="0.1.0")
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> Response:
+        if request.url.path in {
+            "/api/v1/settings/smtp",
+            "/api/v1/settings/smtp/test",
+        }:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "Configuración SMTP inválida"},
+            )
+        return await request_validation_exception_handler(request, exc)
+
     app.add_middleware(
         SessionMiddleware,
         secret_key=session_secret,
@@ -819,6 +836,16 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         password = payload.password.get_secret_value() if payload.password else ""
         return (username, password) if username and password else None
 
+    def encrypt_smtp_values(settings_id: uuid.UUID, credentials: tuple[str, str]) -> bytes:
+        try:
+            return encrypt_smtp_credentials(
+                config, settings_id, credentials[0], credentials[1]
+            )
+        except (OSError, ValueError):
+            raise HTTPException(
+                status_code=503, detail="No se pudieron guardar las credenciales SMTP"
+            ) from None
+
     @app.get("/api/v1/settings/smtp")
     async def get_smtp_settings(
         _admin: UserAccount = Depends(admin_user),
@@ -838,27 +865,15 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         settings_id = previous.id if previous else uuid.uuid4()
         credentials = smtp_request_credentials(payload)
         if credentials is not None:
-            try:
-                encrypted_credentials = encrypt_smtp_credentials(
-                    config, settings_id, credentials[0], credentials[1]
-                )
-            except (OSError, ValueError):
-                raise HTTPException(
-                    status_code=503, detail="No se pudieron guardar las credenciales SMTP"
-                ) from None
+            encrypted_credentials = encrypt_smtp_values(settings_id, credentials)
         elif previous is not None:
             encrypted_credentials = previous.encrypted_credentials
         else:
             environment = environment_smtp_config(config)
             if environment.username and environment.password:
-                try:
-                    encrypted_credentials = encrypt_smtp_credentials(
-                        config, settings_id, environment.username, environment.password
-                    )
-                except (OSError, ValueError):
-                    raise HTTPException(
-                        status_code=503, detail="No se pudieron guardar las credenciales SMTP"
-                    ) from None
+                encrypted_credentials = encrypt_smtp_values(
+                    settings_id, (environment.username, environment.password)
+                )
             else:
                 encrypted_credentials = b""
 
@@ -870,7 +885,26 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             from_address=payload.from_address,
             encrypted_credentials=encrypted_credentials,
         )
-        await app.state.store.asave_smtp_settings(record)
+        if previous is None:
+            canonical = await app.state.store.acreate_smtp_settings_if_absent(record)
+            if canonical.id != record.id:
+                if credentials is None:
+                    encrypted_credentials = canonical.encrypted_credentials
+                else:
+                    encrypted_credentials = encrypt_smtp_values(canonical.id, credentials)
+                record = SMTPSettingsRecord(
+                    id=canonical.id,
+                    host=payload.host,
+                    port=payload.port,
+                    use_tls=payload.use_tls,
+                    from_address=payload.from_address,
+                    encrypted_credentials=encrypted_credentials,
+                )
+                record = await app.state.store.asave_smtp_settings(record)
+            else:
+                record = canonical
+        else:
+            record = await app.state.store.asave_smtp_settings(record)
         changed_fields = (
             ["host", "port", "use_tls", "from_address"]
             if previous is None

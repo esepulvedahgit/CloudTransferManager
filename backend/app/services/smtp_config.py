@@ -97,24 +97,69 @@ def test_smtp_connection(config: SMTPServerConfig) -> None:
 
 def validate_smtp_host(value: str) -> str:
     host = value.strip()
-    if not host or len(host) > 255 or any(character.isspace() for character in host):
+    if (
+        not host
+        or len(host) > 255
+        or any(character.isspace() for character in host)
+        or any(ord(character) < 32 or ord(character) == 127 for character in host)
+    ):
         raise ValueError("Invalid SMTP host")
-    candidate = host[1:-1] if host.startswith("[") and host.endswith("]") else host
-    try:
-        ipaddress.ip_address(candidate)
-        return host
-    except ValueError:
-        pass
-    if len(candidate) > 253 or not re.fullmatch(
+    if "[" in host or "]" in host:
+        if not (host.startswith("[") and host.endswith("]")):
+            raise ValueError("Invalid SMTP host")
+        parsed = _normalize_ip_literal(host[1:-1], require_ipv6=True)
+        if parsed is None:
+            raise ValueError("Invalid SMTP host")
+        return parsed
+    parsed = _normalize_ip_literal(host)
+    if parsed is not None:
+        return parsed
+    if len(host) > 253 or not re.fullmatch(
         r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*",
-        candidate,
+        host,
     ):
         raise ValueError("Invalid SMTP host")
     return host
 
 
+def _normalize_ip_literal(host: str, require_ipv6: bool = False) -> str | None:
+    address_text, separator, scope_id = host.partition("%")
+    if separator and (
+        host.count("%") != 1 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", scope_id)
+    ):
+        raise ValueError("Invalid SMTP host")
+    try:
+        address = ipaddress.ip_address(address_text)
+    except ValueError:
+        return None
+    if (require_ipv6 or separator) and not isinstance(address, ipaddress.IPv6Address):
+        raise ValueError("Invalid SMTP host")
+    normalized = address.compressed
+    return f"{normalized}%{scope_id}" if separator else normalized
+
+
 def validate_smtp_sender(value: str) -> str:
     sender = value.strip()
-    if len(sender) > 255 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", sender):
+    if (
+        len(sender) > 255
+        or any(ord(character) < 32 or ord(character) == 127 for character in sender)
+        or sender.count("@") != 1
+    ):
+        raise ValueError("Invalid sender address")
+    local, domain = sender.split("@")
+    if (
+        not local
+        or len(local) > 64
+        or local.startswith(".")
+        or local.endswith(".")
+        or ".." in local
+        or not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+", local)
+    ):
+        raise ValueError("Invalid sender address")
+    labels = domain.split(".")
+    if len(labels) < 2 or any(
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        for label in labels
+    ):
         raise ValueError("Invalid sender address")
     return sender

@@ -10,14 +10,62 @@ from sqlalchemy.orm import Session
 
 from app.main import create_app
 from app.models import AuditEvent, StorageConnection, TransferCounter
+from app.security.credentials import CredentialCipher
 from app.security.passwords import PasswordService
 from app.services.database_store import DatabaseStore
-from app.services.memory_store import ConnectionInUseError, ConnectionUnavailableError
+from app.services.memory_store import (
+    ConnectionInUseError,
+    ConnectionUnavailableError,
+    SMTPSettingsRecord,
+)
 from app.settings import Settings
 
 
 def test_transfer_counter_year_is_not_database_generated():
     assert TransferCounter.__table__.c.year.autoincrement is False
+
+
+@pytest.mark.asyncio
+async def test_database_store_atomically_creates_one_smtp_settings_identity(tmp_path):
+    key_file = tmp_path / "master_key"
+    key_file.write_bytes(b"k" * 32)
+    cipher = CredentialCipher.from_secret_file(key_file)
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'smtp-race.sqlite'}",
+        session_cookie_secure=False,
+    )
+    store = DatabaseStore(settings)
+    await store.create_schema()
+    candidates = []
+    for index in range(2):
+        candidate_id = uuid.uuid4()
+        candidates.append(
+            SMTPSettingsRecord(
+                id=candidate_id,
+                host=f"smtp{index}.example.test",
+                port=587,
+                use_tls=True,
+                from_address=f"sender{index}@example.test",
+                encrypted_credentials=cipher.encrypt(
+                    candidate_id,
+                    {"username": f"user-{index}", "password": f"pass-{index}"},
+                ),
+            )
+        )
+
+    returned = await asyncio.gather(
+        *(store.acreate_smtp_settings_if_absent(candidate) for candidate in candidates)
+    )
+    persisted = await store.aget_smtp_settings()
+    await store.aclose()
+
+    assert persisted is not None
+    assert returned[0].id == returned[1].id == persisted.id
+    decrypted = cipher.decrypt(persisted.id, persisted.encrypted_credentials)
+    assert decrypted in (
+        {"username": "user-0", "password": "pass-0"},
+        {"username": "user-1", "password": "pass-1"},
+    )
 
 
 @pytest.mark.asyncio

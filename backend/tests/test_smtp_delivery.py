@@ -1,3 +1,5 @@
+import smtplib
+import ssl
 import uuid
 from email.message import EmailMessage
 from types import SimpleNamespace
@@ -128,3 +130,49 @@ def test_smtp_delivery_uses_starttls_and_auth(monkeypatch):
     assert ("login", "database-user", "database-password") in events
     assert ("send", "database@example.test", "recipient@example.test") in events
     assert event_names[-1] == "quit"
+
+
+@pytest.mark.parametrize("failure_phase", ["connect", "starttls", "login"])
+def test_smtp_connection_sanitizes_transport_failures(monkeypatch, failure_phase):
+    secret = "smtp-transport-secret"
+
+    class FakeSMTP:
+        def __init__(self, *_args, **_kwargs):
+            if failure_phase == "connect":
+                raise TimeoutError(f"timeout using {secret}")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def ehlo(self):
+            return None
+
+        def starttls(self, **_kwargs):
+            if failure_phase == "starttls":
+                raise ssl.SSLError(f"TLS failed for {secret}")
+
+        def login(self, *_args):
+            if failure_phase == "login":
+                raise smtplib.SMTPAuthenticationError(
+                    535, f"authentication rejected {secret}".encode()
+                )
+
+    monkeypatch.setattr(smtp_config_module.smtplib, "SMTP", FakeSMTP)
+    config = smtp_config_module.SMTPServerConfig(
+        host="smtp.example.test",
+        port=587,
+        username="smtp-user",
+        password=secret,
+        from_address="notifications@example.test",
+        use_tls=True,
+    )
+
+    with pytest.raises(smtp_config_module.SMTPConnectionError) as raised:
+        smtp_config_module.test_smtp_connection(config)
+
+    assert str(raised.value) == "SMTP connection failed"
+    assert secret not in str(raised.value)
+    assert raised.value.__cause__ is None

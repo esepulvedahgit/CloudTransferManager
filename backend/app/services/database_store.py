@@ -70,6 +70,32 @@ class DatabaseStore:
             row = await session.scalar(select(SMTPSettings).where(SMTPSettings.scope == "global"))
             return self._smtp_settings(row) if row else None
 
+    async def acreate_smtp_settings_if_absent(
+        self, settings: SMTPSettingsRecord
+    ) -> SMTPSettingsRecord:
+        async with self.sessions() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else "postgresql"
+            insert = pg_insert if dialect == "postgresql" else sqlite_insert
+            statement = insert(SMTPSettings).values(
+                id=settings.id,
+                scope="global",
+                host=settings.host,
+                port=settings.port,
+                use_tls=settings.use_tls,
+                from_address=settings.from_address,
+                encrypted_credentials=settings.encrypted_credentials,
+            )
+            await session.execute(
+                statement.on_conflict_do_nothing(index_elements=[SMTPSettings.scope])
+            )
+            row = await session.scalar(
+                select(SMTPSettings).where(SMTPSettings.scope == "global")
+            )
+            if row is None:
+                raise RuntimeError("SMTP settings reservation failed")
+            await session.commit()
+            return self._smtp_settings(row)
+
     async def asave_smtp_settings(self, settings: SMTPSettingsRecord) -> SMTPSettingsRecord:
         async with self.sessions() as session:
             dialect = session.bind.dialect.name if session.bind is not None else "postgresql"
@@ -83,7 +109,7 @@ class DatabaseStore:
                 from_address=settings.from_address,
                 encrypted_credentials=settings.encrypted_credentials,
             )
-            statement = statement.on_conflict_do_update(
+            upsert = statement.on_conflict_do_update(
                 index_elements=[SMTPSettings.scope],
                 set_={
                     "host": settings.host,
@@ -93,7 +119,7 @@ class DatabaseStore:
                     "encrypted_credentials": settings.encrypted_credentials,
                 },
             ).returning(SMTPSettings)
-            row = (await session.scalars(statement)).one()
+            row = (await session.scalars(upsert)).one()
             await session.commit()
             return self._smtp_settings(row)
 
