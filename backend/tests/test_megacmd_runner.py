@@ -266,6 +266,36 @@ async def test_runner_terminates_process_when_transfer_is_cancelled(
 
 
 @pytest.mark.asyncio
+async def test_runner_handles_process_finishing_during_cancellation_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    runner_type = _runner_type()
+    process = _FakeProcess(returncode=None)
+
+    async def start(*args: Any, **kwargs: Any) -> _FakeProcess:
+        return process
+
+    async def cancellation_check() -> bool:
+        process.returncode = 0
+        process._finished.set()
+        await asyncio.sleep(0)
+        return False
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    runner = runner_type("/usr/bin")
+
+    stdout, stderr = await runner.run(
+        "ls",
+        _ls_arguments(),
+        home=tmp_path / "home",
+        should_cancel=cancellation_check,
+    )
+
+    assert stdout == b""
+    assert stderr == b""
+
+
+@pytest.mark.asyncio
 async def test_runner_terminates_process_on_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

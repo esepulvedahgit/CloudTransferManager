@@ -270,7 +270,8 @@ class MegaCmdRunner:
                 else:
                     interval = self._poll_interval_seconds
                 pending = {task for task in [wait_task, *reader_tasks] if not task.done()}
-                await asyncio.wait(pending, timeout=interval)
+                if pending:
+                    await asyncio.wait(pending, timeout=interval)
 
             stdout_result, stderr_result = await asyncio.gather(*reader_tasks)
             if process.returncode != 0:
