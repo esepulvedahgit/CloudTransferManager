@@ -11,8 +11,9 @@ def test_frontend_uses_unprivileged_nginx_on_port_8080():
         PROJECT_ROOT / "infrastructure/nginx/reverse-proxy.conf"
     ).read_text(encoding="utf-8")
 
-    assert "FROM nginxinc/nginx-unprivileged:1.27-alpine" in dockerfile
-    assert "USER 101" in dockerfile
+    assert "FROM nginxinc/nginx-unprivileged:" in dockerfile
+    users = [line.strip() for line in dockerfile.splitlines() if line.startswith("USER ")]
+    assert users[-1] == "USER 101"
     assert "EXPOSE 8080" in dockerfile
     assert "HEALTHCHECK" in dockerfile
     assert "listen 8080;" in nginx_config
