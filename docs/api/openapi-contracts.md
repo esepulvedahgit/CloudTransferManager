@@ -235,6 +235,8 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 ## 6. Transferencias (`/transfers`)
 
 ### `POST /api/v1/transfers`
+- Acepta hasta 100 rutas de origen y responde `201 Created` al registrar y agendar el trabajo. La existencia de cada ruta se valida en el worker para que una consulta lenta del proveedor no bloquee la solicitud HTTP.
+- El worker aplica `TRANSFER_MAX_FILES` (predeterminado 5000), el límite opcional `TRANSFER_MAX_FILE_BYTES` (0 = sin límite fijo) y la reserva de staging antes de escribir en destino. Si el preflight falla, la transferencia pasa a `FAILED`; el usuario puede ver el mensaje seguro en `/api/v1/transfers/{transfer_id}/events`.
 - **Request Body:**
 ```json
 {

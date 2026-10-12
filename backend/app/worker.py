@@ -73,7 +73,6 @@ async def _execute_transfer(transfer_id: uuid.UUID) -> None:
                 "error_count": record.error_count,
             },
             provider_error_code="TRANSFER_FAILED" if record.status == "FAILED" else None,
-            item_path=record.current_item,
         )
         await event_bus.publish_progress(str(record.id), _event_payload(record))
 

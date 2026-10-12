@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import random
+import traceback
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
@@ -28,7 +29,7 @@ from app.services.megacmd import (
 )
 from app.services.memory_store import ConnectionRecord, TransferRecord
 from app.services.rclone import RcloneCancelledError, RcloneCommandError, RcloneRunner
-from app.services.staging import temporary_staging_area
+from app.services.staging import StagingSpaceError, temporary_staging_area
 from app.services.telemetry import parse_mega_progress_line, parse_rclone_stats_line
 from app.settings import Settings
 
@@ -56,6 +57,18 @@ class TransferExecutor:
             settings.transfer_staging_path,
         )
         self.sleep = sleep
+
+    class _PreflightError(Exception):
+        def __init__(
+            self,
+            error_code: str,
+            message: str,
+            technical_details: dict[str, Any] | None = None,
+        ) -> None:
+            super().__init__(message)
+            self.error_code = error_code
+            self.message = message
+            self.technical_details = technical_details or {}
 
     async def execute(self, transfer_id: uuid.UUID) -> None:
         record = await self.store.aget_transfer(transfer_id)
@@ -91,10 +104,18 @@ class TransferExecutor:
                 technical_details={"http_status": exc.status_code},
             )
         except Exception as exc:
+            frames = traceback.extract_tb(exc.__traceback__)
+            location = frames[-1] if frames else None
+            details: dict[str, Any] = {"exception_type": type(exc).__name__}
+            if location is not None:
+                details["failure_location"] = {
+                    "function": location.name[:128],
+                    "line": location.lineno,
+                }
             await self._fail(
                 record,
                 error_code="TRANSFER_EXECUTION_FAILED",
-                technical_details={"exception_type": type(exc).__name__},
+                technical_details=details,
             )
 
     @property
@@ -212,19 +233,102 @@ class TransferExecutor:
         for path in record.source_paths:
             item = await source.get_item(path)
             if item is None:
-                await self._fail(record, error_code="SOURCE_ITEM_NOT_FOUND")
+                await self._fail(
+                    record,
+                    error_code="SOURCE_ITEM_NOT_FOUND",
+                    message=(
+                        "No se encontró uno de los elementos del origen. Compruebe que "
+                        "siga disponible y vuelva a intentarlo."
+                    ),
+                )
                 return
             source_items.append(item)
 
-        path_count = max(len(source_items), 1)
-        file_count_available = bool(source_items) and all(not item.is_dir for item in source_items)
-        byte_weights_available = bool(source_items) and all(
-            not item.is_dir and item.size_bytes is not None for item in source_items
+        try:
+            manifest_files, _directories = await self._collect_files(
+                source, record.source_paths, include_selected_folder=False
+            )
+        except FileNotFoundError:
+            await self._fail(
+                record,
+                error_code="SOURCE_ITEM_NOT_FOUND",
+                message=(
+                    "No se encontró uno de los elementos del origen. Compruebe que "
+                    "siga disponible y vuelva a intentarlo."
+                ),
+            )
+            return
+        except self._PreflightError as exc:
+            await self._fail(
+                record,
+                error_code=exc.error_code,
+                message=exc.message,
+                technical_details=exc.technical_details,
+            )
+            return
+
+        selected_roots = [
+            (MockStorageProvider.normalize_path(path), item)
+            for path, item in zip(record.source_paths, source_items, strict=True)
+        ]
+        copy_roots = [
+            (path, item)
+            for index, (path, item) in enumerate(selected_roots)
+            if not any(
+                other_index != index
+                and other_item.is_dir
+                and path.startswith(other_path.rstrip("/") + "/")
+                for other_index, (other_path, other_item) in enumerate(selected_roots)
+            )
+            and not any(previous_path == path for previous_path, _item in selected_roots[:index])
+        ]
+        copy_paths = [path for path, _item in copy_roots]
+        copy_items = [item for _path, item in copy_roots]
+
+        record.files_total = len(manifest_files)
+        manifest_sizes_known = all(item.size_bytes is not None for item, _path in manifest_files)
+        if not manifest_sizes_known:
+            unknown_sizes = sum(item.size_bytes is None for item, _path in manifest_files)
+            await self._fail(
+                record,
+                error_code="TRANSFER_FILE_SIZE_UNKNOWN",
+                message=(
+                    "No se puede validar el tamaño de todos los archivos del origen. "
+                    "Consulte al administrador antes de volver a intentarlo."
+                ),
+                technical_details={"files_without_size": unknown_sizes},
+            )
+            return
+
+        destination_files: list[tuple[StorageItem, str]] = []
+        for item, _relative_path in manifest_files:
+            destination_file = self._direct_destination_file_path(
+                item.path,
+                copy_paths,
+                copy_items,
+                record.destination_path,
+            )
+            if destination_file is None:
+                await self._fail(
+                    record,
+                    error_code="TRANSFER_MANIFEST_INVALID",
+                    message="No se pudo preparar la lista de archivos para copiar.",
+                )
+                return
+            destination_files.append((item, destination_file))
+
+        record.bytes_total = (
+            sum(item.size_bytes or 0 for item, _path in manifest_files)
+            if manifest_sizes_known
+            else 0
         )
-        if file_count_available:
-            record.files_total = path_count
+
+        path_count = max(len(copy_items), 1)
+        byte_weights_available = bool(copy_items) and all(
+            not item.is_dir and item.size_bytes is not None for item in copy_items
+        )
         path_weights = (
-            [max(item.size_bytes or 0, 0) for item in source_items]
+            [max(item.size_bytes or 0, 0) for item in copy_items]
             if byte_weights_available
             else [1] * path_count
         )
@@ -245,12 +349,12 @@ class TransferExecutor:
             record.status = "RUNNING" if attempt == 1 else "RETRYING"
             if attempt > 1:
                 record.error_count += 1
+                record.bytes_transferred = 0
             await self.publish(record)
             byte_offset = 0
-            file_offset = 0
             try:
                 accumulated_weight = 0
-                for path_index, path in enumerate(record.source_paths):
+                for path_index, path in enumerate(copy_paths):
                     if await self.should_cancel():
                         await self._cancel(record)
                         return
@@ -258,25 +362,24 @@ class TransferExecutor:
                     async def on_line(
                         line: str,
                         byte_base: int = byte_offset,
-                        file_base: int = file_offset,
                         path_count_for_job: int = path_count,
                         path_weight_base: int = accumulated_weight,
                         path_weight_for_job: int = path_weights[path_index],
                         total_weight_for_job: int = total_progress_weight,
                         use_byte_weights: bool = byte_weights_available,
                     ) -> None:
-                        nonlocal byte_offset, file_offset
+                        nonlocal byte_offset
                         progress = parse_rclone_stats_line(line)
                         if progress is None:
                             return
                         if "bytes_transferred" in progress:
-                            record.bytes_transferred = byte_base + progress["bytes_transferred"]
-                        if "bytes_total" in progress and not use_byte_weights:
-                            record.bytes_total = byte_base + progress["bytes_total"]
-                        if "files_completed" in progress:
-                            record.files_completed = file_base + progress["files_completed"]
-                        if "files_total" in progress and not file_count_available:
-                            record.files_total = file_base + progress["files_total"]
+                            reported_bytes = progress["bytes_transferred"]
+                            if manifest_sizes_known:
+                                reported_bytes = min(
+                                    reported_bytes,
+                                    max(record.bytes_total - byte_base, 0),
+                                )
+                            record.bytes_transferred = byte_base + reported_bytes
                         if "current_speed_bps" in progress:
                             record.current_speed_bps = progress["current_speed_bps"]
                             elapsed = max(
@@ -336,7 +439,7 @@ class TransferExecutor:
                         record.current_item = progress.get("current_item")
                         await self.publish(record)
 
-                    source_item = source_items[path_index]
+                    source_item = copy_items[path_index]
                     destination_path = MockStorageProvider.normalize_path(
                         record.destination_path
                     )
@@ -363,7 +466,6 @@ class TransferExecutor:
                         create_empty_src_dirs=source_item.is_dir,
                     )
                     byte_offset = record.bytes_transferred
-                    file_offset = record.files_completed
                     accumulated_weight += path_weights[path_index]
                 break
             except RcloneCancelledError:
@@ -386,7 +488,7 @@ class TransferExecutor:
                 record.status = "RETRYING"
                 await self.publish(record)
                 delay = min(5 * (2 ** (attempt - 1)) + random.random(), 300)
-                if not await self._wait_for_retry(record, delay):
+                if not await self._wait_for_retry(record, delay, next_attempt=attempt + 1):
                     return
         else:
             await self._fail(record)
@@ -394,8 +496,65 @@ class TransferExecutor:
 
         record.current_item = None
         record.current_speed_bps = None
+        record.estimated_remaining_seconds = None
+        await self.publish(record)
+        skipped_bytes = 0
+        for item, destination_file in destination_files:
+            record.current_item = item.path
+            assert item.size_bytes is not None
+            destination_item = await self._read_rclone_destination(
+                destination, destination_file, item.size_bytes
+            )
+            if destination_item is None or destination_item.is_dir:
+                await self._fail(
+                    record,
+                    error_code="DESTINATION_VERIFICATION_FAILED",
+                    message=(
+                        f"El proveedor no confirmó el archivo «{item.name}». Revise el "
+                        "destino antes de volver a intentarlo."
+                    ),
+                    technical_details={
+                        "file_name": item.name,
+                        "expected_bytes": item.size_bytes,
+                    },
+                )
+                return
+            if destination_item.size_bytes != item.size_bytes:
+                if record.conflict_policy == "SKIP":
+                    record.warning_count += 1
+                    skipped_bytes += item.size_bytes or 0
+                else:
+                    await self._fail(
+                        record,
+                        error_code="DESTINATION_VERIFICATION_FAILED",
+                        message=(
+                            f"El proveedor no confirmó el archivo «{item.name}». Revise el "
+                            "destino antes de volver a intentarlo."
+                        ),
+                        technical_details={
+                            "file_name": item.name,
+                            "expected_bytes": item.size_bytes,
+                            "destination_bytes": destination_item.size_bytes,
+                        },
+                    )
+                    return
+            record.files_completed += 1
+            record.progress_percent = max(
+                record.progress_percent,
+                min(
+                    round(record.files_completed * 100 / max(record.files_total, 1), 2),
+                    99.99,
+                ),
+            )
+            await self.publish(record)
+
+        record.current_item = None
+        record.current_speed_bps = None
+        record.files_completed = record.files_total
+        if manifest_sizes_known:
+            record.bytes_transferred = max(record.bytes_total - skipped_bytes, 0)
         record.progress_percent = 100.0
-        record.status = "COMPLETED"
+        record.status = "COMPLETED_WITH_WARNINGS" if record.warning_count else "COMPLETED"
         record.completed_at = datetime.now(UTC)
         await self.publish(record)
 
@@ -443,7 +602,25 @@ class TransferExecutor:
                     include_selected_folder=True,
                 )
             except FileNotFoundError:
-                await self._fail(record, error_code="SOURCE_ITEM_NOT_FOUND")
+                await self._fail(
+                    record,
+                    error_code="SOURCE_ITEM_NOT_FOUND",
+                    message=(
+                        "No se encontró uno de los elementos del origen. Compruebe que "
+                        "siga disponible y vuelva a intentarlo."
+                    ),
+                )
+                return
+            except self._PreflightError as exc:
+                await self._fail(
+                    record,
+                    error_code=exc.error_code,
+                    message=exc.message,
+                    technical_details=exc.technical_details,
+                )
+                return
+
+            if not await self._preflight_staging(record, files):
                 return
 
             record.files_total = len(files)
@@ -560,8 +737,6 @@ class TransferExecutor:
                 byte_base = record.bytes_transferred
                 completed = False
                 already_identical = False
-                size_added_for_file = False
-                staged_file_size = 0
                 mega_upload_started = False
                 for attempt in range(1, self.settings.transfer_max_retries + 2):
                     if await self.should_cancel():
@@ -577,6 +752,7 @@ class TransferExecutor:
                     async def on_progress(
                         line: str,
                         byte_base_for_file: int = byte_base,
+                        item_size: int | None = item.size_bytes,
                     ) -> None:
                         nonlocal local_file_bytes
                         metrics = parse_rclone_stats_line(line)
@@ -587,6 +763,8 @@ class TransferExecutor:
                         current_bytes = metrics.get("bytes_transferred")
                         if isinstance(current_bytes, int):
                             local_file_bytes = max(local_file_bytes, current_bytes)
+                            if item_size is not None:
+                                local_file_bytes = min(local_file_bytes, item_size)
                             record.bytes_transferred = byte_base_for_file + local_file_bytes
                         speed = metrics.get("current_speed_bps")
                         if isinstance(speed, int):
@@ -610,6 +788,8 @@ class TransferExecutor:
                     ) -> None:
                         nonlocal local_file_bytes
                         local_file_bytes = max(local_file_bytes, current)
+                        if item_for_api.size_bytes is not None:
+                            local_file_bytes = min(local_file_bytes, item_for_api.size_bytes)
                         record.bytes_transferred = byte_base_for_api + local_file_bytes
                         if total is not None and item_for_api.size_bytes is None:
                             remaining = sum(
@@ -655,6 +835,8 @@ class TransferExecutor:
                             Path(self.settings.transfer_staging_path),
                             transfer_id=record.id,
                             expected_size=item.size_bytes,
+                            reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+                            margin_percent=self.settings.transfer_staging_margin_percent,
                         ) as staging_area:
                             if self._uses_seafile_api(source_connection):
                                 local_file = staging_area / item.name
@@ -684,18 +866,13 @@ class TransferExecutor:
                                 local_file = staging_area / item.name
 
                             file_size = local_file.stat().st_size
-                            staged_file_size = file_size
-                            if (
-                                self._uses_seafile_api(source_connection)
-                                and item.size_bytes is not None
-                                and file_size != item.size_bytes
-                            ):
+                            if item.size_bytes is not None and file_size != item.size_bytes:
                                 await self._fail(
                                     record,
                                     error_code="SOURCE_SIZE_MISMATCH",
                                     message=(
-                                        "El tamaño descargado no coincide con los metadatos "
-                                        "del archivo de origen."
+                                        "El archivo preparado no coincide con el tamaño "
+                                        "informado por el origen."
                                     ),
                                     technical_details={
                                         "expected_bytes": item.size_bytes,
@@ -704,16 +881,6 @@ class TransferExecutor:
                                 )
                                 return
                             source_digest = await _sha256_file(local_file, self.should_cancel)
-                            if item.size_bytes is None and not size_added_for_file:
-                                remaining_known_size = sum(
-                                    next_item.size_bytes or 0
-                                    for next_item, _path in files[record.files_completed + 1 :]
-                                )
-                                record.bytes_total = max(
-                                    record.bytes_total,
-                                    byte_base + file_size + remaining_known_size,
-                                )
-                                size_added_for_file = True
                             if api_destination:
                                 if (
                                     existing is not None
@@ -745,7 +912,7 @@ class TransferExecutor:
                                         message=(
                                             "La verificación de integridad de Seafile no coincide."
                                         ),
-                                        technical_details={"path": relative.as_posix()},
+                                        technical_details={"file_name": relative.name},
                                     )
                                     return
                                 stored_nfc = unicodedata.normalize("NFC", stored_path)
@@ -760,8 +927,7 @@ class TransferExecutor:
                                             "de reintentar."
                                         ),
                                         technical_details={
-                                            "requested_path": destination_file,
-                                            "stored_path": stored_path,
+                                            "destination_name_conflict": True,
                                         },
                                     )
                                     return
@@ -784,8 +950,34 @@ class TransferExecutor:
                                     should_cancel=self.should_cancel,
                                     conflict_policy=record.conflict_policy,
                                 )
+                                if not await self._verify_rclone_destination(
+                                    destination, destination_file, file_size
+                                ):
+                                    await self._fail(
+                                        record,
+                                        error_code="DESTINATION_VERIFICATION_FAILED",
+                                        message=(
+                                            "El proveedor no confirmó el archivo copiado. "
+                                            "Revise el destino antes de volver a intentarlo."
+                                        ),
+                                        technical_details={"expected_bytes": file_size},
+                                    )
+                                    return
                         completed = True
                         break
+                    except StagingSpaceError:
+                        await self._fail(
+                            record,
+                            error_code="TRANSFER_STAGING_SPACE_INSUFFICIENT",
+                            message=(
+                                "No hay espacio temporal suficiente para continuar. "
+                                "Libere espacio o contacte al administrador."
+                            ),
+                            technical_details={
+                                "required_file_bytes": item.size_bytes or 0,
+                            },
+                        )
+                        return
                     except (RcloneCancelledError, MegaCmdCancelledError, SeafileApiCancelledError):
                         raise
                     except (
@@ -856,7 +1048,9 @@ class TransferExecutor:
                             if isinstance(exc, SeafileApiError) and exc.retry_after is not None
                             else min(5 * (2 ** (attempt - 1)) + random.random(), 300)
                         )
-                        if not await self._wait_for_retry(record, delay):
+                        if not await self._wait_for_retry(
+                            record, delay, next_attempt=attempt + 1
+                        ):
                             return
                     if completed:
                         break
@@ -864,14 +1058,8 @@ class TransferExecutor:
                 if not completed:
                     await self._fail(record)
                     return
-                actual_size = (
-                    item.size_bytes if item.size_bytes is not None else staged_file_size
-                )
                 if not already_identical:
-                    record.bytes_transferred = max(
-                        record.bytes_transferred,
-                        byte_base + actual_size,
-                    )
+                    record.bytes_transferred = byte_base + (item.size_bytes or 0)
                 record.files_completed += 1
                 self._update_transfer_progress(record, files, completed_file=True)
                 record.current_speed_bps = None
@@ -935,7 +1123,25 @@ class TransferExecutor:
                     include_selected_folder=True,
                 )
             except FileNotFoundError:
-                await self._fail(record, error_code="SOURCE_ITEM_NOT_FOUND")
+                await self._fail(
+                    record,
+                    error_code="SOURCE_ITEM_NOT_FOUND",
+                    message=(
+                        "No se encontró uno de los elementos del origen. Compruebe que "
+                        "siga disponible y vuelva a intentarlo."
+                    ),
+                )
+                return
+            except self._PreflightError as exc:
+                await self._fail(
+                    record,
+                    error_code=exc.error_code,
+                    message=exc.message,
+                    technical_details=exc.technical_details,
+                )
+                return
+
+            if not await self._preflight_staging(record, files):
                 return
 
             record.files_total = len(files)
@@ -1054,6 +1260,7 @@ class TransferExecutor:
                         line: str,
                         byte_base_for_file: int = byte_base,
                         file_count_before: int = record.files_completed,
+                        item_size: int | None = item.size_bytes,
                     ) -> None:
                         nonlocal local_file_bytes
                         metrics = parse_rclone_stats_line(line)
@@ -1064,6 +1271,8 @@ class TransferExecutor:
                         current_bytes = metrics.get("bytes_transferred")
                         if isinstance(current_bytes, int):
                             local_file_bytes = max(local_file_bytes, current_bytes)
+                            if item_size is not None:
+                                local_file_bytes = min(local_file_bytes, item_size)
                             record.bytes_transferred = byte_base_for_file + local_file_bytes
                         current_total = metrics.get("bytes_total")
                         if not sizes_known and isinstance(current_total, int):
@@ -1117,6 +1326,8 @@ class TransferExecutor:
                             Path(self.settings.transfer_staging_path),
                             transfer_id=record.id,
                             expected_size=item.size_bytes,
+                            reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+                            margin_percent=self.settings.transfer_staging_margin_percent,
                         ) as staging_area:
                             if mega_is_source:
                                 local_file = await mega_session.download_file(
@@ -1125,6 +1336,26 @@ class TransferExecutor:
                                     line_callback=on_progress,
                                     should_cancel=self.should_cancel,
                                 )
+                                local_file_size = local_file.stat().st_size
+                                if item.size_bytes is None:
+                                    raise ValueError("Staged file size was not preflighted")
+                                if (
+                                    item.size_bytes is not None
+                                    and local_file_size != item.size_bytes
+                                ):
+                                    await self._fail(
+                                        record,
+                                        error_code="SOURCE_SIZE_MISMATCH",
+                                        message=(
+                                            "El archivo preparado no coincide con el tamaño "
+                                            "informado por el origen."
+                                        ),
+                                        technical_details={
+                                            "expected_bytes": item.size_bytes,
+                                            "downloaded_bytes": local_file_size,
+                                        },
+                                    )
+                                    return
                                 await self.runner.copy_local_to_remote(
                                     local_file,
                                     drive_provider.remote_path(destination_folder),
@@ -1134,6 +1365,21 @@ class TransferExecutor:
                                     should_cancel=self.should_cancel,
                                     conflict_policy=record.conflict_policy,
                                 )
+                                if not await self._verify_rclone_destination(
+                                    drive_provider, destination_file, local_file.stat().st_size
+                                ):
+                                    await self._fail(
+                                        record,
+                                        error_code="DESTINATION_VERIFICATION_FAILED",
+                                        message=(
+                                            "El proveedor no confirmó el archivo copiado. "
+                                            "Revise el destino antes de volver a intentarlo."
+                                        ),
+                                        technical_details={
+                                            "expected_bytes": local_file.stat().st_size,
+                                        },
+                                    )
+                                    return
                             else:
                                 await self.runner.copy_remote_to_local(
                                     source.remote_path(item.path),
@@ -1144,6 +1390,26 @@ class TransferExecutor:
                                     should_cancel=self.should_cancel,
                                 )
                                 local_file = staging_area / item.name
+                                local_file_size = local_file.stat().st_size
+                                if item.size_bytes is None:
+                                    raise ValueError("Staged file size was not preflighted")
+                                if (
+                                    item.size_bytes is not None
+                                    and local_file_size != item.size_bytes
+                                ):
+                                    await self._fail(
+                                        record,
+                                        error_code="SOURCE_SIZE_MISMATCH",
+                                        message=(
+                                            "El archivo preparado no coincide con el tamaño "
+                                            "informado por el origen."
+                                        ),
+                                        technical_details={
+                                            "expected_bytes": item.size_bytes,
+                                            "downloaded_bytes": local_file_size,
+                                        },
+                                    )
+                                    return
                                 mega_upload_started = True
                                 await mega_session.upload_file(
                                     local_file,
@@ -1151,6 +1417,19 @@ class TransferExecutor:
                                     line_callback=on_progress,
                                     should_cancel=self.should_cancel,
                                 )
+                    except StagingSpaceError:
+                        await self._fail(
+                            record,
+                            error_code="TRANSFER_STAGING_SPACE_INSUFFICIENT",
+                            message=(
+                                "No hay espacio temporal suficiente para continuar. "
+                                "Libere espacio o contacte al administrador."
+                            ),
+                            technical_details={
+                                "required_file_bytes": item.size_bytes or 0,
+                            },
+                        )
+                        return
                     except (RcloneCancelledError, MegaCmdCancelledError):
                         raise
                     except (
@@ -1209,15 +1488,15 @@ class TransferExecutor:
                         record.estimated_remaining_seconds = None
                         await self.publish(record)
                         delay = min(5 * (2 ** (attempt - 1)) + random.random(), 300)
-                        if not await self._wait_for_retry(record, delay):
+                        if not await self._wait_for_retry(
+                            record, delay, next_attempt=attempt + 1
+                        ):
                             return
                         continue
                     break
 
                 if item.size_bytes is not None:
-                    record.bytes_transferred = max(
-                        record.bytes_transferred, byte_base + item.size_bytes
-                    )
+                    record.bytes_transferred = byte_base + item.size_bytes
                 record.files_completed += 1
                 self._update_transfer_progress(record, files, completed_file=True)
                 record.current_speed_bps = None
@@ -1243,6 +1522,9 @@ class TransferExecutor:
         directories: set[str] = set()
         visited_directories: set[str] = set()
 
+        def add_file(item_path: str, item: StorageItem, relative_path: str) -> None:
+            self._add_file_to_manifest(files, item_path, item, relative_path)
+
         async def walk_directory(path: str, relative_directory: PurePosixPath) -> None:
             if await self.should_cancel():
                 raise SeafileApiCancelledError("Transfer cancelled")
@@ -1266,7 +1548,7 @@ class TransferExecutor:
                     if child.is_dir:
                         await walk_directory(child_path, relative_child)
                     else:
-                        files.setdefault(child_path, (child, relative_child.as_posix()))
+                        add_file(child_path, child, relative_child.as_posix())
                 if page.next_cursor is None:
                     break
                 if page.next_cursor in seen_cursors:
@@ -1290,8 +1572,158 @@ class TransferExecutor:
                 )
                 await walk_directory(item_path, PurePosixPath(selected_directory))
             else:
-                files.setdefault(item_path, (item, item.name))
+                add_file(item_path, item, item.name)
         return list(files.values()), directories
+
+    @staticmethod
+    def _direct_destination_file_path(
+        item_path: str,
+        selected_paths: list[str],
+        selected_items: list[StorageItem],
+        destination_path: str,
+    ) -> str | None:
+        normalized_item_path = MockStorageProvider.normalize_path(item_path)
+        normalized_destination = MockStorageProvider.normalize_path(destination_path)
+        for selected_path, selected_item in zip(selected_paths, selected_items, strict=True):
+            normalized_selected = MockStorageProvider.normalize_path(selected_path)
+            if selected_item.is_dir:
+                prefix = normalized_selected.rstrip("/") + "/"
+                if normalized_item_path.startswith(prefix):
+                    relative_path = normalized_item_path[len(prefix) :]
+                    folder_name = PurePosixPath(normalized_selected).name
+                    destination_root = normalized_destination
+                    if folder_name:
+                        destination_root = MockStorageProvider.normalize_path(
+                            f"{destination_root.rstrip('/')}/{folder_name}"
+                        )
+                    return MockStorageProvider.normalize_path(
+                        f"{destination_root.rstrip('/')}/{relative_path}"
+                    )
+            elif normalized_item_path == normalized_selected:
+                return MockStorageProvider.normalize_path(
+                    f"{normalized_destination.rstrip('/')}/{selected_item.name}"
+                )
+        return None
+
+    def _add_file_to_manifest(
+        self,
+        files: dict[str, tuple[StorageItem, str]],
+        item_path: str,
+        item: StorageItem,
+        relative_path: str,
+    ) -> None:
+        if item_path in files:
+            return
+        if len(files) >= self.settings.transfer_max_files:
+            raise self._PreflightError(
+                "TRANSFER_FILE_LIMIT_EXCEEDED",
+                (
+                    f"La selección supera el máximo de "
+                    f"{self.settings.transfer_max_files:,} archivos. Divida la copia "
+                    "en varias transferencias."
+                ),
+                {"maximum_files": self.settings.transfer_max_files},
+            )
+        maximum_file_bytes = self.settings.transfer_max_file_bytes
+        if maximum_file_bytes > 0 and item.size_bytes is None:
+            raise self._PreflightError(
+                "TRANSFER_FILE_SIZE_UNKNOWN",
+                (
+                    "No se puede comprobar el límite porque el origen no informó "
+                    "el tamaño de todos los archivos. Consulte al administrador."
+                ),
+                {"maximum_file_bytes": maximum_file_bytes},
+            )
+        if (
+            maximum_file_bytes > 0
+            and item.size_bytes is not None
+            and item.size_bytes > maximum_file_bytes
+        ):
+            raise self._PreflightError(
+                "TRANSFER_FILE_SIZE_LIMIT_EXCEEDED",
+                (
+                    "Un archivo supera el tamaño máximo permitido para una transferencia. "
+                    "Divida la copia o ajuste el límite con el administrador."
+                ),
+                {
+                    "maximum_file_bytes": maximum_file_bytes,
+                    "file_bytes": item.size_bytes,
+                },
+            )
+        files[item_path] = (item, relative_path)
+
+    async def _preflight_staging(
+        self,
+        record: TransferRecord,
+        files: list[tuple[StorageItem, str]],
+    ) -> bool:
+        if not files:
+            return True
+        unknown_sizes = sum(item.size_bytes is None for item, _path in files)
+        if unknown_sizes:
+            await self._fail(
+                record,
+                error_code="TRANSFER_FILE_SIZE_UNKNOWN",
+                message=(
+                    "No se puede comprobar el espacio temporal porque el origen no informó "
+                    "el tamaño de todos los archivos. Consulte al administrador."
+                ),
+                technical_details={"files_without_size": unknown_sizes},
+            )
+            return False
+
+        largest_file = max(item.size_bytes or 0 for item, _path in files)
+        try:
+            async with temporary_staging_area(
+                Path(self.settings.transfer_staging_path),
+                transfer_id=record.id,
+                expected_size=largest_file,
+                reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+                margin_percent=self.settings.transfer_staging_margin_percent,
+            ):
+                pass
+        except StagingSpaceError:
+            await self._fail(
+                record,
+                error_code="TRANSFER_STAGING_SPACE_INSUFFICIENT",
+                message=(
+                    "No hay espacio temporal suficiente para procesar el archivo más grande. "
+                    "Libere espacio o contacte al administrador."
+                ),
+                technical_details={"largest_file_bytes": largest_file},
+            )
+            return False
+        return True
+
+    async def _read_rclone_destination(
+        self,
+        destination: Any,
+        path: str,
+        expected_size: int,
+    ) -> StorageItem | None:
+        last_item = None
+        for attempt in range(1, 4):
+            item = None
+            try:
+                item = await asyncio.wait_for(destination.get_item(path), timeout=15)
+            except Exception:
+                pass
+            if isinstance(item, StorageItem):
+                last_item = item
+                if item.is_dir or item.size_bytes == expected_size:
+                    return item
+            if attempt < 3:
+                await self.sleep(float(attempt))
+        return last_item
+
+    async def _verify_rclone_destination(
+        self,
+        destination: Any,
+        path: str,
+        expected_size: int,
+    ) -> bool:
+        item = await self._read_rclone_destination(destination, path, expected_size)
+        return item is not None and not item.is_dir and item.size_bytes == expected_size
 
     @staticmethod
     def _update_transfer_progress(
@@ -1310,7 +1742,24 @@ class TransferExecutor:
             record.progress_percent, min(round(progress, 2), progress_cap)
         )
 
-    async def _wait_for_retry(self, record: TransferRecord, delay: float) -> bool:
+    async def _wait_for_retry(
+        self,
+        record: TransferRecord,
+        delay: float,
+        *,
+        next_attempt: int,
+    ) -> bool:
+        await self.store.aadd_transfer_event(
+            record.id,
+            level="WARNING",
+            event_type="RETRY_SCHEDULED",
+            message="La transferencia volverá a intentarlo automáticamente.",
+            technical_details={
+                "next_attempt": next_attempt,
+                "delay_seconds": round(delay, 2),
+            },
+            correlation_id=record.id,
+        )
         remaining = delay
         while remaining > 0:
             if await self.should_cancel():
@@ -1341,21 +1790,30 @@ class TransferExecutor:
         message: str = "No se pudo completar la transferencia.",
         technical_details: dict[str, Any] | None = None,
     ) -> None:
+        stage = record.status
+        file_name = PurePosixPath(record.current_item).name if record.current_item else None
+        details: dict[str, Any] = {
+            "stage": stage,
+            "attempt": record.attempt_count,
+        }
+        if file_name:
+            details["file_name"] = file_name[:255]
+        details.update(technical_details or {})
         record.status = "FAILED"
         record.error_count += 1
         record.current_item = None
         record.current_speed_bps = None
         record.completed_at = datetime.now(UTC)
-        await self.publish(record)
         await self.store.aadd_transfer_event(
             record.id,
             level="ERROR",
             event_type="FAILURE_DIAGNOSTIC",
             message=message,
-            technical_details=technical_details or {},
+            technical_details=details,
             provider_error_code=error_code,
             correlation_id=record.id,
         )
+        await self.publish(record)
 
 
 async def _sha256_file(path: Path, should_cancel: Callable[[], Awaitable[bool]]) -> str:

@@ -86,6 +86,7 @@ type Transfer = {
   current_item: string | null;
   average_speed_bps: number | null;
   current_speed_bps: number | null;
+  attempt_count?: number;
   estimated_remaining_seconds?: number | null;
   created_at?: string | null;
   started_at?: string | null;
@@ -979,7 +980,7 @@ function pathCrumbs(path: string): string[] {
 function formatBytes(size: number | null): string {
   if (size === null) return '—';
   if (size < 1024) return `${size} B`;
-  const units = ['KB', 'MB', 'GB', 'TB'];
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
   let value = size / 1024;
   let index = 0;
   while (value >= 1024 && index < units.length - 1) {
@@ -1433,7 +1434,13 @@ function TransferWorkspace({
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const sourceConnection = connectionById.get(sourceId);
   const destinationConnection = connectionById.get(destinationId);
-  const canTransfer = Boolean(sourceId && destinationId && sourceId !== destinationId && selectedPaths.length > 0);
+  const canTransfer = Boolean(
+    sourceId
+    && destinationId
+    && sourceId !== destinationId
+    && selectedPaths.length > 0
+    && selectedPaths.length <= 100,
+  );
   const [conflictPolicy, setConflictPolicy] = useState<'SKIP' | 'OVERWRITE_IF_DIFFERENT'>('OVERWRITE_IF_DIFFERENT');
   const [sendEmailNotification, setSendEmailNotification] = useState(false);
   const [mobileStep, setMobileStep] = useState(0);
@@ -1551,6 +1558,17 @@ function TransferWorkspace({
       setActiveTransfer(update);
       if (terminalTransferStatuses.includes(update.status)) {
         stream.close();
+        if (update.status === 'FAILED') {
+          void apiRequest<{ items: Array<{ event_type: string; message: string }> }>(
+            `/api/v1/transfers/${update.id}/events`,
+          ).then(({ items }) => {
+            const failure = [...items].reverse().find((item) => item.event_type === 'FAILURE_DIAGNOSTIC');
+            if (failure) {
+              setNotice(failure.message);
+              setNoticeSeverity('error');
+            }
+          }).catch(() => undefined);
+        }
       }
     };
     return () => stream.close();
@@ -1766,6 +1784,11 @@ function TransferWorkspace({
                       ? 'Elige una conexión distinta como destino.'
                       : 'Selecciona una conexión de destino para habilitar la copia.'}
               </Typography>
+              {selectedPaths.length > 100 && (
+                <Alert severity="warning" sx={{ mt: 1 }}>
+                  Selecciona como máximo 100 rutas por transferencia. Divide la selección en varias copias.
+                </Alert>
+              )}
               <Box className="transfer-route" aria-label="Ruta de transferencia">
                 <Box className="transfer-route-point">
                   <Typography variant="overline">ORIGEN</Typography>
@@ -1829,10 +1852,15 @@ function TransferWorkspace({
               <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2}>
                 <Box>
                   <Typography variant="overline" color="text.secondary">TRANSFERENCIA ACTIVA · {activeTransfer.public_id}</Typography>
-                  <Typography fontWeight={700}>{activeTransfer.current_item ?? activeTransfer.status}</Typography>
+                  <Typography fontWeight={700}>{activeTransfer.current_item ?? transferStatusLabel(activeTransfer.status)}</Typography>
                 </Box>
                 <Typography fontWeight={700}>{activeTransfer.progress_percent.toFixed(1)}%</Typography>
               </Stack>
+              {activeTransfer.status === 'RETRYING' && (
+                <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                  Reintento automático en curso; próximo intento {activeTransfer.attempt_count ? activeTransfer.attempt_count + 1 : 2}.
+                </Typography>
+              )}
               <LinearProgress variant={activeTransfer.bytes_total ? 'determinate' : 'indeterminate'} value={activeTransfer.progress_percent} sx={{ mt: 2, mb: 1 }} />
               <Typography variant="caption" color="text.secondary">
                 {formatBytes(activeTransfer.bytes_transferred)} de {formatBytes(activeTransfer.bytes_total)} · {activeTransfer.files_completed}/{activeTransfer.files_total} archivos

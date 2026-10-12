@@ -48,6 +48,8 @@ Proporcionar una experiencia fluida y transparente en la interfaz web mostrando 
 
 ### Reglas de Presentación en la UI:
 - **Total Desconocido:** Si el proveedor no puede reportar el total de bytes o archivos de antemano, mostrar una barra indeterminada animada, indicando los bytes y archivos transferidos hasta el momento.
+- En rutas con staging, `bytes_transferred` mide el avance lógico del archivo una sola vez y no debe superar el tamaño conocido de origen. Presentar unidades binarias con etiquetas `KiB`, `MiB`, `GiB` y `TiB`.
+- Mostrar `VALIDATING` como «Validando» y `RETRYING` como «Reintentando», indicando el próximo número de intento. Al fallar, consultar `/events` y mostrar el mensaje de `FAILURE_DIAGNOSTIC`; los detalles técnicos no incluyen rutas completas ni texto crudo del proveedor.
 - **Varias Rutas de Origen:** Ponderar el avance por bytes cuando todas las rutas son archivos con tamaño conocido; si no, usar una estimación equitativa por ruta. Si el trabajo total de una transferencia de varias rutas es desconocido, omitir el ETA en vez de presentar el ETA de una sola ruta como si fuera el del trabajo completo.
 - El parser de MEGAcmd acepta únicamente métricas numéricas reconocidas; salida desconocida se ignora. `current_item` conserva la ruta remota y nunca expone una ruta local de staging ni la línea cruda del proceso.
 - **Resiliencia ante Desconexión:** El hook del frontend debe implementar reconexión automática con backoff si se pierde temporalmente la conexión SSE.

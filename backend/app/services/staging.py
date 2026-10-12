@@ -11,15 +11,23 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 
+class StagingSpaceError(OSError):
+    """Raised when a staging copy would violate its free-space reserve."""
+
+
 @asynccontextmanager
 async def temporary_staging_area(
     root: Path,
     *,
     transfer_id: uuid.UUID,
     expected_size: int | None,
+    reserve_bytes: int = 0,
+    margin_percent: int = 0,
 ) -> AsyncIterator[Path]:
     if expected_size is not None and expected_size < 0:
         raise ValueError("expected_size cannot be negative")
+    if reserve_bytes < 0 or margin_percent < 0:
+        raise ValueError("staging reserve and margin cannot be negative")
     staging_root = Path(root).absolute()
     _reject_symlink_components(staging_root)
     staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -27,8 +35,16 @@ async def temporary_staging_area(
     staging_root = staging_root.resolve(strict=True)
     if not staging_root.is_dir():
         raise ValueError("El directorio de staging no es una carpeta")
-    if expected_size is not None and shutil.disk_usage(staging_root).free < expected_size:
-        raise OSError("No hay suficiente espacio disponible para staging")
+    margin_bytes = (
+        (expected_size * margin_percent + 99) // 100 if expected_size is not None else 0
+    )
+    required_space = (
+        expected_size + max(reserve_bytes, margin_bytes)
+        if expected_size is not None
+        else 0
+    )
+    if expected_size is not None and shutil.disk_usage(staging_root).free < required_space:
+        raise StagingSpaceError("No hay suficiente espacio disponible para staging")
 
     area = Path(tempfile.mkdtemp(prefix=f"transfer-{transfer_id.hex}-", dir=staging_root))
     try:

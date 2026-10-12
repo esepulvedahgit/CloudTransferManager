@@ -174,11 +174,18 @@ def _google_callback_url(app_base_url: str, app_env: str) -> str | None:
 class TransferCreate(BaseModel):
     source_connection_id: uuid.UUID
     destination_connection_id: uuid.UUID
-    source_paths: list[str] = Field(min_length=1, max_length=100)
+    source_paths: list[str] = Field(min_length=1)
     destination_path: str = Field(min_length=1, max_length=1024)
     operation: str = "COPY"
     conflict_policy: str = "OVERWRITE_IF_DIFFERENT"
     send_email_notification: bool = False
+
+    @field_validator("source_paths")
+    @classmethod
+    def validate_source_path_limit(cls, value: list[str]) -> list[str]:
+        if len(value) > 100:
+            raise ValueError("Selecciona como máximo 100 rutas por transferencia.")
+        return value
 
 
 class EventHub:
@@ -405,7 +412,6 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 "error_count": record.error_count,
             },
             provider_error_code="TRANSFER_FAILED" if record.status == "FAILED" else None,
-            item_path=record.current_item,
         )
         if app.state.event_bus:
             await app.state.event_bus.publish_progress(str(record.id), event)
@@ -1466,11 +1472,6 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             safe_destination = MockStorageProvider.normalize_path(payload.destination_path)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Ruta no válida") from exc
-        for path in safe_paths:
-            if await provider_for(source).get_item(path) is None:
-                raise HTTPException(
-                    status_code=400, detail=f"No existe el elemento de origen: {path}"
-                )
         try:
             record = await app.state.store.acreate_transfer(
                 user.id,

@@ -61,3 +61,30 @@ async def test_modified_time_sort_handles_provider_items_without_timestamps():
     assert [item.name for item in page.items] == ["undated.txt", "dated.txt"]
 
 
+@pytest.mark.asyncio
+async def test_get_item_finds_entry_after_first_200_items():
+    class ListingRunner:
+        async def run(self, command, paths, config, job_id, **kwargs):
+            entries = [
+                {"Name": f"file-{index:03}.txt", "IsDir": False, "Size": index}
+                for index in range(205)
+            ]
+            return json.dumps(entries).encode(), b""
+
+    provider = RcloneGoogleDriveProvider(
+        uuid.uuid4(),
+        {
+            "client_id": "client-id",
+            "client_secret": "client-secret",
+            "refresh_token": "refresh-token",
+        },
+        ListingRunner(),
+    )
+
+    item = await provider.get_item("/file-204.txt")
+
+    assert item is not None
+    assert item.path == "/file-204.txt"
+    assert item.size_bytes == 204
+
+

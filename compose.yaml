@@ -88,7 +88,7 @@ services:
         "app.worker.celery_app",
         "worker",
         "--loglevel=INFO",
-        "--concurrency=${TRANSFER_MAX_CONCURRENT:-2}",
+        "--concurrency=${TRANSFER_MAX_CONCURRENT:-1}",
         "--queues=transfers",
       ]
     env_file:

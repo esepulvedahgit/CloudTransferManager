@@ -132,8 +132,15 @@ class RcloneStorageProvider(StorageProvider):
         if normalized == "/":
             return StorageItem(name="/", path="/", is_dir=True, provider_type=self.provider_type)
         parent = normalized.rsplit("/", 1)[0] or "/"
-        page = await self.list_items(parent, page_size=200)
-        return next((item for item in page.items if item.path == normalized), None)
+        cursor: str | None = None
+        while True:
+            page = await self.list_items(parent, cursor=cursor, page_size=200)
+            match = next((item for item in page.items if item.path == normalized), None)
+            if match is not None:
+                return match
+            if page.next_cursor is None:
+                return None
+            cursor = page.next_cursor
 
     async def get_quota(self) -> StorageQuota | None:
         try:

@@ -593,6 +593,9 @@ describe('Cloud Transfer Manager', () => {
           { id: 'destination', name: 'Destino', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
         ] });
         if (path.endsWith('/transfers') && init?.method === 'POST') return jsonResponse(transfer, 201);
+        if (path.endsWith('/events')) return jsonResponse({ items: [
+          { event_type: 'FAILURE_DIAGNOSTIC', message: 'No hay espacio temporal suficiente.' },
+        ] });
         if (path.endsWith('/transfers')) {
           return jsonResponse({ items: completedTransfer ? [completedTransfer] : [] });
         }
@@ -624,7 +627,7 @@ describe('Cloud Transfer Manager', () => {
 
       const eventSource = TestEventSource.instances[0];
       eventSource.emit({ ...transfer, status: 'RUNNING', progress_percent: 50, current_item: null });
-      await waitFor(() => expect(screen.getByText('RUNNING')).toBeVisible());
+      await waitFor(() => expect(screen.getAllByText('En curso').length).toBeGreaterThan(0));
       expect(destinationItemsRequests).toBe(1);
 
       completedTransfer = {
@@ -635,6 +638,10 @@ describe('Cloud Transfer Manager', () => {
         bytes_transferred: 4,
       };
       eventSource.emit(completedTransfer);
+
+      if (terminalStatus === 'FAILED') {
+        expect(await screen.findByText('No hay espacio temporal suficiente.')).toBeVisible();
+      }
 
       expect(await screen.findByText('archivo-copiado.txt')).toBeVisible();
       if (terminalStatus === 'COMPLETED') {
