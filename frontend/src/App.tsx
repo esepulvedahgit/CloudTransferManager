@@ -148,7 +148,7 @@ function isProgrammedBackgroundTransfer(transfer: Transfer): boolean {
 type LoginForm = { username_or_email: string; password: string };
 type ConnectionForm = {
   name: string;
-  provider_type: 'MOCK' | 'MEGA' | 'GOOGLE_DRIVE' | 'SEAFILE' | 'SMB';
+  provider_type: 'MOCK' | 'MEGA' | 'GOOGLE_DRIVE' | 'SEAFILE' | 'SMB' | 'NEXTCLOUD';
   seafile_adapter_type: 'RCLONE' | 'SEAFILE_API';
   is_global: boolean;
   mega_username: string;
@@ -162,6 +162,9 @@ type ConnectionForm = {
   seafile_password: string;
   seafile_library: string;
   seafile_library_password: string;
+  nextcloud_url: string;
+  nextcloud_username: string;
+  nextcloud_password: string;
   smb_host: string;
   smb_port: string;
   smb_share: string;
@@ -252,6 +255,7 @@ const providerAssets: Record<string, { label: string; src: string }> = {
   MEGA: { label: 'MEGA', src: '/brand/mega.svg' },
   GOOGLE_DRIVE: { label: 'Google Drive', src: '/brand/google-drive.png' },
   SEAFILE: { label: 'Seafile', src: '/brand/seafile.svg' },
+  NEXTCLOUD: { label: 'Nextcloud', src: '/brand/nextcloud.svg' },
 };
 
 function ProviderLogo({ provider, decorative = true }: { provider: string; decorative?: boolean }) {
@@ -354,7 +358,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
 
 const connectionSchema = z.object({
   name: z.string().trim().min(1, 'Ingresa un nombre.'),
-  provider_type: z.enum(['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB']),
+  provider_type: z.enum(['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB', 'NEXTCLOUD']),
   seafile_adapter_type: z.enum(['RCLONE', 'SEAFILE_API']),
   is_global: z.boolean(),
   mega_username: z.string(),
@@ -368,6 +372,9 @@ const connectionSchema = z.object({
   seafile_password: z.string(),
   seafile_library: z.string(),
   seafile_library_password: z.string(),
+  nextcloud_url: z.string(),
+  nextcloud_username: z.string(),
+  nextcloud_password: z.string(),
   smb_host: z.string(),
   smb_port: z.string(),
   smb_share: z.string(),
@@ -386,6 +393,12 @@ const connectionSchema = z.object({
             ['seafile_username', values.seafile_username],
             ['seafile_password', values.seafile_password],
           ]
+        : values.provider_type === 'NEXTCLOUD'
+          ? [
+              ['nextcloud_url', values.nextcloud_url],
+              ['nextcloud_username', values.nextcloud_username],
+              ['nextcloud_password', values.nextcloud_password],
+            ]
         : values.provider_type === 'SMB'
           ? [
               ['smb_host', values.smb_host],
@@ -404,6 +417,7 @@ const emptyConnectionForm: ConnectionForm = {
   mega_username: '', mega_password: '', drive_client_id: '', drive_client_secret: '',
   drive_team_drive: '', drive_root_folder_id: '', seafile_url: '', seafile_username: '',
   seafile_password: '', seafile_library: '', seafile_library_password: '',
+  nextcloud_url: '', nextcloud_username: '', nextcloud_password: '',
   smb_host: '', smb_port: '445', smb_share: '', smb_base_path: '', smb_username: '',
   smb_password: '', smb_domain: '',
 };
@@ -413,11 +427,13 @@ function ConnectionDialog({
   onClose,
   onCreated,
   initialProvider = 'MEGA',
+  nextcloudEnabled,
 }: {
   open: boolean;
   onClose: () => void;
   onCreated: (connection: Connection) => void;
   initialProvider?: ConnectionForm['provider_type'];
+  nextcloudEnabled: boolean;
 }) {
   const formDefaults = { ...emptyConnectionForm, provider_type: initialProvider };
   const [error, setError] = useState('');
@@ -460,6 +476,12 @@ function ConnectionDialog({
                 ? { library_password: values.seafile_library_password }
                 : {}),
             }
+          : values.provider_type === 'NEXTCLOUD'
+            ? {
+                url: values.nextcloud_url,
+                username: values.nextcloud_username,
+                password: values.nextcloud_password,
+              }
           : values.provider_type === 'SMB'
             ? {
                 host: values.smb_host,
@@ -529,6 +551,7 @@ function ConnectionDialog({
                     <MenuItem value="MEGA"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MEGA" />MEGA</Stack></MenuItem>
                     <MenuItem value="GOOGLE_DRIVE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="GOOGLE_DRIVE" />Google Drive</Stack></MenuItem>
                     <MenuItem value="SEAFILE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="SEAFILE" />Seafile</Stack></MenuItem>
+                    {nextcloudEnabled && <MenuItem value="NEXTCLOUD"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="NEXTCLOUD" />Nextcloud</Stack></MenuItem>}
                     <MenuItem value="SMB">NAS privado (SMB)</MenuItem>
                     <MenuItem value="MOCK"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MOCK" />Simulado (pruebas)</Stack></MenuItem>
                   </Select>
@@ -602,6 +625,36 @@ function ConnectionDialog({
                   autoComplete="new-password"
                   helperText="Solo se necesita para una biblioteca cifrada."
                   {...register('seafile_library_password')}
+                />
+              </>
+            )}
+            {provider === 'NEXTCLOUD' && (
+              <>
+                <Alert severity="info">
+                  Usa el endpoint WebDAV de archivos y una contraseña de aplicación. La prueba inicial verifica lectura; para usar Nextcloud como destino, la cuenta también necesita permiso de escritura.
+                </Alert>
+                <TextField
+                  label="URL WebDAV de Nextcloud"
+                  placeholder="https://cloud.example.com/remote.php/dav/files/usuario/"
+                  autoComplete="url"
+                  error={Boolean(errors.nextcloud_url)}
+                  helperText={errors.nextcloud_url?.message ?? 'Usa HTTPS y conserva el prefijo de instalación, si existe.'}
+                  {...register('nextcloud_url')}
+                />
+                <TextField
+                  label="Usuario de Nextcloud"
+                  autoComplete="username"
+                  error={Boolean(errors.nextcloud_username)}
+                  helperText={errors.nextcloud_username?.message ?? ' '}
+                  {...register('nextcloud_username')}
+                />
+                <TextField
+                  label="Contraseña de aplicación"
+                  type="password"
+                  autoComplete="new-password"
+                  error={Boolean(errors.nextcloud_password)}
+                  helperText={errors.nextcloud_password?.message ?? ' '}
+                  {...register('nextcloud_password')}
                 />
               </>
             )}
@@ -1182,6 +1235,7 @@ function transferStatusLabel(status: string): string {
 function providerLabel(provider: string): string {
   if (provider === 'GOOGLE_DRIVE') return 'Google Drive';
   if (provider === 'SEAFILE') return 'Seafile Community Edition';
+  if (provider === 'NEXTCLOUD') return 'Nextcloud';
   if (provider === 'SMB') return 'NAS privado (SMB)';
   if (provider === 'MOCK') return 'Simulada';
   return provider;
@@ -1669,6 +1723,11 @@ function TransferWorkspace({
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
     queryFn: () => apiRequest<{ items: Connection[] }>('/api/v1/connections'),
+  });
+  const providerCapabilitiesQuery = useQuery({
+    queryKey: ['provider-capabilities'],
+    queryFn: () => apiRequest<{ enabled_providers: string[] }>('/api/v1/system/capabilities'),
+    retry: false,
   });
   const transfersQuery = useQuery({
     queryKey: ['transfers'],
@@ -2918,6 +2977,7 @@ function TransferWorkspace({
       <ConnectionDialog
         open={connectionDialogOpen}
         initialProvider={connectionDialogProvider}
+        nextcloudEnabled={providerCapabilitiesQuery.data?.enabled_providers.includes('NEXTCLOUD') ?? false}
         onClose={() => setConnectionDialogOpen(false)}
         onCreated={(created) => {
           setNotice(created.status === 'ACTIVE'

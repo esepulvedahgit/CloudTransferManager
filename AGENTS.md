@@ -116,6 +116,7 @@ Antes de implementar o modificar cualquier módulo, el agente **DEBE** consultar
 | **SMB/NAS** | `docs/integrations/smb-nas-setup.md` | Allowlist de hosts, red, exploración y migración por manifiesto |
 | **Programaciones** | `docs/integrations/transfer-scheduling.md` | Ejecución única, modos, dependencias y cola de segundo plano |
 | **Seafile** | `docs/integrations/seafile-compatibility.md` | Adaptadores disponibles y límites de compatibilidad |
+| **Nextcloud** | `docs/integrations/nextcloud-compatibility.md` | WebDAV/Rclone, allowlist HTTPS, límites operativos y validación real |
 
 ### Decisiones de Arquitectura (ADRs):
 - **`docs/adr/ADR-001-rclone-subprocess-security.md`**: Por qué se utiliza subproceso CLI aislado y no la API RC de Rclone.

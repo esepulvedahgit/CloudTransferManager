@@ -745,6 +745,62 @@ describe('Cloud Transfer Manager', () => {
     expect(screen.getByLabelText(/Contraseña de MEGA/i)).toBeVisible();
   });
 
+  it('creates a Nextcloud connection with a WebDAV app password only when enabled', async () => {
+    let createRequest: Record<string, unknown> | undefined;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/system/capabilities')) {
+        return jsonResponse({ enabled_providers: ['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB', 'NEXTCLOUD'] });
+      }
+      if (path.endsWith('/connections') && init?.method === 'POST') {
+        createRequest = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return jsonResponse({
+          id: 'nextcloud-1', name: 'Nube equipo', provider_type: 'NEXTCLOUD', status: 'INACTIVE',
+          credentials_configured: true, is_global: true,
+        }, 201);
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [], total_count: 0 });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    fireEvent.change(await screen.findByLabelText(/Usuario o correo/i), { target: { value: 'admin' } });
+    fireEvent.change(screen.getByLabelText(/Contraseña/i), { target: { value: 'CorrectHorseBatteryStaple123!' } });
+    fireEvent.click(screen.getByRole('button', { name: /Iniciar sesión/i }));
+    fireEvent.click(await screen.findByRole('tab', { name: /Conexiones/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /Agregar conexión/i }));
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: /Proveedor/i }));
+    fireEvent.click(await screen.findByRole('option', { name: /Nextcloud/i }));
+    fireEvent.change(screen.getByLabelText(/Nombre de conexión/i), { target: { value: 'Nube equipo' } });
+    fireEvent.change(screen.getByLabelText(/URL WebDAV de Nextcloud/i), {
+      target: { value: 'https://cloud.example.test/remote.php/dav/files/alice/' },
+    });
+    fireEvent.change(screen.getByLabelText(/Usuario de Nextcloud/i), { target: { value: 'alice' } });
+    fireEvent.change(screen.getByLabelText(/Contraseña de aplicación/i), { target: { value: 'application-secret' } });
+    fireEvent.click(screen.getByRole('button', { name: /Guardar conexión/i }));
+
+    await waitFor(() => expect(createRequest).toBeDefined());
+    expect(createRequest).toMatchObject({
+      provider_type: 'NEXTCLOUD',
+      credentials: {
+        url: 'https://cloud.example.test/remote.php/dav/files/alice/',
+        username: 'alice',
+        password: 'application-secret',
+      },
+    });
+    expect(await screen.findByText(/Conexión guardada de forma inactiva/i)).toBeVisible();
+  });
+
   it('creates Seafile with an explicit adapter and sends 2FA only with the connection test', async () => {
     let connections: Array<Record<string, unknown>> = [];
     let createRequest: Record<string, unknown> | undefined;

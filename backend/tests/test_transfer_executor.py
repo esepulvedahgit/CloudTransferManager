@@ -11,7 +11,7 @@ from app.providers.base import PaginatedItems, StorageItem
 from app.security.credentials import CredentialCipher
 from app.services.megacmd import MegaCmdCancelledError, MegaCmdCommandError
 from app.services.memory_store import MemoryStore
-from app.services.rclone import RcloneCancelledError, RcloneCommandError
+from app.services.rclone import RcloneCancelledError, RcloneCommandError, RcloneRunner
 from app.services.transfer_executor import TransferExecutor
 from app.settings import Settings
 
@@ -319,6 +319,87 @@ def _cross_provider_executor(
     executor = TransferExecutor(settings, store, publish, never_cancel, runner=copy_runner)
     executor._provider = lambda connection: providers[connection.id]
     return executor, transfer, providers, copy_runner, snapshots, store
+
+
+@pytest.mark.asyncio
+async def test_nextcloud_transfer_uses_a_scoped_rclone_profile(tmp_path, monkeypatch):
+    runner = RcloneRunner(
+        "/usr/bin/rclone",
+        str(tmp_path / "rclone-config"),
+        str(tmp_path / "staging"),
+    )
+    executor, transfer, _providers, _runner, _snapshots, _store = _cross_provider_executor(
+        tmp_path,
+        source_type="NEXTCLOUD",
+        destination_type="GOOGLE_DRIVE",
+        source_items=[_item("/source.txt", size=4, provider="NEXTCLOUD")],
+        runner=runner,
+    )
+    executor.settings = Settings(
+        nextcloud_enabled=True,
+        nextcloud_allowed_origins="https://cloud.example.test",
+        nextcloud_bandwidth_limit="4M",
+    )
+    original_runner = executor.runner
+    observed_profile = None
+
+    async def stop_after_profile_check(record, _source, _destination):
+        nonlocal observed_profile
+        observed_profile = executor.runner.transfer_profile
+        await executor._fail(record, error_code="PROFILE_CHECKED")
+
+    monkeypatch.setattr(executor, "_run_rclone", stop_after_profile_check)
+
+    await executor.execute(transfer.id)
+
+    assert observed_profile is not None
+    assert observed_profile.bandwidth_limit == "4M"
+    assert observed_profile.transfers == 1
+    assert observed_profile.checkers == 2
+    assert executor.runner is original_runner
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_preexisting_nextcloud_transfer_when_disabled(tmp_path):
+    executor, transfer, _providers, runner, _snapshots, _store = _cross_provider_executor(
+        tmp_path,
+        source_type="NEXTCLOUD",
+        destination_type="GOOGLE_DRIVE",
+        source_items=[_item("/source.txt", size=4, provider="NEXTCLOUD")],
+    )
+
+    await executor.execute(transfer.id)
+
+    assert transfer.status == "FAILED"
+    events = await _store.alist_transfer_events(transfer.id)
+    assert _failure_diagnostic(events, "NEXTCLOUD_DISABLED")
+    assert runner.downloaded == []
+    assert runner.uploaded == []
+
+
+@pytest.mark.asyncio
+async def test_nextcloud_timeout_has_a_specific_sanitized_failure_code(tmp_path, monkeypatch):
+    executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="NEXTCLOUD",
+        destination_type="GOOGLE_DRIVE",
+        source_items=[_item("/source.txt", size=4, provider="NEXTCLOUD")],
+    )
+    executor.settings = Settings(
+        nextcloud_enabled=True,
+        nextcloud_allowed_origins="https://cloud.example.test",
+    )
+
+    async def timed_out(_record, _source, _destination):
+        raise TimeoutError("private timeout diagnostic")
+
+    monkeypatch.setattr(executor, "_run_rclone", timed_out)
+
+    await executor.execute(transfer.id)
+
+    events = await store.alist_transfer_events(transfer.id)
+    assert _failure_diagnostic(events, "NEXTCLOUD_TRANSFER_TIMEOUT")
+    assert "private timeout diagnostic" not in str(events)
 
 
 def _nested_tree(provider_type: str, sizes: tuple[int, int] = (2, 3)) -> list[StorageItem]:

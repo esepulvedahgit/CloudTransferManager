@@ -11,7 +11,7 @@ El estado por módulo, las extensiones agregadas desde el alcance inicial y las 
 | Área | Implementación disponible |
 |---|---|
 | Usuarios | Roles `ADMIN` y `USER`, sesiones con cookies `HttpOnly`, contraseñas con Argon2id, cambio inicial de contraseña y alta del primer administrador mediante CLI. |
-| Proveedores | MEGA con MEGAcmd; Google Drive con OAuth y Rclone; Seafile mediante Rclone o, si se elige por conexión, su API; recursos privados SMB para explorar y migrar archivos. El proveedor mock sirve para desarrollo. |
+| Proveedores | MEGA con MEGAcmd; Google Drive con OAuth y Rclone; Seafile mediante Rclone o API por conexión; Nextcloud mediante WebDAV/Rclone tras habilitarlo por despliegue; recursos privados SMB para explorar y migrar archivos. El proveedor mock sirve para desarrollo. |
 | Acceso a conexiones | Conexiones globales o privadas asignadas por usuario. Las credenciales y tokens se cifran en el backend y la API no los devuelve al frontend. |
 | Transferencias | Copias inmediatas y programadas de una sola ejecución; modos `AUTO` y `EXCLUSIVE`, dependencias opcionales, reintentos, cancelación y reanudación donde el adaptador lo permite. |
 | Seguimiento | Progreso por SSE, estados en segundo plano, historial y resultado por archivo para transferencias SMB. |
@@ -87,6 +87,10 @@ Edita `.env` antes de iniciar Compose. Los valores iniciales están en `.env.exa
 | `TRANSFER_STAGING_RESERVE_BYTES` / `TRANSFER_STAGING_MARGIN_PERCENT` | `1073741824` / `20` | Reserva libre y margen usados en la comprobación de espacio del staging. |
 | `SMB_ALLOWED_TARGETS` | vacío | Lista separada por comas de hosts exactos autorizados. Vacío significa que SMB queda denegado. |
 | `SMB_INTERACTIVE_TIMEOUT_SECONDS` | `30` | Tiempo máximo para probar o explorar SMB; no limita cuánto tarda una copia grande. |
+| `NEXTCLOUD_ENABLED` | `false` | Habilita Nextcloud; permanece oculto e inaccesible hasta activarlo explícitamente. |
+| `NEXTCLOUD_ALLOWED_ORIGINS` | vacío | Orígenes HTTPS exactos permitidos, separados por comas; vacío deniega conexiones y oculta la opción. |
+| `NEXTCLOUD_MAX_CONCURRENT` | `1` | Máximo de trabajos activos que usan Nextcloud; se aplica junto al límite global. |
+| `NEXTCLOUD_BANDWIDTH_LIMIT` / `NEXTCLOUD_CHUNK_SIZE` / `NEXTCLOUD_JOB_TIMEOUT_SECONDS` | `8M` / `10Mi` / `43200` | Perfil conservador de subida y timeout total de 12 h. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USE_TLS`, `SMTP_FROM_ADDRESS` | vacío, `587`, `true`, vacío | Completa la configuración si esta instalación enviará correo; también se administra desde la sección SMTP de Administración. |
 
 `TRANSFER_TEMP_PATH` y `TRANSFER_STAGING_PATH` normalmente se dejan con sus rutas predeterminadas. Si cambias `TRANSFER_TEMP_PATH`, actualiza también el montaje `tmpfs` correspondiente en `compose.yaml` para backend y worker; de lo contrario, el nuevo destino no quedará cubierto por ese `tmpfs`. Si cambias `TRANSFER_STAGING_PATH`, configura la misma ruta en ambos servicios y confirma que sea un directorio absoluto dedicado y escribible por UID `10001`.
@@ -130,6 +134,10 @@ docker compose up -d --build backend worker
 ```
 
 Consulta [la guía de conexión y migración SMB](docs/integrations/smb-nas-setup.md) para la configuración del recurso compartido, las rutas lógicas, límites y reanudación.
+
+### Nextcloud
+
+Nextcloud queda desactivado por defecto. Para habilitarlo, establece `NEXTCLOUD_ENABLED=true` y agrega al menos un origen HTTPS válido a `NEXTCLOUD_ALLOWED_ORIGINS`; la opción aparecerá entonces para los administradores. La conexión usa la URL WebDAV del usuario y una contraseña de aplicación. Aplica el cambio recreando backend y workers. Consulta la [guía de compatibilidad y configuración Nextcloud](docs/integrations/nextcloud-compatibility.md) antes de probarlo con datos reales.
 
 ### Temporales, secretos y datos persistentes
 
@@ -202,3 +210,4 @@ npm run build
 - [Programación y cola de transferencias](docs/integrations/transfer-scheduling.md)
 - [Conexión y migración SMB/NAS](docs/integrations/smb-nas-setup.md)
 - [Compatibilidad de Seafile](docs/integrations/seafile-compatibility.md)
+- [Compatibilidad y configuración de Nextcloud](docs/integrations/nextcloud-compatibility.md)

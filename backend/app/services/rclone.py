@@ -5,6 +5,7 @@ import re
 import stat
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
@@ -33,6 +34,7 @@ class RcloneCommandError(RuntimeError):
         "502",
         "503",
         "504",
+        "423",
         "rate limit",
         "network is unreachable",
     )
@@ -58,6 +60,37 @@ class RcloneOutputLimitError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class RcloneExecutionProfile:
+    bandwidth_limit: str = "8M"
+    transfers: int = 1
+    checkers: int = 2
+    connect_timeout_seconds: int = 10
+    idle_timeout_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[1-9][0-9]{0,3}(?:K|M|G)?", self.bandwidth_limit):
+            raise ValueError("Invalid Rclone bandwidth limit")
+        if self.transfers != 1 or self.checkers != 2:
+            raise ValueError("Unsupported Rclone transfer profile")
+        if self.connect_timeout_seconds != 10 or self.idle_timeout_seconds != 60:
+            raise ValueError("Unsupported Rclone timeout profile")
+
+    def argv(self) -> list[str]:
+        return [
+            "--transfers",
+            str(self.transfers),
+            "--checkers",
+            str(self.checkers),
+            "--bwlimit",
+            self.bandwidth_limit,
+            "--contimeout",
+            f"{self.connect_timeout_seconds}s",
+            "--timeout",
+            f"{self.idle_timeout_seconds}s",
+        ]
+
+
 class RcloneRunner:
     _allowed_commands = {"lsjson", "copy", "about", "size"}
     _copy_output_limit = 64 * 1024
@@ -65,10 +98,18 @@ class RcloneRunner:
     _max_log_line_bytes = 64 * 1024
     _remote_path = re.compile(r"^(ctm_[0-9a-f]{32}):(/[^\x00\r\n]*|[^\x00\r\n]+)$")
 
-    def __init__(self, binary: str, temp_path: str, staging_path: str | None = None) -> None:
+    def __init__(
+        self,
+        binary: str,
+        temp_path: str,
+        staging_path: str | None = None,
+        *,
+        transfer_profile: RcloneExecutionProfile | None = None,
+    ) -> None:
         self.binary = binary
         self.temp_path = temp_path
         self.staging_path = Path(staging_path) if staging_path is not None else None
+        self.transfer_profile = transfer_profile
 
     @classmethod
     def _validate_remote_path(cls, value: str) -> str:
@@ -94,11 +135,14 @@ class RcloneRunner:
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
         *,
         create_empty_src_dirs: bool = False,
+        stat: bool = False,
     ) -> list[str]:
         if command not in self._allowed_commands:
             raise ValueError(f"Rclone command is not allowed: {command}")
         if create_empty_src_dirs and command != "copy":
             raise ValueError("Empty source directories can only be preserved by copy")
+        if stat and command != "lsjson":
+            raise ValueError("Stat output is only available for lsjson")
         expected_paths = 2 if command == "copy" else 1
         if len(remote_paths) != expected_paths:
             raise ValueError(f"{command} expects {expected_paths} remote path(s)")
@@ -116,6 +160,10 @@ class RcloneRunner:
             argv.extend(["--json", "--full"])
         elif command == "size":
             argv.append("--json")
+        elif stat:
+            argv.append("--stat")
+        if self.transfer_profile is not None:
+            argv.extend(self.transfer_profile.argv())
         return argv
 
     async def run(
@@ -128,6 +176,7 @@ class RcloneRunner:
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
         create_empty_src_dirs: bool = False,
+        stat: bool = False,
         timeout_seconds: float | None = None,
     ) -> tuple[bytes, bytes]:
         if command not in self._allowed_commands:
@@ -146,6 +195,7 @@ class RcloneRunner:
                 config_path,
                 conflict_policy,
                 create_empty_src_dirs=create_empty_src_dirs,
+                stat=stat,
             ),
             line_callback=line_callback,
             should_cancel=should_cancel,
@@ -296,6 +346,8 @@ class RcloneRunner:
             command.append("--ignore-existing")
         if create_empty_src_dirs:
             command.append("--create-empty-src-dirs")
+        if self.transfer_profile is not None:
+            command.extend(self.transfer_profile.argv())
         return command
 
     async def _run_with_argv(

@@ -8,7 +8,7 @@
 |---|---|---|
 | Autenticación y usuarios | Implementado | Sesiones HttpOnly/SameSite con CSRF, Argon2id, bloqueo tras cinco intentos fallidos, roles `ADMIN`/`USER`, cambio obligatorio de contraseña y CLI inicial. Véanse `backend/app/main.py`, `backend/app/security/` y `backend/tests/test_api_security.py`, `test_user_management.py`, `test_cli.py`. |
 | Conexiones y credenciales | Implementado | Administración, asignación privada, OAuth de Google, cifrado AES-GCM y respuestas públicas sin credenciales. El archivado es lógico y rechaza conexiones con trabajos activos. Véanse `backend/app/main.py`, `backend/app/security/credentials.py` y las migraciones. |
-| Proveedores | Implementado con validación externa | MEGA usa MEGAcmd; Google Drive usa Rclone/OAuth; Seafile ofrece adaptadores Rclone o API explícito; la UI usa SMB/NAS como origen. Cada instalación necesita sus credenciales, permisos y rutas de red. La compatibilidad de Seafile API se acota inicialmente a CE 13.x. |
+| Proveedores | Implementado con validación externa | MEGA usa MEGAcmd; Google Drive usa Rclone/OAuth; Seafile ofrece adaptadores Rclone o API explícito; la UI usa SMB/NAS como origen; Nextcloud usa Rclone WebDAV tras habilitación y allowlist de origen HTTPS. Cada instalación necesita sus credenciales, permisos y rutas de red. La compatibilidad de Seafile API se acota inicialmente a CE 13.x. Nextcloud requiere prueba real por instalación antes de activarlo. |
 | Explorador | Implementado | Navegación, búsqueda, selección múltiple y destino por carpeta existente; paneles coordinados en escritorio y pasos separados en pantallas estrechas. No hay creación manual de carpetas desde la UI. Véanse `frontend/src/App.tsx` y `docs/specs/03-file-explorer-spec.md`. |
 | Transferencias | Implementado | Operación `COPY`, ejecución de fondo, límites, cancelación, reintentos clasificados, staging por archivo, verificación y diagnóstico sanitizado. La reanudación por manifiesto está disponible para transferencias SMB fallidas o canceladas; no es una capacidad general de todos los adaptadores. |
 | Programaciones | Implementado | Ejecuciones futuras de una sola vez, zonas IANA, modos `AUTO`/`EXCLUSIVE`, dependencias y despacho durable vía PostgreSQL, Celery Beat y `control-worker`. No hay recurrencia. Detalle en `docs/integrations/transfer-scheduling.md`. |
@@ -20,6 +20,7 @@
 
 - Migración de carpetas desde SMB/NAS a MEGA, Google Drive o Seafile, con manifiesto por archivo y reanudación controlada.
 - Seafile mediante Rclone o API directa seleccionada por conexión; no hay fallback silencioso entre adaptadores.
+- Nextcloud mediante WebDAV/Rclone con límites conservadores de concurrencia, ancho de banda y timeout; deshabilitado por defecto. Véase `docs/integrations/nextcloud-compatibility.md`.
 - Programación única, modos de admisión, dependencias y vista de trabajos en segundo plano.
 - Administración de conexiones privadas y archivado lógico sin borrar referencias históricas.
 - Configuración SMTP desde Administración y menú de cuenta que agrupa administración, cambio de contraseña y cierre de sesión.
@@ -52,7 +53,7 @@ La implementación cubre el flujo principal y varias extensiones que no estaban 
 Antes de declarar una versión lista para una instalación concreta, falta registrar evidencia de:
 
 1. Todos los jobs de CI verdes para el commit candidato (`ruff`, tests y `mypy`; tests, lint y build del frontend; Trivy y builds Docker).
-2. Conectividad y copia real con credenciales de Google Drive y MEGA; para extensiones habilitadas, validar además Seafile CE 13.x y NAS desde las redes del backend/worker.
+2. Conectividad y copia real con credenciales de Google Drive y MEGA; para extensiones habilitadas, validar además Seafile CE 13.x, Nextcloud y NAS desde las redes del backend/worker.
 3. Revisión visual responsive en los tamaños soportados y recorrido de los flujos administrativos.
 4. Decisión explícita sobre dos requisitos de hardening que siguen en la guía operativa: rate limiting de API e inmutabilidad de auditoría impuesta por la base de datos. No se encontraron implementaciones equivalentes en el árbol revisado.
 5. Si SMB debe ser estrictamente solo origen, validar ese límite también en `POST /api/v1/transfers`: la UI filtra SMB del selector de destino, pero el endpoint no comprueba el tipo de proveedor destino.

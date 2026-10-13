@@ -116,6 +116,14 @@ class StorageProvider(ABC):
 - La credencial queda cifrada como las demás conexiones. El host, recurso compartido y carpeta base forman la raíz lógica visible como `/`. La UI excluye SMB del selector de destino, pero `POST /api/v1/transfers` no valida ese límite por tipo de proveedor; agregar o mantener una restricción de servidor si SMB debe ser solo origen.
 - La guía operativa y sus límites están en [`docs/integrations/smb-nas-setup.md`](../integrations/smb-nas-setup.md).
 
+### F. Nextcloud (`NextcloudRcloneProvider`)
+- Nextcloud usa Rclone WebDAV (`type = webdav`, `vendor = nextcloud`) y una contraseña de aplicación. La URL debe apuntar a `https://{host}/remote.php/dav/files/{usuario}/`; el origen HTTPS debe estar en `NEXTCLOUD_ALLOWED_ORIGINS`.
+- `NEXTCLOUD_ENABLED` es `false` por defecto. Con la integración apagada no se pueden crear ni operar conexiones Nextcloud. La allowlist vacía deniega cualquier conexión aunque esté habilitada.
+- Las credenciales se almacenan cifradas con el mecanismo común y nunca se devuelven al frontend. Rclone se ejecuta como subproceso con argumentos separados y configuración temporal `0600`; la lista blanca de comandos y la semántica exclusivamente `COPY` no cambian.
+- El listado usa la abstracción común y una caché local, acotada por tiempo y memoria. Las actualizaciones de credenciales usan otra clave de caché.
+- Para trabajo Nextcloud se limita Rclone a un transfer, dos checkers, `NEXTCLOUD_BANDWIDTH_LIMIT` (predeterminado `8M`), `NEXTCLOUD_CHUNK_SIZE` (predeterminado `10Mi`), conexión de 10 s, inactividad de 60 s y `NEXTCLOUD_JOB_TIMEOUT_SECONDS` (predeterminado 12 h). La admisión permite por defecto un trabajo Nextcloud activo por clúster.
+- Soporte de lanzamiento y versión real deben registrarse tras probar contra la instancia concreta; la existencia del adaptador no equivale a certificación operativa. Véase [`docs/integrations/nextcloud-compatibility.md`](../integrations/nextcloud-compatibility.md).
+
 ---
 
 ## 4. Cifrado en Reposo de Credenciales
@@ -153,7 +161,7 @@ class StorageProvider(ABC):
 CREATE TABLE storage_connections (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(128) NOT NULL,
-    provider_type VARCHAR(32) NOT NULL CHECK (provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE')),
+    provider_type VARCHAR(32) NOT NULL CHECK (provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB', 'NEXTCLOUD')),
     adapter_type VARCHAR(32) NOT NULL DEFAULT 'RCLONE' CHECK (adapter_type IN ('RCLONE', 'SEAFILE_API')),
     status VARCHAR(16) NOT NULL DEFAULT 'INACTIVE' CHECK (status IN ('ACTIVE', 'INACTIVE', 'ERROR')),
     deleted_at TIMESTAMP WITH TIME ZONE NULL,

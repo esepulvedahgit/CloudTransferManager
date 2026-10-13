@@ -13,6 +13,7 @@ from typing import Any
 from app.providers.base import StorageItem
 from app.providers.megacmd import MegaCmdProvider
 from app.providers.mock import MockStorageProvider
+from app.providers.nextcloud import NextcloudRcloneProvider, parse_allowed_origins
 from app.providers.rclone import RcloneGoogleDriveProvider
 from app.providers.seafile import SeafileRcloneProvider
 from app.providers.seafile_api import (
@@ -33,7 +34,12 @@ from app.services.memory_store import (
     TransferManifestItemRecord,
     TransferRecord,
 )
-from app.services.rclone import RcloneCancelledError, RcloneCommandError, RcloneRunner
+from app.services.rclone import (
+    RcloneCancelledError,
+    RcloneCommandError,
+    RcloneExecutionProfile,
+    RcloneRunner,
+)
 from app.services.staging import StagingSpaceError, temporary_staging_area
 from app.services.telemetry import parse_mega_progress_line, parse_rclone_stats_line
 from app.services.transfer_progress import smb_manifest_progress_percent
@@ -99,11 +105,33 @@ class TransferExecutor:
             await self._fail(record, error_code="PROVIDER_PAIR_UNSUPPORTED")
             return
 
+        uses_nextcloud = "NEXTCLOUD" in {source.provider_type, destination.provider_type}
+        if uses_nextcloud and not self.settings.nextcloud_enabled:
+            await self._fail(
+                record,
+                error_code="NEXTCLOUD_DISABLED",
+                message="La integración Nextcloud está desactivada.",
+            )
+            return
+        original_runner = self.runner
+        if uses_nextcloud and isinstance(self.runner, RcloneRunner):
+            self.runner = RcloneRunner(
+                self.settings.rclone_binary,
+                self.settings.transfer_temp_path,
+                self.settings.transfer_staging_path,
+                transfer_profile=RcloneExecutionProfile(
+                    bandwidth_limit=self.settings.nextcloud_bandwidth_limit
+                ),
+            )
+
         try:
-            if source.provider_type == "SMB":
-                await self._run_smb_transfer(record, source, destination)
-            else:
-                await self._run_rclone(record, source, destination)
+            async with asyncio.timeout(
+                self.settings.nextcloud_job_timeout_seconds if uses_nextcloud else None
+            ):
+                if source.provider_type == "SMB":
+                    await self._run_smb_transfer(record, source, destination)
+                else:
+                    await self._run_rclone(record, source, destination)
         except (RcloneCancelledError, MegaCmdCancelledError, SeafileApiCancelledError):
             await self._cancel(record)
         except SeafileApiError as exc:
@@ -113,6 +141,7 @@ class TransferExecutor:
                 technical_details={"http_status": exc.status_code},
             )
         except Exception as exc:
+            nextcloud_timeout = uses_nextcloud and isinstance(exc, TimeoutError)
             frames = traceback.extract_tb(exc.__traceback__)
             location = frames[-1] if frames else None
             details: dict[str, Any] = {"exception_type": type(exc).__name__}
@@ -123,9 +152,20 @@ class TransferExecutor:
                 }
             await self._fail(
                 record,
-                error_code="TRANSFER_EXECUTION_FAILED",
+                error_code=(
+                    "NEXTCLOUD_TRANSFER_TIMEOUT"
+                    if nextcloud_timeout
+                    else "TRANSFER_EXECUTION_FAILED"
+                ),
+                message=(
+                    "Se agotó el tiempo máximo de la transferencia."
+                    if nextcloud_timeout
+                    else "No se pudo completar la transferencia."
+                ),
                 technical_details=details,
             )
+        finally:
+            self.runner = original_runner
 
     @property
     def _terminal(self) -> set[str]:
@@ -199,6 +239,15 @@ class TransferExecutor:
                 connection.id,
                 credentials,
                 self.runner,
+            )
+        if connection.provider_type == "NEXTCLOUD":
+            return NextcloudRcloneProvider(
+                connection.id,
+                credentials,
+                self.runner,
+                allowed_origins=parse_allowed_origins(self.settings.nextcloud_allowed_origins),
+                credential_version=connection.credential_version,
+                chunk_size=self.settings.nextcloud_chunk_size,
             )
         if connection.provider_type == "SMB":
             return RcloneSmbProvider(
@@ -371,7 +420,12 @@ class TransferExecutor:
         source_connection: ConnectionRecord,
         destination_connection: ConnectionRecord,
     ) -> None:
-        if destination_connection.provider_type not in {"GOOGLE_DRIVE", "MEGA", "SEAFILE"}:
+        if destination_connection.provider_type not in {
+            "GOOGLE_DRIVE",
+            "MEGA",
+            "SEAFILE",
+            "NEXTCLOUD",
+        }:
             await self._fail(record, error_code="PROVIDER_PAIR_UNSUPPORTED")
             return
         source = self._provider(source_connection)

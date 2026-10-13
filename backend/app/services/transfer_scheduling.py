@@ -14,6 +14,7 @@ class TransferReservation:
     destination_connection_id: Any
     execution_mode: str
     uses_staging: bool
+    uses_nextcloud: bool = False
 
 
 @dataclass
@@ -50,14 +51,19 @@ def admission_wait_reason(
     destination_connection_id: Any,
     execution_mode: str,
     uses_staging: bool,
+    uses_nextcloud: bool = False,
     active: list[TransferReservation],
     max_concurrent: int,
+    max_nextcloud_concurrent: int = 1,
 ) -> str | None:
     if execution_mode == "EXCLUSIVE" and active:
         return "WAITING_EXCLUSIVE"
     if any(reservation.execution_mode == "EXCLUSIVE" for reservation in active):
         return "WAITING_EXCLUSIVE"
     if len(active) >= max_concurrent:
+        return "WAITING_CAPACITY"
+    active_nextcloud = sum(reservation.uses_nextcloud for reservation in active)
+    if uses_nextcloud and active_nextcloud >= max_nextcloud_concurrent:
         return "WAITING_CAPACITY"
 
     for reservation in active:

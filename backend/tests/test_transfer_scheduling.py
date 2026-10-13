@@ -83,6 +83,30 @@ def test_auto_admission_allows_parallel_work_until_the_global_limit():
     ) == "WAITING_CAPACITY"
 
 
+def test_nextcloud_admission_has_its_own_capacity_limit():
+    active = [
+        TransferReservation(
+            transfer_id="active-nextcloud",
+            source_connection_id="source-a",
+            destination_connection_id="nextcloud-a",
+            execution_mode="AUTO",
+            uses_staging=False,
+            uses_nextcloud=True,
+        )
+    ]
+
+    assert admission_wait_reason(
+        source_connection_id="source-b",
+        destination_connection_id="nextcloud-b",
+        execution_mode="AUTO",
+        uses_staging=False,
+        uses_nextcloud=True,
+        active=active,
+        max_concurrent=3,
+        max_nextcloud_concurrent=1,
+    ) == "WAITING_CAPACITY"
+
+
 def test_exclusive_admission_waits_for_active_transfers_to_finish():
     active = [
         TransferReservation(
@@ -128,6 +152,7 @@ def test_staging_transfer_waits_for_the_single_staging_slot():
     assert transfer_requires_staging("GOOGLE_DRIVE", "MEGA")
     assert transfer_requires_staging("GOOGLE_DRIVE", "SEAFILE", "RCLONE", "SEAFILE_API")
     assert not transfer_requires_staging("GOOGLE_DRIVE", "SEAFILE")
+    assert not transfer_requires_staging("GOOGLE_DRIVE", "NEXTCLOUD")
     assert admission_wait_reason(
         source_connection_id="drive-b",
         destination_connection_id="drive-c",
@@ -186,6 +211,37 @@ async def test_database_dispatcher_admits_parallel_jobs_and_holds_an_exclusive_b
     assert jobs[transfers[2].id].wait_reason == "WAITING_EXCLUSIVE"
     assert jobs[future.id].status == "SCHEDULED"
     assert jobs[future.id].wait_reason == "WAITING_UNTIL"
+
+
+@pytest.mark.asyncio
+async def test_database_dispatcher_enforces_nextcloud_connection_capacity(tmp_path):
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'nextcloud-capacity.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("admin", "admin@example.test", "hash", role="ADMIN")
+    source = await store.acreate_connection("Drive", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x")
+    destinations = [
+        await store.acreate_connection(
+            f"Nextcloud {index}", "NEXTCLOUD", user.id, uuid.uuid4(), b"x"
+        )
+        for index in range(2)
+    ]
+    transfers = [
+        await store.acreate_transfer(
+            user.id, source.id, destination.id, ["/source"], "/destination"
+        )
+        for destination in destinations
+    ]
+
+    batch = await store.adispatch_due_transfers(
+        datetime.now(UTC), max_concurrent=3, max_nextcloud_concurrent=1
+    )
+
+    assert len(batch.admitted) == 1
+    waiting = next(item for item in batch.changed if item.id == transfers[1].id)
+    assert waiting.wait_reason == "WAITING_CAPACITY"
+    await store.aclose()
 
 
 @pytest.mark.asyncio

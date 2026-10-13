@@ -590,10 +590,13 @@ class DatabaseStore:
         now: datetime,
         *,
         max_concurrent: int,
+        max_nextcloud_concurrent: int = 1,
     ) -> DispatchBatch:
         """Reserve eligible transfers transactionally before sending them to Celery."""
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be positive")
+        if max_nextcloud_concurrent < 1:
+            raise ValueError("max_nextcloud_concurrent must be positive")
         active_statuses = {"VALIDATING", "RUNNING", "RETRYING", "CANCELLING"}
         changed_ids: set[uuid.UUID] = set()
         admitted_ids: list[uuid.UUID] = []
@@ -731,6 +734,7 @@ class DatabaseStore:
                         uses_staging=self._transfer_uses_staging(
                             transfer, connections
                         ),
+                        uses_nextcloud=self._transfer_uses_nextcloud(transfer, connections),
                     )
                     for transfer in running
                 ]
@@ -826,8 +830,10 @@ class DatabaseStore:
                             destination_connection_id=transfer.destination_connection_id,
                             execution_mode=transfer.execution_mode,
                             uses_staging=self._transfer_uses_staging(transfer, connections),
+                            uses_nextcloud=self._transfer_uses_nextcloud(transfer, connections),
                             active=active,
                             max_concurrent=max_concurrent,
+                            max_nextcloud_concurrent=max_nextcloud_concurrent,
                         )
 
                     if reason is not None:
@@ -852,6 +858,7 @@ class DatabaseStore:
                             destination_connection_id=transfer.destination_connection_id,
                             execution_mode=transfer.execution_mode,
                             uses_staging=self._transfer_uses_staging(transfer, connections),
+                            uses_nextcloud=self._transfer_uses_nextcloud(transfer, connections),
                         )
                     )
                     if transfer.execution_mode == "EXCLUSIVE":
@@ -887,6 +894,19 @@ class DatabaseStore:
             destination.provider_type,
             source.adapter_type,
             destination.adapter_type,
+        )
+
+    @staticmethod
+    def _transfer_uses_nextcloud(
+        transfer: TransferJob, connections: dict[uuid.UUID, StorageConnection]
+    ) -> bool:
+        return any(
+            (connection := connections.get(connection_id)) is not None
+            and connection.provider_type == "NEXTCLOUD"
+            for connection_id in (
+                transfer.source_connection_id,
+                transfer.destination_connection_id,
+            )
         )
 
     async def arelease_transfer_dispatch(

@@ -48,12 +48,13 @@ def test_migration_chain_matches_current_schema_and_downgrades(tmp_path):
         )
         with Operations.context(MigrationContext.configure(connection)):
             migrations[-1]["downgrade"]()
+            migrations[-2]["downgrade"]()
         assert connection.scalar(
             select(TransferJob.status).where(TransferJob.id == scheduled_transfer_id)
         ) == "QUEUED"
 
         with Operations.context(MigrationContext.configure(connection)):
-            for migration in reversed(migrations[:-1]):
+            for migration in reversed(migrations[:-2]):
                 migration["downgrade"]()
 
         assert inspect(connection).get_table_names() == []

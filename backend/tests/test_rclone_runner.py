@@ -4,7 +4,48 @@ import uuid
 
 import pytest
 
-from app.services.rclone import RcloneCancelledError, RcloneCommandError, RcloneRunner
+from app.services.rclone import (
+    RcloneCancelledError,
+    RcloneCommandError,
+    RcloneExecutionProfile,
+    RcloneRunner,
+)
+
+
+def test_nextcloud_profile_adds_bounded_resource_flags_to_all_rclone_commands():
+    runner = RcloneRunner(
+        binary="/usr/bin/rclone",
+        temp_path="/tmp",
+        transfer_profile=RcloneExecutionProfile(),
+    )
+
+    command = runner.build_command(
+        "copy",
+        [
+            "ctm_0123456789abcdef0123456789abcdef:/source",
+            "ctm_fedcba9876543210fedcba9876543210:/dest",
+        ],
+        "/tmp/job.conf",
+    )
+
+    assert command[-10:] == [
+        "--transfers",
+        "1",
+        "--checkers",
+        "2",
+        "--bwlimit",
+        "8M",
+        "--contimeout",
+        "10s",
+        "--timeout",
+        "60s",
+    ]
+
+
+def test_rclone_retries_nextcloud_webdav_locks():
+    error = RcloneCommandError(1, b"HTTP 423 Locked")
+
+    assert error.retryable is True
 
 
 def test_rclone_command_builder_uses_argv_and_closed_allowlist():

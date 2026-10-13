@@ -26,6 +26,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.providers.base import ConnectionTestResult
 from app.providers.megacmd import MegaCmdProvider
 from app.providers.mock import MockStorageProvider
+from app.providers.nextcloud import NextcloudRcloneProvider, parse_allowed_origins
 from app.providers.rclone import RcloneGoogleDriveProvider
 from app.providers.seafile_auth import (
     SeafileAuthClient,
@@ -106,7 +107,7 @@ class PasswordReset(BaseModel):
 
 class ConnectionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    provider_type: str = Field(pattern="^(MOCK|MEGA|GOOGLE_DRIVE|SEAFILE|SMB)$")
+    provider_type: str = Field(pattern="^(MOCK|MEGA|GOOGLE_DRIVE|SEAFILE|SMB|NEXTCLOUD)$")
     adapter_type: str = Field(default="RCLONE", pattern="^(RCLONE|SEAFILE_API)$")
     credentials: dict[str, str] | None = None
     is_global: bool = True
@@ -377,12 +378,29 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 status_code=503, detail="No se pudieron cargar las credenciales"
             ) from exc
 
+    def ensure_provider_available(provider_type: str) -> None:
+        if provider_type != "NEXTCLOUD":
+            return
+        if not config.nextcloud_enabled:
+            raise HTTPException(status_code=409, detail="La integración Nextcloud está desactivada")
+        try:
+            allowed_origins = parse_allowed_origins(config.nextcloud_allowed_origins)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=503, detail="La lista de servidores Nextcloud no es válida"
+            ) from exc
+        if not allowed_origins:
+            raise HTTPException(
+                status_code=503, detail="No hay servidores Nextcloud autorizados"
+            )
+
     def provider_for(
         connection: ConnectionRecord,
         credentials_override: dict[str, Any] | None = None,
     ) -> Any:
         if connection.provider_type == "MOCK":
             return MockStorageProvider()
+        ensure_provider_available(connection.provider_type)
         credentials = credentials_override or credentials_for(connection)
         provider_type = connection.provider_type
         if provider_type == "MEGA":
@@ -397,6 +415,29 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 connection.id,
                 credentials,
                 RcloneRunner(config.rclone_binary, config.transfer_temp_path),
+            )
+        if provider_type == "NEXTCLOUD":
+            try:
+                allowed_origins = parse_allowed_origins(config.nextcloud_allowed_origins)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=503, detail="La lista de servidores Nextcloud no es válida"
+                ) from exc
+            if not allowed_origins:
+                raise HTTPException(
+                    status_code=503, detail="No hay servidores Nextcloud autorizados"
+                )
+            return NextcloudRcloneProvider(
+                connection.id,
+                credentials,
+                RcloneRunner(
+                    config.rclone_binary,
+                    config.transfer_temp_path,
+                    config.transfer_staging_path,
+                ),
+                allowed_origins=allowed_origins,
+                credential_version=connection.credential_version,
+                chunk_size=config.nextcloud_chunk_size,
             )
         if provider_type == "SMB":
             allowed_targets = {
@@ -1037,6 +1078,17 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         )
         return {"items": [connection.public_dict() for connection in connections]}
 
+    @app.get("/api/v1/system/capabilities")
+    async def system_capabilities(_user: UserAccount = Depends(current_user)) -> dict[str, Any]:
+        enabled_providers = ["MOCK", "MEGA", "GOOGLE_DRIVE", "SEAFILE", "SMB"]
+        try:
+            nextcloud_configured = bool(parse_allowed_origins(config.nextcloud_allowed_origins))
+        except ValueError:
+            nextcloud_configured = False
+        if config.nextcloud_enabled and nextcloud_configured:
+            enabled_providers.append("NEXTCLOUD")
+        return {"enabled_providers": enabled_providers}
+
     @app.delete("/api/v1/connections/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
     async def archive_connection(
         connection_id: uuid.UUID,
@@ -1071,6 +1123,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         del user_csrf
         encrypted_credentials = b""
         connection_id = uuid.uuid4()
+        ensure_provider_available(payload.provider_type)
         if payload.provider_type != "SEAFILE" and payload.adapter_type != "RCLONE":
             raise HTTPException(
                 status_code=422, detail="El adaptador API solo está disponible para Seafile"
@@ -1098,16 +1151,29 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                         ),
                         validation_credentials,
                     ).config_content()
-                else:
+                elif payload.provider_type == "NEXTCLOUD":
+                    allowed_origins = parse_allowed_origins(config.nextcloud_allowed_origins)
+                    validation_credentials = NextcloudRcloneProvider.validate_credentials(
+                        validation_credentials, allowed_origins
+                    )
+                    NextcloudRcloneProvider(
+                        connection_id,
+                        validation_credentials,
+                        RcloneRunner(config.rclone_binary, config.transfer_temp_path),
+                        allowed_origins=allowed_origins,
+                        chunk_size=config.nextcloud_chunk_size,
+                    ).config_content()
+                elif payload.provider_type == "GOOGLE_DRIVE":
                     validation_credentials.setdefault("refresh_token", "oauth-pending")
                     RcloneGoogleDriveProvider(
                         connection_id,
                         validation_credentials,
                         RcloneRunner(config.rclone_binary, config.transfer_temp_path),
                     ).config_content()
+                payload.credentials = validation_credentials
                 encrypted_credentials = CredentialCipher.from_secret_file(
                     config.master_encryption_key_file
-                ).encrypt(connection_id, payload.credentials)
+                ).encrypt(connection_id, validation_credentials)
             except (OSError, ValueError) as exc:
                 raise HTTPException(
                     status_code=422, detail="Credenciales inválidas o clave no disponible"
@@ -1303,6 +1369,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         if payload.is_global is not None:
             connection.is_global = payload.is_global
         if payload.credentials is not None:
+            ensure_provider_available(connection.provider_type)
             if connection.provider_type == "MOCK":
                 raise HTTPException(
                     status_code=422, detail="Las conexiones simuladas no usan credenciales"
@@ -1317,7 +1384,19 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                         payload.credentials
                     )
                     provider_for(connection, payload.credentials).config_content()
-                else:
+                elif connection.provider_type == "NEXTCLOUD":
+                    allowed_origins = parse_allowed_origins(config.nextcloud_allowed_origins)
+                    payload.credentials = NextcloudRcloneProvider.validate_credentials(
+                        payload.credentials, allowed_origins
+                    )
+                    NextcloudRcloneProvider(
+                        connection.id,
+                        payload.credentials,
+                        RcloneRunner(config.rclone_binary, config.transfer_temp_path),
+                        allowed_origins=allowed_origins,
+                        chunk_size=config.nextcloud_chunk_size,
+                    ).config_content()
+                elif connection.provider_type == "GOOGLE_DRIVE":
                     RcloneGoogleDriveProvider(
                         connection.id,
                         payload.credentials,
@@ -1546,6 +1625,8 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         destination = await app.state.store.aget_connection(payload.destination_connection_id)
         if source is None or destination is None:
             raise HTTPException(status_code=404, detail="Conexión no encontrada")
+        ensure_provider_available(source.provider_type)
+        ensure_provider_available(destination.provider_type)
         if source.status != "ACTIVE" or destination.status != "ACTIVE":
             raise HTTPException(status_code=409, detail="Una conexión está inactiva")
         if user.role != "ADMIN":

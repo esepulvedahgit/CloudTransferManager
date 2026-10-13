@@ -57,7 +57,7 @@ class StorageConnection(Base):
     __tablename__ = "storage_connections"
     __table_args__ = (
         CheckConstraint(
-            "provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB')",
+            "provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB', 'NEXTCLOUD')",
             name="ck_storage_provider_type",
         ),
         CheckConstraint(

@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     rclone_binary: str = "/usr/bin/rclone"
     smb_allowed_targets: str = ""
     smb_interactive_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    nextcloud_enabled: bool = False
+    nextcloud_allowed_origins: str = ""
+    nextcloud_max_concurrent: int = Field(default=1, ge=1, le=8)
+    nextcloud_bandwidth_limit: str = Field(default="8M", pattern=r"^[1-9][0-9]{0,3}(?:K|M|G)?$")
+    nextcloud_chunk_size: str = Field(
+        default="10Mi",
+        pattern=r"^(?:(?:10|32|64|128|256|512)Mi|1Gi)$",
+    )
+    nextcloud_job_timeout_seconds: int = Field(default=43200, ge=60, le=86400)
     megacmd_binary_dir: str = "/usr/bin"
     transfer_temp_path: str = "/var/lib/cloud-transfer/tmp"
     transfer_staging_path: str = "/var/lib/cloud-transfer/staging"

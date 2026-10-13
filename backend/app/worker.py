@@ -152,7 +152,9 @@ async def _dispatch_pending_transfers() -> int:
     event_bus = RedisEventBus(redis_client)
     try:
         batch = await store.adispatch_due_transfers(
-            datetime.now(UTC), max_concurrent=current_settings.transfer_max_concurrent
+            datetime.now(UTC),
+            max_concurrent=current_settings.transfer_max_concurrent,
+            max_nextcloud_concurrent=current_settings.nextcloud_max_concurrent,
         )
         admitted_ids = {transfer.id for transfer in batch.admitted}
         for transfer in batch.changed:
