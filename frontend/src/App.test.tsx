@@ -36,6 +36,11 @@ async function signIn(fetchMock: ReturnType<typeof vi.fn>) {
   await screen.findByRole('heading', { name: /Explorador de archivos/i });
 }
 
+async function openAdministration() {
+  fireEvent.click(await screen.findByRole('button', { name: /Menú de cuenta de/i }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: /Administración/i }));
+}
+
 describe('Cloud Transfer Manager', () => {
   afterEach(() => {
     cleanup();
@@ -1321,7 +1326,7 @@ describe('Cloud Transfer Manager', () => {
     fireEvent.change(await screen.findByLabelText(/Usuario o correo/i), { target: { value: 'admin' } });
     fireEvent.change(screen.getByLabelText(/Contraseña/i), { target: { value: 'CorrectHorseBatteryStaple123!' } });
     fireEvent.click(screen.getByRole('button', { name: /Iniciar sesión/i }));
-    fireEvent.click(await screen.findByRole('button', { name: /Administración/i }));
+    await openAdministration();
     expect(await screen.findByRole('heading', { name: /Administración/i })).toBeVisible();
     fireEvent.change(screen.getByLabelText(/Nombre de usuario/i), { target: { value: 'operator' } });
     fireEvent.change(screen.getByLabelText(/^Correo$/i), { target: { value: 'operator@example.test' } });
@@ -1349,7 +1354,7 @@ describe('Cloud Transfer Manager', () => {
     });
 
     await signIn(fetchMock);
-    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+    await openAdministration();
 
     expect(await screen.findByRole('heading', { name: /Administración/i })).toBeVisible();
     expect(screen.getByRole('tab', { name: 'General' })).toBeVisible();
@@ -1383,7 +1388,7 @@ describe('Cloud Transfer Manager', () => {
     });
 
     await signIn(fetchMock);
-    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+    await openAdministration();
     fireEvent.click(await screen.findByRole('tab', { name: 'Correo SMTP' }));
 
     expect(await screen.findByDisplayValue('smtp.example.test')).toBeVisible();
@@ -1429,7 +1434,7 @@ describe('Cloud Transfer Manager', () => {
     });
 
     await signIn(fetchMock);
-    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+    await openAdministration();
     fireEvent.click(await screen.findByRole('tab', { name: 'Correo SMTP' }));
     fireEvent.change(await screen.findByLabelText(/Servidor SMTP/i), { target: { value: 'mail.example.test' } });
     fireEvent.click(screen.getByRole('button', { name: /Guardar configuración/i }));
@@ -1478,7 +1483,7 @@ describe('Cloud Transfer Manager', () => {
     });
 
     await signIn(fetchMock);
-    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+    await openAdministration();
     fireEvent.click(await screen.findByRole('tab', { name: 'Correo SMTP' }));
     fireEvent.change(await screen.findByLabelText(/Servidor SMTP/i), { target: { value: 'draft.example.test' } });
     fireEvent.change(screen.getByLabelText(/Usuario SMTP/i), { target: { value: 'draft-user' } });
@@ -1527,7 +1532,7 @@ describe('Cloud Transfer Manager', () => {
     });
 
     await signIn(fetchMock);
-    fireEvent.click(screen.getByRole('button', { name: /Administración/i }));
+    await openAdministration();
     fireEvent.click(await screen.findByRole('tab', { name: 'Correo SMTP' }));
     await screen.findByDisplayValue('smtp.example.test');
     fireEvent.click(screen.getByRole('button', { name: /Probar conexión/i }));
