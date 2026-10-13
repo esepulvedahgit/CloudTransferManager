@@ -2230,14 +2230,13 @@ function TransferWorkspace({
           </Stack>
           <Tabs
             className="header-navigation"
-            value={workspaceSection}
-            onChange={(_event, value: 'explorer' | 'connections' | 'private' | 'scheduled' | 'documentation') => setWorkspaceSection(value)}
+            value={workspaceSection === 'documentation' ? false : workspaceSection}
+            onChange={(_event, value: 'explorer' | 'connections' | 'private' | 'scheduled') => setWorkspaceSection(value)}
             aria-label="Secciones principales"
           >
             <Tab value="explorer" label="Explorador" />
             <Tab value="private" label="Servicios privados" />
             <Tab value="scheduled" label="Programaciones" />
-            <Tab value="documentation" label="Documentación" />
             {user.role === 'ADMIN' && <Tab value="connections" label="Conexiones" />}
           </Tabs>
           <Stack className="topbar-actions" direction="row" alignItems="center" spacing={1.5}>
@@ -2298,6 +2297,10 @@ function TransferWorkspace({
         <MenuItem className="account-menu-item" onClick={() => { setAccountMenuAnchor(null); setPasswordDialogOpen(true); }}>
           <ListItemIcon><InterfaceIcon name="key" /></ListItemIcon>
           Cambiar contraseña
+        </MenuItem>
+        <MenuItem className="account-menu-item" onClick={() => { setAccountMenuAnchor(null); setWorkspaceSection('documentation'); }}>
+          <ListItemIcon><InterfaceIcon name="file" /></ListItemIcon>
+          Documentación
         </MenuItem>
         <Divider className="account-menu-divider" />
         <MenuItem className="account-menu-item account-menu-logout" onClick={() => { setAccountMenuAnchor(null); onLogout(); }}>
