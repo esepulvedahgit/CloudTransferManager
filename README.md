@@ -23,6 +23,12 @@ Las programaciones no son recurrentes. Una programación tampoco crea conectivid
 
 [Abrir el diagrama editable en HTML](docs/architecture.html). Nginx es el único servicio que publica puertos y enruta a la interfaz y a la API. FastAPI coordina exploración y autenticación, y usa Redis para colas y eventos SSE. Los workers ejecutan las copias hacia los proveedores. PostgreSQL conserva el estado y la auditoría; Rclone y MEGAcmd permanecen dentro del despliegue.
 
+### Secuencia de una transferencia
+
+![Diagrama de secuencia: solicitud COPY, despacho con Celery y Redis, ejecución del worker y progreso transmitido por SSE.](docs/transfer-sequence.svg)
+
+[Abrir la secuencia en HTML](docs/transfer-sequence.html). El dispatcher reserva los trabajos admitidos en PostgreSQL antes de encolarlos en `transfers`; los eventos de progreso viajan por Redis hasta la API y el navegador.
+
 ## Despliegue con Docker Compose
 
 ### Requisitos
