@@ -15,12 +15,15 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Divider,
   FormHelperText,
   FormControl,
   FormControlLabel,
   InputLabel,
   IconButton,
   LinearProgress,
+  ListItemIcon,
+  Menu,
   MenuItem,
   Paper,
   Popover,
@@ -1663,6 +1666,7 @@ function TransferWorkspace({
   });
   const [reportTransferId, setReportTransferId] = useState<string | null>(null);
   const [backgroundPopoverAnchor, setBackgroundPopoverAnchor] = useState<HTMLButtonElement | null>(null);
+  const [accountMenuAnchor, setAccountMenuAnchor] = useState<HTMLButtonElement | null>(null);
   const transferManifestQuery = useInfiniteQuery({
     queryKey: ['transfer-manifest', reportTransferId],
     enabled: Boolean(reportTransferId),
@@ -2209,25 +2213,52 @@ function TransferWorkspace({
                 <InterfaceIcon name="clock" />
               </Badge>
             </IconButton>
-            <Box className="user-badge" aria-label={`Sesión de ${user.username}`}>
-              <span>{user.username.slice(0, 1).toUpperCase()}</span>
-              <Typography variant="body2">{user.username}</Typography>
-            </Box>
-            <Box className="topbar-separator" aria-hidden="true" />
-            {user.role === 'ADMIN' && (
-              <Button color="inherit" size="small" startIcon={<InterfaceIcon name="settings" />} onClick={() => setAdminDialogOpen(true)}>
-                Administración
-              </Button>
-            )}
-            <Button color="inherit" size="small" startIcon={<InterfaceIcon name="key" />} onClick={() => setPasswordDialogOpen(true)}>
-              Cambiar contraseña
-            </Button>
-            <Button color="inherit" size="small" startIcon={<InterfaceIcon name="logout" />} onClick={onLogout}>
-              Cerrar sesión
+            <Button
+              id="account-menu-trigger"
+              className="account-menu-trigger"
+              color="inherit"
+              aria-label={`Menú de cuenta de ${user.username}`}
+              aria-haspopup="menu"
+              aria-expanded={Boolean(accountMenuAnchor)}
+              aria-controls={accountMenuAnchor ? 'account-menu' : undefined}
+              onClick={(event) => setAccountMenuAnchor(event.currentTarget)}
+            >
+              <span className="account-avatar">{user.username.slice(0, 1).toUpperCase()}</span>
+              <span className="account-menu-name">{user.username}</span>
+              <span className="account-menu-chevron" aria-hidden="true" />
             </Button>
           </Stack>
         </Toolbar>
       </AppBar>
+      <Menu
+        id="account-menu"
+        anchorEl={accountMenuAnchor}
+        open={Boolean(accountMenuAnchor)}
+        onClose={() => setAccountMenuAnchor(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+        transitionDuration={{ enter: 180, exit: 120 }}
+        slotProps={{
+          paper: { className: 'account-menu' },
+          list: { 'aria-labelledby': 'account-menu-trigger' },
+        }}
+      >
+        {user.role === 'ADMIN' && (
+          <MenuItem className="account-menu-item" onClick={() => { setAccountMenuAnchor(null); setAdminDialogOpen(true); }}>
+            <ListItemIcon><InterfaceIcon name="settings" /></ListItemIcon>
+            Administración
+          </MenuItem>
+        )}
+        <MenuItem className="account-menu-item" onClick={() => { setAccountMenuAnchor(null); setPasswordDialogOpen(true); }}>
+          <ListItemIcon><InterfaceIcon name="key" /></ListItemIcon>
+          Cambiar contraseña
+        </MenuItem>
+        <Divider className="account-menu-divider" />
+        <MenuItem className="account-menu-item account-menu-logout" onClick={() => { setAccountMenuAnchor(null); onLogout(); }}>
+          <ListItemIcon><InterfaceIcon name="logout" /></ListItemIcon>
+          Cerrar sesión
+        </MenuItem>
+      </Menu>
       <Popover
         open={Boolean(backgroundPopoverAnchor)}
         anchorEl={backgroundPopoverAnchor}
