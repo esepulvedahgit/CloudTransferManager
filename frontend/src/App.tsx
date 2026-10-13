@@ -92,13 +92,30 @@ type Transfer = {
   started_at?: string | null;
   completed_at?: string | null;
 };
+type TransferManifestItem = {
+  id: string;
+  source_path: string;
+  destination_path: string;
+  is_dir: boolean;
+  size_bytes: number | null;
+  modified_at: string | null;
+  scan_complete: boolean;
+  status: 'DIRECTORY' | 'PENDING' | 'COPIED' | 'SKIPPED' | 'FAILED';
+  error_code: string | null;
+  verified_by: string | null;
+};
+type TransferManifestPage = {
+  items: TransferManifestItem[];
+  next_cursor: string | null;
+  counts: { total: number; pending: number; copied: number; skipped: number; failed: number };
+};
 const terminalTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED'];
 const successfulTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS'];
 const terminalProgressDisplayMs = 3_000;
 type LoginForm = { username_or_email: string; password: string };
 type ConnectionForm = {
   name: string;
-  provider_type: 'MOCK' | 'MEGA' | 'GOOGLE_DRIVE' | 'SEAFILE';
+  provider_type: 'MOCK' | 'MEGA' | 'GOOGLE_DRIVE' | 'SEAFILE' | 'SMB';
   seafile_adapter_type: 'RCLONE' | 'SEAFILE_API';
   is_global: boolean;
   mega_username: string;
@@ -112,6 +129,13 @@ type ConnectionForm = {
   seafile_password: string;
   seafile_library: string;
   seafile_library_password: string;
+  smb_host: string;
+  smb_port: string;
+  smb_share: string;
+  smb_base_path: string;
+  smb_username: string;
+  smb_password: string;
+  smb_domain: string;
 };
 type PasswordForm = { current_password: string; new_password: string };
 type SmtpSettings = {
@@ -296,7 +320,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
 
 const connectionSchema = z.object({
   name: z.string().trim().min(1, 'Ingresa un nombre.'),
-  provider_type: z.enum(['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE']),
+  provider_type: z.enum(['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB']),
   seafile_adapter_type: z.enum(['RCLONE', 'SEAFILE_API']),
   is_global: z.boolean(),
   mega_username: z.string(),
@@ -310,6 +334,13 @@ const connectionSchema = z.object({
   seafile_password: z.string(),
   seafile_library: z.string(),
   seafile_library_password: z.string(),
+  smb_host: z.string(),
+  smb_port: z.string(),
+  smb_share: z.string(),
+  smb_base_path: z.string(),
+  smb_username: z.string(),
+  smb_password: z.string(),
+  smb_domain: z.string(),
 }).superRefine((values, context) => {
   const required: Array<[keyof ConnectionForm, string]> = values.provider_type === 'MEGA'
     ? [['mega_username', values.mega_username], ['mega_password', values.mega_password]]
@@ -321,6 +352,13 @@ const connectionSchema = z.object({
             ['seafile_username', values.seafile_username],
             ['seafile_password', values.seafile_password],
           ]
+        : values.provider_type === 'SMB'
+          ? [
+              ['smb_host', values.smb_host],
+              ['smb_share', values.smb_share],
+              ['smb_username', values.smb_username],
+              ['smb_password', values.smb_password],
+            ]
         : [];
   required.forEach(([field, value]) => {
     if (!value) context.addIssue({ code: 'custom', path: [field], message: 'Este campo es obligatorio.' });
@@ -332,27 +370,36 @@ const emptyConnectionForm: ConnectionForm = {
   mega_username: '', mega_password: '', drive_client_id: '', drive_client_secret: '',
   drive_team_drive: '', drive_root_folder_id: '', seafile_url: '', seafile_username: '',
   seafile_password: '', seafile_library: '', seafile_library_password: '',
+  smb_host: '', smb_port: '445', smb_share: '', smb_base_path: '', smb_username: '',
+  smb_password: '', smb_domain: '',
 };
 
 function ConnectionDialog({
   open,
   onClose,
   onCreated,
+  initialProvider = 'MEGA',
 }: {
   open: boolean;
   onClose: () => void;
   onCreated: (connection: Connection) => void;
+  initialProvider?: ConnectionForm['provider_type'];
 }) {
+  const formDefaults = { ...emptyConnectionForm, provider_type: initialProvider };
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const { register, control, handleSubmit, reset, watch, formState: { errors } } = useForm<ConnectionForm>({
     resolver: zodResolver(connectionSchema),
-    defaultValues: emptyConnectionForm,
+    defaultValues: formDefaults,
   });
   const provider = watch('provider_type');
 
+  useEffect(() => {
+    if (open) reset(formDefaults);
+  }, [formDefaults.provider_type, open, reset]);
+
   const close = () => {
-    reset(emptyConnectionForm);
+    reset(formDefaults);
     setError('');
     onClose();
   };
@@ -379,7 +426,17 @@ function ConnectionDialog({
                 ? { library_password: values.seafile_library_password }
                 : {}),
             }
-          : undefined;
+          : values.provider_type === 'SMB'
+            ? {
+                host: values.smb_host,
+                port: values.smb_port || '445',
+                share: values.smb_share,
+                ...(values.smb_base_path.trim() ? { base_path: values.smb_base_path.trim() } : {}),
+                username: values.smb_username,
+                password: values.smb_password,
+                ...(values.smb_domain.trim() ? { domain: values.smb_domain.trim() } : {}),
+              }
+            : undefined;
     try {
       const connection = await apiRequest<Connection>('/api/v1/connections', {
         method: 'POST',
@@ -401,7 +458,7 @@ function ConnectionDialog({
         window.location.assign(authorization.authorization_url);
         return;
       }
-      reset(emptyConnectionForm);
+      reset(formDefaults);
       onCreated(connection);
       onClose();
     } catch (caught) {
@@ -438,6 +495,7 @@ function ConnectionDialog({
                     <MenuItem value="MEGA"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MEGA" />MEGA</Stack></MenuItem>
                     <MenuItem value="GOOGLE_DRIVE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="GOOGLE_DRIVE" />Google Drive</Stack></MenuItem>
                     <MenuItem value="SEAFILE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="SEAFILE" />Seafile</Stack></MenuItem>
+                    <MenuItem value="SMB">NAS privado (SMB)</MenuItem>
                     <MenuItem value="MOCK"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MOCK" />Simulado (pruebas)</Stack></MenuItem>
                   </Select>
                 )}
@@ -511,6 +569,18 @@ function ConnectionDialog({
                   helperText="Solo se necesita para una biblioteca cifrada."
                   {...register('seafile_library_password')}
                 />
+              </>
+            )}
+            {provider === 'SMB' && (
+              <>
+                <Alert severity="info">CTM debe alcanzar el NAS desde la LAN o una VPN ya configurada. La cuenta debe tener acceso de solo lectura al recurso.</Alert>
+                <TextField label="Servidor NAS" placeholder="nas.intranet.local" {...register('smb_host')} error={Boolean(errors.smb_host)} helperText={errors.smb_host?.message ?? ' '} />
+                <TextField label="Puerto SMB" inputMode="numeric" {...register('smb_port')} />
+                <TextField label="Recurso compartido" placeholder="Datos" {...register('smb_share')} error={Boolean(errors.smb_share)} helperText={errors.smb_share?.message ?? ' '} />
+                <TextField label="Carpeta raíz opcional" placeholder="Departamentos" {...register('smb_base_path')} />
+                <TextField label="Dominio opcional" {...register('smb_domain')} />
+                <TextField label="Usuario SMB" autoComplete="username" {...register('smb_username')} error={Boolean(errors.smb_username)} helperText={errors.smb_username?.message ?? ' '} />
+                <TextField label="Contraseña SMB" type="password" autoComplete="new-password" {...register('smb_password')} error={Boolean(errors.smb_password)} helperText={errors.smb_password?.message ?? ' '} />
               </>
             )}
             {provider === 'MOCK' && <Alert severity="info">Conexión local de demostración; no usa credenciales externas.</Alert>}
@@ -1037,6 +1107,7 @@ function transferStatusLabel(status: string): string {
 function providerLabel(provider: string): string {
   if (provider === 'GOOGLE_DRIVE') return 'Google Drive';
   if (provider === 'SEAFILE') return 'Seafile Community Edition';
+  if (provider === 'SMB') return 'NAS privado (SMB)';
   if (provider === 'MOCK') return 'Simulada';
   return provider;
 }
@@ -1224,6 +1295,64 @@ function ConnectionManagementSection({
           </Button>
         </DialogActions>
       </Dialog>
+    </Box>
+  );
+}
+
+function PrivateServicesSection({
+  connections,
+  loading,
+  isAdmin,
+  onAdd,
+  onExplore,
+}: {
+  connections: Connection[];
+  loading: boolean;
+  isAdmin: boolean;
+  onAdd: () => void;
+  onExplore: (connection: Connection) => void;
+}) {
+  return (
+    <Box component="section" aria-labelledby="private-services-title">
+      <Box className="connection-management-heading">
+        <Box>
+          <Typography variant="h5" component="h2" id="private-services-title">Servicios privados</Typography>
+          <Typography color="text.secondary" sx={{ mt: 0.5 }}>
+            NAS accesibles desde la red de CTM o desde una VPN ya configurada.
+          </Typography>
+        </Box>
+        {isAdmin && <Button variant="contained" onClick={onAdd}>Agregar NAS</Button>}
+      </Box>
+      {loading && <LinearProgress aria-label="Cargando servicios privados" />}
+      {!loading && connections.length === 0 && (
+        <Paper className="connection-empty-state" elevation={0}>
+          <Typography variant="h6">Aún no hay NAS configurados</Typography>
+          <Typography color="text.secondary">
+            Un administrador puede conectar un recurso compartido SMB accesible desde CTM.
+          </Typography>
+        </Paper>
+      )}
+      <Stack spacing={1.5}>
+        {connections.map((connection) => (
+          <Paper key={connection.id} className="connection-inventory" elevation={0}>
+            <Box className="connection-row">
+              <Box className="connection-name-field">
+                <Typography fontWeight={700}>{connection.name}</Typography>
+                <Typography variant="caption" color="text.secondary">NAS · SMB</Typography>
+              </Box>
+              <Chip size="small" color={connectionStatusColor(connection.status)} label={connectionStatusLabel(connection.status)} />
+              <Button
+                variant="outlined"
+                disabled={connection.status !== 'ACTIVE'}
+                onClick={() => onExplore(connection)}
+                aria-label={`Explorar ${connection.name}`}
+              >
+                Explorar NAS
+              </Button>
+            </Box>
+          </Paper>
+        ))}
+      </Stack>
     </Box>
   );
 }
@@ -1426,7 +1555,25 @@ function TransferWorkspace({
     queryFn: () => apiRequest<{ items: Transfer[] }>('/api/v1/transfers'),
     refetchInterval: 3_000,
   });
+  const [reportTransferId, setReportTransferId] = useState<string | null>(null);
+  const transferManifestQuery = useInfiniteQuery({
+    queryKey: ['transfer-manifest', reportTransferId],
+    enabled: Boolean(reportTransferId),
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam }) => {
+      const params = new URLSearchParams({ limit: '100' });
+      if (pageParam) params.set('after_id', pageParam);
+      return apiRequest<TransferManifestPage>(
+        `/api/v1/transfers/${reportTransferId}/items?${params}`,
+      );
+    },
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+  });
   const connections = connectionsQuery.data?.items ?? [];
+  const destinationConnections = useMemo(
+    () => connections.filter((connection) => connection.provider_type !== 'SMB'),
+    [connections],
+  );
   const connectionById = new Map(connections.map((connection) => [connection.id, connection]));
   const [sourceId, setSourceId] = useState('');
   const [destinationId, setDestinationId] = useState('');
@@ -1445,13 +1592,14 @@ function TransferWorkspace({
   const [conflictPolicy, setConflictPolicy] = useState<'SKIP' | 'OVERWRITE_IF_DIFFERENT'>('OVERWRITE_IF_DIFFERENT');
   const [sendEmailNotification, setSendEmailNotification] = useState(false);
   const [mobileStep, setMobileStep] = useState(0);
-  const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections'>('explorer');
+  const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections' | 'private'>('explorer');
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
   const [transferFailure, setTransferFailure] = useState<{ transferId: string; message: string } | null>(null);
   const [notice, setNotice] = useState('');
   const [noticeSeverity, setNoticeSeverity] = useState<'error' | 'info' | 'success' | 'warning'>('error');
   const [busy, setBusy] = useState(false);
   const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
+  const [connectionDialogProvider, setConnectionDialogProvider] = useState<ConnectionForm['provider_type']>('MEGA');
   const [adminDialogOpen, setAdminDialogOpen] = useState(false);
   const [passwordDialogOpen, setPasswordDialogOpen] = useState(Boolean(user.must_change_password));
   const latestTransfer = useMemo(() => transfersQuery.data?.items[0], [transfersQuery.data]);
@@ -1533,7 +1681,7 @@ function TransferWorkspace({
 
   useEffect(() => {
     const sourceIsAvailable = connections.some((connection) => connection.id === sourceId);
-    const destinationIsAvailable = connections.some((connection) => connection.id === destinationId);
+    const destinationIsAvailable = destinationConnections.some((connection) => connection.id === destinationId);
     if (sourceId && !sourceIsAvailable) {
       setSourceId(connections[0]?.id ?? '');
       setSourcePath('/');
@@ -1542,15 +1690,16 @@ function TransferWorkspace({
       setSourceId(connections[0].id);
     }
     if (destinationId && !destinationIsAvailable) {
-      const fallback = connections.find((connection) => connection.id !== sourceId) ?? connections[0];
+      const fallback = destinationConnections.find((connection) => connection.id !== sourceId)
+        ?? destinationConnections[0];
       setDestinationId(fallback?.id ?? '');
       setDestinationPath('/');
-    } else if (!destinationId && connections.length > 1) {
-      const currentSource = sourceId || connections[0].id;
-      const fallback = connections.find((connection) => connection.id !== currentSource) ?? connections[1];
-      setDestinationId(fallback.id);
+    } else if (!destinationId && destinationConnections.length > 0) {
+      const currentSource = sourceId || connections[0]?.id;
+      const fallback = destinationConnections.find((connection) => connection.id !== currentSource)
+      if (fallback) setDestinationId(fallback.id);
     }
-  }, [connections, destinationId, sourceId]);
+  }, [connections, destinationConnections, destinationId, sourceId]);
 
   const runConnectionTest = async (connectionId: string, otp?: string) => {
     setNotice('');
@@ -1644,6 +1793,26 @@ function TransferWorkspace({
     }
   };
 
+  const resumeTransfer = async (transfer: Transfer) => {
+    setBusy(true);
+    setNotice('');
+    try {
+      const updated = await apiRequest<Transfer>(
+        `/api/v1/transfers/${transfer.id}/resume`,
+        { method: 'POST' },
+      );
+      setActiveTransfer(updated);
+      setNotice('La transferencia se reanudó.');
+      setNoticeSeverity('success');
+      await queryClient.invalidateQueries({ queryKey: ['transfers'] });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo reanudar la transferencia.');
+      setNoticeSeverity('error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const archiveConnection = async (connection: Connection) => {
     await apiRequest<void>(`/api/v1/connections/${connection.id}`, { method: 'DELETE' });
     queryClient.setQueryData<{ items: Connection[] }>(['connections'], (current) => current && ({
@@ -1682,7 +1851,7 @@ function TransferWorkspace({
       <ExplorerPanel
         title="Elige la carpeta de destino"
         side="destination"
-        connections={connections}
+        connections={destinationConnections}
         connectionId={destinationId}
         onConnectionChange={(id) => { setDestinationId(id); setDestinationPath('/'); }}
         path={destinationPath}
@@ -1704,17 +1873,16 @@ function TransferWorkspace({
               <Typography variant="overline">COPIA ENTRE NUBES</Typography>
             </Box>
           </Stack>
-          {user.role === 'ADMIN' && (
-            <Tabs
-              className="header-navigation"
-              value={workspaceSection}
-              onChange={(_event, value: 'explorer' | 'connections') => setWorkspaceSection(value)}
-              aria-label="Secciones principales"
-            >
-              <Tab value="explorer" label="Explorador" />
-              <Tab value="connections" label="Conexiones" />
-            </Tabs>
-          )}
+          <Tabs
+            className="header-navigation"
+            value={workspaceSection}
+            onChange={(_event, value: 'explorer' | 'connections' | 'private') => setWorkspaceSection(value)}
+            aria-label="Secciones principales"
+          >
+            <Tab value="explorer" label="Explorador" />
+            <Tab value="private" label="Servicios privados" />
+            {user.role === 'ADMIN' && <Tab value="connections" label="Conexiones" />}
+          </Tabs>
           <Stack className="topbar-actions" direction="row" alignItems="center" spacing={1.5}>
             <Box className="user-badge" aria-label={`Sesión de ${user.username}`}>
               <span>{user.username.slice(0, 1).toUpperCase()}</span>
@@ -1739,15 +1907,21 @@ function TransferWorkspace({
         <Box className="page-heading">
           <Box>
             <Typography variant="overline" color="primary.main">
-              {workspaceSection === 'connections' ? 'ADMINISTRACIÓN DE CONEXIONES' : 'CENTRO DE TRANSFERENCIAS'}
+              {workspaceSection === 'connections'
+                ? 'ADMINISTRACIÓN DE CONEXIONES'
+                : workspaceSection === 'private' ? 'ORÍGENES DE RED PRIVADA' : 'CENTRO DE TRANSFERENCIAS'}
             </Typography>
             <Typography variant="h4" component="h1">
-              {workspaceSection === 'connections' ? 'Conexiones' : 'Explorador de archivos'}
+              {workspaceSection === 'connections'
+                ? 'Conexiones'
+                : workspaceSection === 'private' ? 'Servicios privados' : 'Explorador de archivos'}
             </Typography>
             <Typography color="text.secondary" sx={{ mt: 0.6 }}>
               {workspaceSection === 'connections'
-                ? 'Administra los proveedores disponibles para explorar y transferir archivos.'
-                : 'Mueve archivos entre tus conexiones cloud con visibilidad en tiempo real.'}
+                ? 'Administra las conexiones cloud disponibles para transferir archivos.'
+                : workspaceSection === 'private'
+                  ? 'Explora carpetas del NAS accesible desde la red de Cloud Transfer Manager.'
+                  : 'Copia archivos entre tus servicios cloud y los NAS conectados.'}
             </Typography>
           </Box>
         </Box>
@@ -1756,12 +1930,31 @@ function TransferWorkspace({
         {transferFailure && <Alert severity="error" sx={{ mb: 2 }}>{transferFailure.message}</Alert>}
         {workspaceSection === 'connections' && user.role === 'ADMIN' ? (
           <ConnectionManagementSection
-            connections={connections}
+            connections={connections.filter((connection) => connection.provider_type !== 'SMB')}
             loading={connectionsQuery.isLoading}
             loadError={connectionsQuery.isError}
-            onAdd={() => setConnectionDialogOpen(true)}
+            onAdd={() => {
+              setConnectionDialogProvider('MEGA');
+              setConnectionDialogOpen(true);
+            }}
             onRefresh={() => { void connectionsQuery.refetch(); }}
             onArchive={archiveConnection}
+          />
+        ) : workspaceSection === 'private' ? (
+          <PrivateServicesSection
+            connections={connections.filter((connection) => connection.provider_type === 'SMB')}
+            loading={connectionsQuery.isLoading}
+            isAdmin={user.role === 'ADMIN'}
+            onAdd={() => {
+              setConnectionDialogProvider('SMB');
+              setConnectionDialogOpen(true);
+            }}
+            onExplore={(connection) => {
+              setSourceId(connection.id);
+              setSourcePath('/');
+              setSelectedPaths([]);
+              setWorkspaceSection('explorer');
+            }}
           />
         ) : (
           <>
@@ -1901,6 +2094,51 @@ function TransferWorkspace({
           </Card>
         )}
 
+        {reportTransferId && (
+          <Card className="progress-card" variant="outlined" aria-label="Resultado de migración SMB">
+            <CardContent>
+              <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2}>
+                <Box>
+                  <Typography variant="overline" color="text.secondary">INVENTARIO Y RESULTADOS</Typography>
+                  <Typography variant="h6">
+                    {historyTransfers.find((transfer) => transfer.id === reportTransferId)?.public_id}
+                  </Typography>
+                </Box>
+                <Button size="small" onClick={() => setReportTransferId(null)}>Cerrar</Button>
+              </Stack>
+              {transferManifestQuery.data?.pages[0]?.counts && (
+                <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+                  {transferManifestQuery.data.pages[0].counts.copied} copiados · {transferManifestQuery.data.pages[0].counts.skipped} omitidos · {transferManifestQuery.data.pages[0].counts.failed} con error
+                </Typography>
+              )}
+              {transferManifestQuery.isLoading && <LinearProgress sx={{ mt: 1 }} />}
+              {transferManifestQuery.isError && <Alert severity="error" sx={{ mt: 1 }}>No se pudo cargar el resultado de la migración.</Alert>}
+              <Stack spacing={0.75} sx={{ mt: 1.5 }}>
+                {transferManifestQuery.data?.pages.flatMap((page) => page.items).map((item) => (
+                  <Box key={item.id} className="history-row">
+                    <Chip size="small" label={item.status === 'DIRECTORY' ? 'Carpeta' : item.status} color={item.status === 'FAILED' ? 'error' : item.status === 'COPIED' ? 'success' : 'default'} />
+                    <Box className="history-label">
+                      <Typography variant="body2" title={item.source_path}>{item.source_path}</Typography>
+                      <Typography variant="caption" color="text.secondary" title={item.destination_path}>{item.destination_path}</Typography>
+                    </Box>
+                    {item.error_code && <Typography variant="caption" color="error">{item.error_code}</Typography>}
+                  </Box>
+                ))}
+              </Stack>
+              {transferManifestQuery.hasNextPage && (
+                <Button
+                  size="small"
+                  sx={{ mt: 1 }}
+                  disabled={transferManifestQuery.isFetchingNextPage}
+                  onClick={() => void transferManifestQuery.fetchNextPage()}
+                >
+                  {transferManifestQuery.isFetchingNextPage ? <CircularProgress size={18} /> : 'Cargar más resultados'}
+                </Button>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
         <Box className="history-heading">
           <Box>
             <Typography variant="overline" color="text.secondary">ACTIVIDAD</Typography>
@@ -1947,6 +2185,27 @@ function TransferWorkspace({
                 <Typography variant="body2" fontWeight={700}>{transfer.progress_percent.toFixed(0)}%</Typography>
                 <Box className="history-progress-track"><Box style={{ width: `${Math.max(0, Math.min(100, transfer.progress_percent))}%` }} /></Box>
               </Box>
+              {sourceConnection?.provider_type === 'SMB' && (
+                <Stack spacing={0.5} alignItems="flex-start">
+                  <Button
+                    size="small"
+                    onClick={() => setReportTransferId(transfer.id)}
+                    aria-label={`Ver archivos de ${transfer.public_id}`}
+                  >
+                    Ver archivos
+                  </Button>
+                  {['FAILED', 'CANCELLED'].includes(transfer.status) && (
+                    <Button
+                      size="small"
+                      disabled={busy}
+                      onClick={() => void resumeTransfer(transfer)}
+                      aria-label={`Reanudar transferencia ${transfer.public_id}`}
+                    >
+                      Reanudar
+                    </Button>
+                  )}
+                </Stack>
+              )}
             </Box>
             );
           })}
@@ -1963,6 +2222,7 @@ function TransferWorkspace({
       </Container>
       <ConnectionDialog
         open={connectionDialogOpen}
+        initialProvider={connectionDialogProvider}
         onClose={() => setConnectionDialogOpen(false)}
         onCreated={(created) => {
           setNotice(created.status === 'ACTIVE'

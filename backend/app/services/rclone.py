@@ -63,7 +63,7 @@ class RcloneRunner:
     _copy_output_limit = 64 * 1024
     _json_output_limit = 32 * 1024 * 1024
     _max_log_line_bytes = 64 * 1024
-    _remote_path = re.compile(r"^(ctm_[0-9a-f]{32}):(/[^\x00\r\n]*)$")
+    _remote_path = re.compile(r"^(ctm_[0-9a-f]{32}):(/[^\x00\r\n]*|[^\x00\r\n]+)$")
 
     def __init__(self, binary: str, temp_path: str, staging_path: str | None = None) -> None:
         self.binary = binary
@@ -74,11 +74,15 @@ class RcloneRunner:
     def _validate_remote_path(cls, value: str) -> str:
         match = cls._remote_path.fullmatch(value)
         if match is None:
-            raise ValueError("Rclone paths must use an internal remote and an absolute path")
+            raise ValueError("Rclone paths must use an internal remote and a normalized path")
         path = match.group(2)
         if "\\" in path or any(part == ".." for part in path.split("/")):
             raise ValueError("Path traversal is not allowed")
-        if str(PurePosixPath(path)) != path.rstrip("/") and path != "/":
+        if path.startswith("/") and str(PurePosixPath(path)) != path.rstrip("/") and path != "/":
+            raise ValueError("Rclone path is not normalized")
+        if not path.startswith("/") and (
+            any(part in {"", "."} for part in path.split("/")) or str(PurePosixPath(path)) != path
+        ):
             raise ValueError("Rclone path is not normalized")
         return value
 
@@ -124,6 +128,7 @@ class RcloneRunner:
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
         create_empty_src_dirs: bool = False,
+        timeout_seconds: float | None = None,
     ) -> tuple[bytes, bytes]:
         if command not in self._allowed_commands:
             raise ValueError(f"Rclone command is not allowed: {command}")
@@ -144,6 +149,7 @@ class RcloneRunner:
             ),
             line_callback=line_callback,
             should_cancel=should_cancel,
+            timeout_seconds=timeout_seconds,
         )
 
     async def copy_remote_to_local(
@@ -205,9 +211,7 @@ class RcloneRunner:
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
     ) -> None:
-        safe_local_directory = self._validate_local_staging_path(
-            local_directory, is_directory=True
-        )
+        safe_local_directory = self._validate_local_staging_path(local_directory, is_directory=True)
         safe_remote_destination = self._validate_remote_path(remote_destination)
         await self._run_with_argv(
             "copy",
@@ -303,9 +307,12 @@ class RcloneRunner:
         *,
         line_callback: Callable[[str], Awaitable[None]] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[bytes, bytes]:
         if "\x00" in config_content:
             raise ValueError("Rclone configuration contains an invalid character")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("Rclone timeout must be positive")
         os.makedirs(self.temp_path, mode=0o700, exist_ok=True)
         os.chmod(self.temp_path, 0o700)
         config_path = os.path.join(self.temp_path, f"{job_id}.rclone.conf")
@@ -391,6 +398,11 @@ class RcloneRunner:
                 asyncio.create_task(read_stream(process.stderr, line_callback)),
             ]
             wait_task = asyncio.create_task(process.wait())
+            deadline = (
+                asyncio.get_running_loop().time() + timeout_seconds
+                if timeout_seconds is not None
+                else None
+            )
             while not wait_task.done():
                 if should_cancel is not None and await should_cancel():
                     process.terminate()
@@ -401,7 +413,14 @@ class RcloneRunner:
                         await wait_task
                     await asyncio.gather(*reader_tasks, return_exceptions=True)
                     raise RcloneCancelledError("La transferencia fue cancelada")
-                await asyncio.wait({wait_task}, timeout=0.25)
+                if deadline is not None:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise TimeoutError("Rclone operation timed out")
+                    wait_timeout = min(0.25, remaining)
+                else:
+                    wait_timeout = 0.25
+                await asyncio.wait({wait_task}, timeout=wait_timeout)
             (stdout, stdout_truncated), (stderr, stderr_truncated) = await asyncio.gather(
                 *reader_tasks
             )

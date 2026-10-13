@@ -1009,4 +1009,128 @@ describe('Cloud Transfer Manager', () => {
     fireEvent.click(screen.getByRole('button', { name: /Probar conexión/i }));
     expect(await screen.findByText(/No se pudo conectar con SMTP/i)).toBeVisible();
   });
+
+  it('opens a private NAS from Servicios privados as the transfer source', async () => {
+    const smb = {
+      id: 'smb-1',
+      name: 'NAS Finanzas',
+      provider_type: 'SMB',
+      status: 'ACTIVE',
+      credentials_configured: true,
+      is_global: true,
+    };
+    const drive = {
+      id: 'drive-1',
+      name: 'Drive',
+      provider_type: 'GOOGLE_DRIVE',
+      status: 'ACTIVE',
+      credentials_configured: true,
+      is_global: true,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [smb, drive] });
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (path.includes('/items?')) return jsonResponse({ items: [], next_cursor: null, total_count: 0 });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('tab', { name: 'Servicios privados' }));
+
+    expect(await screen.findByRole('heading', { name: 'Servicios privados', level: 2 })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: /Explorar NAS Finanzas/i }));
+
+    expect(await screen.findByRole('heading', { name: 'Explorador de archivos' })).toBeVisible();
+    await waitFor(() => {
+      const originSelect = screen.getAllByRole('combobox', { name: 'Conexión' })[0];
+      expect(originSelect).toHaveTextContent('NAS Finanzas');
+    });
+  });
+
+  it('shows the SMB file report and resumes a failed NAS transfer', async () => {
+    vi.stubGlobal('EventSource', TestEventSource);
+    const failedTransfer = {
+      id: 'smb-transfer',
+      public_id: 'TRF-2026-000099',
+      status: 'FAILED',
+      progress_percent: 50,
+      files_total: 2,
+      files_completed: 1,
+      bytes_total: 2048,
+      bytes_transferred: 1024,
+      current_item: null,
+      average_speed_bps: null,
+      current_speed_bps: null,
+      estimated_remaining_seconds: null,
+      source_connection_id: 'nas',
+      destination_connection_id: 'drive',
+      source_paths: ['/Projects'],
+      destination_path: '/Archive',
+      created_at: '2026-10-12T10:00:00.000Z',
+      started_at: '2026-10-12T10:01:00.000Z',
+      completed_at: '2026-10-12T10:02:00.000Z',
+    };
+    let resumed = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/connections')) {
+        return jsonResponse({ items: [
+          { id: 'nas', name: 'NAS Proyectos', provider_type: 'SMB', status: 'ACTIVE', credentials_configured: true },
+          { id: 'drive', name: 'Google Drive', provider_type: 'GOOGLE_DRIVE', status: 'ACTIVE', credentials_configured: true },
+        ] });
+      }
+      if (path.endsWith('/transfers') && init?.method === 'POST') return jsonResponse(failedTransfer, 201);
+      if (path.endsWith('/items?limit=100')) {
+        return jsonResponse({
+          items: [{
+            id: 'manifest-item',
+            source_path: '/Projects/report.pdf',
+            destination_path: '/Archive/Projects/report.pdf',
+            is_dir: false,
+            size_bytes: 1024,
+            modified_at: null,
+            scan_complete: false,
+            status: 'FAILED',
+            error_code: 'NETWORK',
+            verified_by: null,
+          }],
+          next_cursor: null,
+          counts: { total: 1, pending: 0, copied: 0, skipped: 0, failed: 1 },
+        });
+      }
+      if (path.endsWith('/resume') && init?.method === 'POST') {
+        resumed = true;
+        return jsonResponse({ ...failedTransfer, status: 'QUEUED', attempt_count: 2 }, 202);
+      }
+      if (path.endsWith('/transfers')) return jsonResponse({ items: [failedTransfer] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    await screen.findByText('TRF-2026-000099');
+    fireEvent.click(screen.getByRole('button', { name: /Ver archivos de TRF-2026-000099/i }));
+    expect(await screen.findByText('/Projects/report.pdf')).toBeVisible();
+    expect(screen.getByText('NETWORK')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: /Reanudar transferencia TRF-2026-000099/i }));
+
+    await waitFor(() => expect(resumed).toBe(true));
+    expect(await screen.findByText('La transferencia se reanudó.')).toBeVisible();
+  });
 });

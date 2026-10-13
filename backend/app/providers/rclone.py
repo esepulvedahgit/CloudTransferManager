@@ -23,11 +23,19 @@ def _config_value(value: str, field_name: str) -> str:
 class RcloneStorageProvider(StorageProvider):
     provider_type: str
 
-    def __init__(self, connection_id: uuid.UUID, credentials: dict[str, Any], runner: RcloneRunner):
+    def __init__(
+        self,
+        connection_id: uuid.UUID,
+        credentials: dict[str, Any],
+        runner: RcloneRunner,
+        *,
+        operation_timeout_seconds: float | None = None,
+    ):
         self.connection_id = connection_id
         self.credentials = credentials
         self.runner = runner
         self.remote_name = f"ctm_{connection_id.hex}"
+        self.operation_timeout_seconds = operation_timeout_seconds
 
     def config_content(self) -> str:
         raise NotImplementedError
@@ -65,9 +73,18 @@ class RcloneStorageProvider(StorageProvider):
         if direction not in {"asc", "desc"}:
             raise ValueError("Unsupported sort direction")
         safe_path = MockStorageProvider.normalize_path(path)
-        stdout, _stderr = await self.runner.run(
-            "lsjson", [self.remote_path(safe_path)], self.config_content(), uuid.uuid4()
-        )
+        if self.operation_timeout_seconds is None:
+            stdout, _stderr = await self.runner.run(
+                "lsjson", [self.remote_path(safe_path)], self.config_content(), uuid.uuid4()
+            )
+        else:
+            stdout, _stderr = await self.runner.run(
+                "lsjson",
+                [self.remote_path(safe_path)],
+                self.config_content(),
+                uuid.uuid4(),
+                timeout_seconds=self.operation_timeout_seconds,
+            )
         entries = json.loads(stdout)
         if not isinstance(entries, list):
             raise ValueError("Rclone returned an invalid item list")

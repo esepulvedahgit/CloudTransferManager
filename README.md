@@ -1,6 +1,6 @@
 # Cloud Transfer Manager
 
-Aplicación web privada para explorar y copiar archivos entre MEGA y Google Drive. Las credenciales se cifran en el backend; tanto la navegación/prueba de conexión como las transferencias usan Rclone mediante argumentos separados y configuraciones temporales con permisos `0600`. El worker ejecuta los trabajos de copia; el MVP únicamente permite `COPY`.
+Aplicación web privada para explorar y copiar archivos entre MEGA, Google Drive, Seafile y recursos SMB privados. Las credenciales se cifran en el backend; tanto la navegación/prueba de conexión como las transferencias usan Rclone mediante argumentos separados y configuraciones temporales con permisos `0600`. El worker ejecuta los trabajos de copia; solo se permite `COPY`.
 
 ## Inicio local con Docker
 
@@ -26,6 +26,8 @@ docker compose exec backend python -m app.cli create-admin \
 El usuario deberá cambiar la contraseña inicial al entrar. Después, un administrador puede configurar conexiones MEGA/Google Drive, crear usuarios y asignar accesos a conexiones privadas desde la interfaz.
 
 Google Drive requiere un cliente OAuth web configurado en Google Cloud con URI de redirección `${APP_BASE_URL}/api/v1/connections/google-oauth/callback`. En la interfaz se ingresan el `client_id` y `client_secret`; la autorización y el intercambio del código ocurren en el servidor, y los tokens se cifran antes de guardarlos. La conexión queda inactiva hasta superar la prueba. MEGA requiere usuario y contraseña; el API nunca devuelve credenciales al frontend.
+
+Para migrar un NAS, configura primero el acceso de red del host Docker y `SMB_ALLOWED_TARGETS`; el worker y el backend deben alcanzar el NAS por la LAN o por una VPN externa ya disponible. CTM no administra la VPN. El acceso SMB se configura desde **Servicios privados**, separado de las conexiones cloud. Consulta [la guía de conexión y migración SMB](docs/integrations/smb-nas-setup.md) para rutas, firewall, límites y reanudación de transferencias.
 
 ## Verificación
 

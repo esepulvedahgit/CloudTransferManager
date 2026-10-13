@@ -9,11 +9,13 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -55,7 +57,7 @@ class StorageConnection(Base):
     __tablename__ = "storage_connections"
     __table_args__ = (
         CheckConstraint(
-            "provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE')",
+            "provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB')",
             name="ck_storage_provider_type",
         ),
         CheckConstraint(
@@ -86,9 +88,7 @@ class StorageConnection(Base):
 
 class SMTPSettings(Base):
     __tablename__ = "smtp_settings"
-    __table_args__ = (
-        CheckConstraint("scope = 'global'", name="ck_smtp_settings_global_scope"),
-    )
+    __table_args__ = (CheckConstraint("scope = 'global'", name="ck_smtp_settings_global_scope"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     scope: Mapped[str] = mapped_column(
@@ -136,6 +136,8 @@ class TransferJob(Base):
     destination_connection_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("storage_connections.id")
     )
+    source_credential_version: Mapped[int] = mapped_column(Integer, default=1)
+    destination_credential_version: Mapped[int] = mapped_column(Integer, default=1)
     source_paths: Mapped[list[str]] = mapped_column(JSON_VALUE)
     destination_path: Mapped[str] = mapped_column(String(1024))
     operation: Mapped[str] = mapped_column(String(16), default="COPY")
@@ -159,6 +161,42 @@ class TransferJob(Base):
     cancel_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class TransferManifestItem(Base):
+    __tablename__ = "transfer_manifest_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "transfer_job_id", "source_path_digest", name="uq_transfer_manifest_source"
+        ),
+        CheckConstraint(
+            "status IN ('DIRECTORY', 'PENDING', 'COPIED', 'SKIPPED', 'FAILED')",
+            name="ck_transfer_manifest_status",
+        ),
+        Index("ix_transfer_manifest_scan", "transfer_job_id", "is_dir", "scan_complete"),
+        Index("ix_transfer_manifest_status", "transfer_job_id", "status", "id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    transfer_job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("transfer_jobs.id", ondelete="CASCADE")
+    )
+    source_path: Mapped[str] = mapped_column(String(2048))
+    destination_path: Mapped[str] = mapped_column(String(2048))
+    source_path_digest: Mapped[str] = mapped_column(String(64))
+    is_dir: Mapped[bool] = mapped_column(Boolean, default=False)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    scan_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(16), default="PENDING")
+    copy_started: Mapped[bool] = mapped_column(Boolean, default=False)
+    destination_existed_before: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    verified_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

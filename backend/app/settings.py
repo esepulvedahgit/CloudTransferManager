@@ -20,12 +20,15 @@ class Settings(BaseSettings):
     postgres_password_file: str | None = None
     redis_url: str = "redis://redis:6379/0"
     rclone_binary: str = "/usr/bin/rclone"
+    smb_allowed_targets: str = ""
+    smb_interactive_timeout_seconds: int = Field(default=30, ge=1, le=300)
     megacmd_binary_dir: str = "/usr/bin"
     transfer_temp_path: str = "/var/lib/cloud-transfer/tmp"
     transfer_staging_path: str = "/var/lib/cloud-transfer/staging"
     transfer_max_retries: int = Field(default=5, ge=0)
     transfer_max_concurrent: int = Field(default=1, ge=1)
     transfer_max_files: int = Field(default=5000, ge=1)
+    smb_transfer_max_files: int = Field(default=100000, ge=1)
     transfer_max_file_bytes: int = Field(default=0, ge=0)
     transfer_staging_reserve_bytes: int = Field(default=1073741824, ge=0)
     transfer_staging_margin_percent: int = Field(default=20, ge=0, le=100)

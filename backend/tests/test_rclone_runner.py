@@ -223,6 +223,52 @@ async def test_cancellation_terminates_subprocess_and_removes_ephemeral_config(
 
 
 @pytest.mark.asyncio
+async def test_interactive_timeout_terminates_subprocess_and_removes_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    class SlowProcess:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.returncode = None
+            self._finished = asyncio.Event()
+            self.terminated = False
+
+        async def wait(self):
+            await self._finished.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+            self._finished.set()
+
+        def kill(self):
+            self.returncode = -9
+            self._finished.set()
+
+    process = SlowProcess()
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *args, **kwargs: _resolved(process)
+    )
+    runner = RcloneRunner("/usr/bin/rclone", str(tmp_path))
+
+    with pytest.raises(TimeoutError):
+        await runner.run(
+            "lsjson",
+            ["ctm_0123456789abcdef0123456789abcdef:/"],
+            "[mock]\ntype = smb\n",
+            uuid.uuid4(),
+            timeout_seconds=0.01,
+        )
+
+    assert process.terminated
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_copy_command_retains_only_bounded_process_output(monkeypatch, tmp_path):
     class NoisyProcess:
         def __init__(self):
@@ -311,9 +357,7 @@ async def test_local_copy_helpers_use_only_copy_and_accept_paths_inside_staging(
 
 
 @pytest.mark.asyncio
-async def test_local_directory_copy_creates_empty_folders_with_only_copy(
-    monkeypatch, tmp_path
-):
+async def test_local_directory_copy_creates_empty_folders_with_only_copy(monkeypatch, tmp_path):
     staging_root = tmp_path / "staging"
     source_directory = staging_root / "empty-folders" / "selected" / "nested"
     source_directory.mkdir(parents=True)
@@ -386,3 +430,29 @@ async def test_local_copy_helpers_reject_outside_and_symlink_paths(monkeypatch, 
 
 async def _resolved(value):
     return value
+
+
+def test_smb_remote_paths_use_a_share_relative_to_the_internal_remote():
+    runner = RcloneRunner("rclone", "/tmp/rclone")
+
+    command = runner.build_command(
+        "lsjson",
+        ["ctm_0123456789abcdef0123456789abcdef:Shared Data/Finance"],
+        "/tmp/job.conf",
+    )
+
+    assert command[1:3] == [
+        "lsjson",
+        "ctm_0123456789abcdef0123456789abcdef:Shared Data/Finance",
+    ]
+
+
+def test_smb_remote_path_rejects_share_relative_traversal():
+    runner = RcloneRunner("rclone", "/tmp/rclone")
+
+    with pytest.raises(ValueError, match="traversal"):
+        runner.build_command(
+            "lsjson",
+            ["ctm_0123456789abcdef0123456789abcdef:Share/../../etc"],
+            "/tmp/job.conf",
+        )

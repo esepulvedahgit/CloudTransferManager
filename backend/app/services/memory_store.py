@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -6,9 +7,7 @@ from typing import Any, Literal
 
 from app.security.sanitize import sanitize_data
 
-ACTIVE_TRANSFER_STATUSES = frozenset(
-    {"QUEUED", "VALIDATING", "RUNNING", "RETRYING", "CANCELLING"}
-)
+ACTIVE_TRANSFER_STATUSES = frozenset({"QUEUED", "VALIDATING", "RUNNING", "RETRYING", "CANCELLING"})
 
 
 class ConnectionInUseError(ValueError):
@@ -52,6 +51,7 @@ class ConnectionRecord:
     last_test_status: str | None = None
     is_global: bool = True
     deleted_at: datetime | None = None
+    credential_version: int = 1
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +86,8 @@ class TransferRecord:
     destination_connection_id: uuid.UUID
     source_paths: list[str]
     destination_path: str
+    source_credential_version: int = 1
+    destination_credential_version: int = 1
     conflict_policy: str = "OVERWRITE_IF_DIFFERENT"
     send_email_notification: bool = False
     status: str = "QUEUED"
@@ -135,16 +137,49 @@ class TransferRecord:
         }
 
 
+@dataclass
+class TransferManifestItemRecord:
+    id: uuid.UUID
+    transfer_id: uuid.UUID
+    source_path: str
+    destination_path: str
+    is_dir: bool
+    size_bytes: int | None = None
+    modified_at: datetime | None = None
+    scan_complete: bool = False
+    status: str = "PENDING"
+    copy_started: bool = False
+    destination_existed_before: bool = False
+    error_code: str | None = None
+    verified_by: str | None = None
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "source_path": self.source_path,
+            "destination_path": self.destination_path,
+            "is_dir": self.is_dir,
+            "size_bytes": self.size_bytes,
+            "modified_at": self.modified_at.isoformat() if self.modified_at else None,
+            "scan_complete": self.scan_complete,
+            "status": self.status,
+            "error_code": self.error_code,
+            "verified_by": self.verified_by,
+        }
+
+
 class MemoryStore:
     """In-memory repository for the mock vertical slice and isolated tests."""
 
     def __init__(self) -> None:
         self.users: dict[uuid.UUID, UserAccount] = {}
         self.connections: dict[uuid.UUID, ConnectionRecord] = {}
+        self._connection_credential_fingerprints: dict[uuid.UUID, bytes] = {}
         self.smtp_settings: SMTPSettingsRecord | None = None
         self.transfers: dict[uuid.UUID, TransferRecord] = {}
         self.connection_grants: set[tuple[uuid.UUID, uuid.UUID]] = set()
         self.transfer_events: dict[uuid.UUID, list[dict[str, Any]]] = {}
+        self.transfer_manifest_items: dict[tuple[uuid.UUID, str], TransferManifestItemRecord] = {}
         self.audit_events: list[dict[str, Any]] = []
 
     async def acheck(self) -> bool:
@@ -219,6 +254,7 @@ class MemoryStore:
             is_global=is_global,
         )
         self.connections[record.id] = record
+        self._connection_credential_fingerprints[record.id] = encrypted_credentials
         return record
 
     def get_connection(self, connection_id: uuid.UUID) -> ConnectionRecord | None:
@@ -227,9 +263,7 @@ class MemoryStore:
 
     def list_connections(self, user_id: uuid.UUID | None = None) -> list[ConnectionRecord]:
         connections: Iterable[ConnectionRecord] = (
-            connection
-            for connection in self.connections.values()
-            if connection.deleted_at is None
+            connection for connection in self.connections.values() if connection.deleted_at is None
         )
         if user_id is not None:
             connections = (
@@ -257,6 +291,8 @@ class MemoryStore:
         destination_path: str,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
         send_email_notification: bool = False,
+        source_credential_version: int = 1,
+        destination_credential_version: int = 1,
     ) -> TransferRecord:
         record = TransferRecord(
             id=uuid.uuid4(),
@@ -264,6 +300,8 @@ class MemoryStore:
             requested_by=requested_by,
             source_connection_id=source_connection_id,
             destination_connection_id=destination_connection_id,
+            source_credential_version=source_credential_version,
+            destination_credential_version=destination_credential_version,
             source_paths=source_paths,
             destination_path=destination_path,
             conflict_policy=conflict_policy,
@@ -334,8 +372,7 @@ class MemoryStore:
             return None
         if any(
             transfer.status in ACTIVE_TRANSFER_STATUSES
-            and connection_id
-            in {transfer.source_connection_id, transfer.destination_connection_id}
+            and connection_id in {transfer.source_connection_id, transfer.destination_connection_id}
             for transfer in self.transfers.values()
         ):
             raise ConnectionInUseError("Connection has an active transfer")
@@ -408,6 +445,14 @@ class MemoryStore:
         if current is None or current.deleted_at is not None:
             raise ConnectionUnavailableError("not_found")
         connection.deleted_at = current.deleted_at
+        previous_credentials = self._connection_credential_fingerprints.get(
+            connection.id, current.encrypted_credentials
+        )
+        if connection.encrypted_credentials != previous_credentials:
+            connection.credential_version = current.credential_version + 1
+        else:
+            connection.credential_version = current.credential_version
+        self._connection_credential_fingerprints[connection.id] = connection.encrypted_credentials
         self.connections[connection.id] = connection
 
     async def aget_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
@@ -432,6 +477,8 @@ class MemoryStore:
                 raise ConnectionUnavailableError("not_found")
             if connection.status != "ACTIVE":
                 raise ConnectionUnavailableError("inactive")
+        source = self.get_connection(source_connection_id)
+        destination = self.get_connection(destination_connection_id)
         return self.create_transfer(
             requested_by,
             source_connection_id,
@@ -440,10 +487,182 @@ class MemoryStore:
             destination_path,
             conflict_policy,
             send_email_notification,
+            source.credential_version if source else 1,
+            destination.credential_version if destination else 1,
         )
 
     async def asave_transfer(self, transfer: TransferRecord) -> None:
         self.transfers[transfer.id] = transfer
+
+    async def aadd_transfer_manifest_items(
+        self, transfer_id: uuid.UUID, entries: list[dict[str, Any]]
+    ) -> int:
+        if transfer_id not in self.transfers:
+            raise ValueError("Transfer not found")
+        inserted = 0
+        for entry in entries:
+            source_path = str(entry["source_path"])
+            digest = hashlib.sha256(f"{transfer_id}:{source_path}".encode()).hexdigest()
+            key = (transfer_id, digest)
+            if key in self.transfer_manifest_items:
+                continue
+            is_dir = bool(entry.get("is_dir", False))
+            self.transfer_manifest_items[key] = TransferManifestItemRecord(
+                id=uuid.uuid4(),
+                transfer_id=transfer_id,
+                source_path=source_path,
+                destination_path=str(entry["destination_path"]),
+                is_dir=is_dir,
+                size_bytes=entry.get("size_bytes"),
+                modified_at=entry.get("modified_at"),
+                status="DIRECTORY" if is_dir else "PENDING",
+            )
+            inserted += 1
+        files = [
+            item
+            for (item_transfer_id, _), item in self.transfer_manifest_items.items()
+            if item_transfer_id == transfer_id and not item.is_dir
+        ]
+        transfer = self.transfers[transfer_id]
+        transfer.files_total = len(files)
+        transfer.bytes_total = sum(item.size_bytes or 0 for item in files)
+        return inserted
+
+    async def alist_pending_scan_directories(
+        self, transfer_id: uuid.UUID, limit: int = 200
+    ) -> list[TransferManifestItemRecord]:
+        rows = [
+            item
+            for (item_transfer_id, _), item in self.transfer_manifest_items.items()
+            if item_transfer_id == transfer_id and item.is_dir and not item.scan_complete
+        ]
+        return sorted(rows, key=lambda item: item.id.int)[:limit]
+
+    async def amark_transfer_directory_scanned(
+        self, transfer_id: uuid.UUID, item_id: uuid.UUID
+    ) -> None:
+        item = self._manifest_item(transfer_id, item_id)
+        if item is None or not item.is_dir:
+            raise ValueError("Manifest directory not found")
+        item.scan_complete = True
+
+    async def amark_transfer_manifest_item_started(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        destination_existed_before: bool,
+    ) -> None:
+        item = self._manifest_item(transfer_id, item_id)
+        if item is None or item.is_dir:
+            raise ValueError("Manifest file not found")
+        if not item.copy_started:
+            item.copy_started = True
+            item.destination_existed_before = destination_existed_before
+
+    async def alist_transfer_manifest_items(
+        self,
+        transfer_id: uuid.UUID,
+        statuses: set[str] | None = None,
+        after_id: uuid.UUID | None = None,
+        limit: int = 200,
+        include_directories: bool = False,
+    ) -> list[TransferManifestItemRecord]:
+        allowed_statuses = statuses or {"PENDING"}
+        rows = [
+            item
+            for (item_transfer_id, _), item in self.transfer_manifest_items.items()
+            if item_transfer_id == transfer_id
+            and (include_directories or not item.is_dir)
+            and item.status in allowed_statuses
+            and (after_id is None or item.id.int > after_id.int)
+        ]
+        return sorted(rows, key=lambda item: item.id.int)[:limit]
+
+    async def aupdate_transfer_manifest_item(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        status: str,
+        verified_by: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        if status not in {"COPIED", "SKIPPED", "FAILED", "PENDING"}:
+            raise ValueError("Invalid manifest result")
+        item = self._manifest_item(transfer_id, item_id)
+        transfer = self.transfers.get(transfer_id)
+        if item is None or item.is_dir or transfer is None:
+            raise ValueError("Manifest file not found")
+        old_status = item.status
+        if (
+            old_status == status
+            and item.verified_by == verified_by
+            and item.error_code == error_code
+        ):
+            return
+        terminal = {"COPIED", "SKIPPED", "FAILED"}
+        if old_status not in terminal and status in terminal:
+            transfer.files_completed += 1
+        elif old_status in terminal and status not in terminal:
+            transfer.files_completed = max(0, transfer.files_completed - 1)
+        was_copied = old_status == "COPIED"
+        becomes_copied = status == "COPIED"
+        if was_copied != becomes_copied:
+            transfer.bytes_transferred = max(
+                0,
+                transfer.bytes_transferred
+                + ((item.size_bytes or 0) if becomes_copied else -(item.size_bytes or 0)),
+            )
+        if old_status == "FAILED":
+            transfer.error_count = max(0, transfer.error_count - 1)
+        if old_status in {"FAILED", "SKIPPED"}:
+            transfer.warning_count = max(0, transfer.warning_count - 1)
+        if status == "FAILED":
+            transfer.error_count += 1
+        if status in {"FAILED", "SKIPPED"}:
+            transfer.warning_count += 1
+        item.status = status
+        item.verified_by = verified_by
+        item.error_code = error_code
+        if transfer.bytes_total:
+            transfer.progress_percent = min(
+                100.0, round(transfer.bytes_transferred * 100 / transfer.bytes_total, 2)
+            )
+        elif transfer.files_total:
+            transfer.progress_percent = min(
+                100.0, round(transfer.files_completed * 100 / transfer.files_total, 2)
+            )
+
+    async def aget_transfer_manifest_counts(self, transfer_id: uuid.UUID) -> dict[str, int]:
+        rows = [
+            item
+            for (item_transfer_id, _), item in self.transfer_manifest_items.items()
+            if item_transfer_id == transfer_id
+        ]
+        return {
+            "total": len(rows),
+            "pending": sum(
+                1
+                for item in rows
+                if item.status == "PENDING" or (item.is_dir and not item.scan_complete)
+            ),
+            "copied": sum(1 for item in rows if item.status == "COPIED"),
+            "skipped": sum(1 for item in rows if item.status == "SKIPPED"),
+            "failed": sum(1 for item in rows if item.status == "FAILED"),
+        }
+
+    def _manifest_item(
+        self, transfer_id: uuid.UUID, item_id: uuid.UUID
+    ) -> TransferManifestItemRecord | None:
+        return next(
+            (
+                item
+                for (candidate_transfer, _), item in self.transfer_manifest_items.items()
+                if candidate_transfer == transfer_id and item.id == item_id
+            ),
+            None,
+        )
 
     async def aadd_transfer_event(
         self,

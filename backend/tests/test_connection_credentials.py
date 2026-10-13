@@ -367,3 +367,128 @@ async def test_changing_seafile_adapter_requires_a_new_connection_test(tmp_path:
     assert response.json()["adapter_type"] == "SEAFILE_API"
     assert response.json()["status"] == "INACTIVE"
     assert response.json()["last_test_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_smb_connection_credentials_are_encrypted_and_never_returned(tmp_path: Path):
+    master_key_file = tmp_path / "master_key"
+    master_key_file.write_bytes(b"m" * 32)
+    store = MemoryStore()
+    store.add_user(
+        username="admin",
+        email="admin@example.test",
+        password_hash=PasswordService().hash("SafePassword123!"),
+        role="ADMIN",
+    )
+    app = create_app(
+        Settings(
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+            master_encryption_key_file=str(master_key_file),
+            smb_allowed_targets="nas.example.internal",
+        ),
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        csrf = (await client.get("/api/v1/auth/csrf")).json()["csrf_token"]
+        await client.post(
+            "/api/v1/auth/login",
+            json={"username_or_email": "admin", "password": "SafePassword123!"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        response = await client.post(
+            "/api/v1/connections",
+            json={
+                "name": "NAS Finanzas",
+                "provider_type": "SMB",
+                "credentials": {
+                    "host": "nas.example.internal",
+                    "share": "Shared Data",
+                    "base_path": "Departments/Finance",
+                    "username": "migration-reader",
+                    "password": "private-password",
+                },
+            },
+            headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+        )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "INACTIVE"
+    assert response.json()["credentials_configured"] is True
+    assert "private-password" not in response.text
+    connection = next(iter(store.connections.values()))
+    assert b"private-password" not in connection.encrypted_credentials
+    assert (
+        CredentialCipher.from_secret_file(master_key_file).decrypt(
+            connection.id, connection.encrypted_credentials
+        )["share"]
+        == "Shared Data"
+    )
+
+
+@pytest.mark.asyncio
+async def test_smb_connection_test_checks_the_configured_share_root(monkeypatch, tmp_path: Path):
+    master_key_file = tmp_path / "master_key"
+    master_key_file.write_bytes(b"m" * 32)
+    store = MemoryStore()
+    store.add_user(
+        username="admin",
+        email="admin@example.test",
+        password_hash=PasswordService().hash("SafePassword123!"),
+        role="ADMIN",
+    )
+
+    class FakeRcloneRunner:
+        async def run(self, command, remote_paths, config_content, job_id, **kwargs):
+            assert command == "lsjson"
+            assert remote_paths[0].endswith(":Shared Data/Departments/Finance")
+            assert "type = smb" in config_content
+            return b"[]", b""
+
+    monkeypatch.setattr(main, "RcloneRunner", lambda *args: FakeRcloneRunner())
+    app = create_app(
+        Settings(
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+            master_encryption_key_file=str(master_key_file),
+            smb_allowed_targets="nas.example.internal",
+        ),
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        csrf = (await client.get("/api/v1/auth/csrf")).json()["csrf_token"]
+        await client.post(
+            "/api/v1/auth/login",
+            json={"username_or_email": "admin", "password": "SafePassword123!"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        headers = {"X-CSRF-Token": client.cookies["ctm_csrf"]}
+        connection_response = await client.post(
+            "/api/v1/connections",
+            json={
+                "name": "NAS Finanzas",
+                "provider_type": "SMB",
+                "credentials": {
+                    "host": "nas.example.internal",
+                    "share": "Shared Data",
+                    "base_path": "Departments/Finance",
+                    "username": "migration-reader",
+                    "password": "private-password",
+                },
+            },
+            headers=headers,
+        )
+        test_response = await client.post(
+            f"/api/v1/connections/{connection_response.json()['id']}/test",
+            headers=headers,
+        )
+
+    assert test_response.status_code == 200, test_response.text
+    assert test_response.json()["success"] is True
+    assert store.connections[next(iter(store.connections))].status == "ACTIVE"

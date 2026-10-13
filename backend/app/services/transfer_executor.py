@@ -4,7 +4,7 @@ import random
 import traceback
 import unicodedata
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -20,6 +20,7 @@ from app.providers.seafile_api import (
     SeafileApiError,
     SeafileApiProvider,
 )
+from app.providers.smb import RcloneSmbProvider
 from app.security.credentials import CredentialCipher
 from app.services.megacmd import (
     MegaCmdCancelledError,
@@ -27,7 +28,11 @@ from app.services.megacmd import (
     MegaCmdRunner,
     MegaCmdTimeoutError,
 )
-from app.services.memory_store import ConnectionRecord, TransferRecord
+from app.services.memory_store import (
+    ConnectionRecord,
+    TransferManifestItemRecord,
+    TransferRecord,
+)
 from app.services.rclone import RcloneCancelledError, RcloneCommandError, RcloneRunner
 from app.services.staging import StagingSpaceError, temporary_staging_area
 from app.services.telemetry import parse_mega_progress_line, parse_rclone_stats_line
@@ -94,7 +99,10 @@ class TransferExecutor:
             return
 
         try:
-            await self._run_rclone(record, source, destination)
+            if source.provider_type == "SMB":
+                await self._run_smb_transfer(record, source, destination)
+            else:
+                await self._run_rclone(record, source, destination)
         except (RcloneCancelledError, MegaCmdCancelledError, SeafileApiCancelledError):
             await self._cancel(record)
         except SeafileApiError as exc:
@@ -191,11 +199,519 @@ class TransferExecutor:
                 credentials,
                 self.runner,
             )
+        if connection.provider_type == "SMB":
+            return RcloneSmbProvider(
+                connection.id,
+                credentials,
+                self.runner,
+                allowed_targets={
+                    target.strip()
+                    for target in self.settings.smb_allowed_targets.split(",")
+                    if target.strip()
+                },
+                interactive_timeout_seconds=self.settings.smb_interactive_timeout_seconds,
+            )
         if connection.provider_type == "SEAFILE":
             if connection.adapter_type == "SEAFILE_API":
                 return SeafileApiProvider(connection.id, credentials)
             return SeafileRcloneProvider(connection.id, credentials, self.runner)
         raise ValueError("Unsupported provider")
+
+    async def _build_smb_manifest(self, record: TransferRecord, source: Any) -> None:
+        """Discover a NAS tree incrementally, persisting each page before advancing."""
+        selected: list[tuple[str, StorageItem]] = []
+        for requested_path in record.source_paths:
+            if await self.should_cancel():
+                raise RcloneCancelledError("SMB inventory cancelled")
+            normalized = MockStorageProvider.normalize_path(requested_path)
+            item = await self._smb_source_call(source.get_item(normalized))
+            if item is None:
+                raise FileNotFoundError(normalized)
+            item_path = MockStorageProvider.normalize_path(item.path)
+            if item_path != normalized:
+                raise ValueError("SMB source returned an unexpected path")
+            selected.append((normalized, item))
+
+        # Collapse duplicate and nested selections so each NAS subtree is inventoried once.
+        collapsed: list[tuple[str, StorageItem]] = []
+        for path, item in sorted(
+            selected, key=lambda row: (len(PurePosixPath(row[0]).parts), row[0])
+        ):
+            if any(
+                prior_item.is_dir
+                and (path == prior_path or path.startswith(prior_path.rstrip("/") + "/"))
+                for prior_path, prior_item in collapsed
+            ):
+                continue
+            collapsed.append((path, item))
+
+        destination_root = MockStorageProvider.normalize_path(record.destination_path)
+        root_entries: list[dict[str, Any]] = []
+        for source_path, item in collapsed:
+            name = PurePosixPath(source_path).name
+            destination_path = (
+                destination_root
+                if source_path == "/"
+                else MockStorageProvider.normalize_path(f"{destination_root.rstrip('/')}/{name}")
+            )
+            root_entries.append(
+                {
+                    "source_path": source_path,
+                    "destination_path": destination_path,
+                    "is_dir": item.is_dir,
+                    "size_bytes": item.size_bytes,
+                    "modified_at": item.modified_at,
+                }
+            )
+        destination_paths = [entry["destination_path"] for entry in root_entries]
+        if len(destination_paths) != len(set(destination_paths)):
+            raise self._PreflightError(
+                "SMB_DESTINATION_PATH_COLLISION",
+                "Dos elementos seleccionados apuntan a la misma ruta de destino. "
+                "Ajuste la selección o el destino antes de iniciar.",
+            )
+        await self.store.aadd_transfer_manifest_items(record.id, root_entries)
+
+        while True:
+            if await self.should_cancel():
+                raise RcloneCancelledError("SMB inventory cancelled")
+            directories = await self.store.alist_pending_scan_directories(record.id, limit=1)
+            if not directories:
+                break
+            directory = directories[0]
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            while True:
+                if await self.should_cancel():
+                    raise RcloneCancelledError("SMB inventory cancelled")
+                page = await self._smb_source_call(
+                    source.list_items(directory.source_path, cursor=cursor, page_size=200)
+                )
+                entries: list[dict[str, Any]] = []
+                for child in page.items:
+                    name = child.name
+                    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+                        raise ValueError("SMB returned an unsafe item name")
+                    child_path = MockStorageProvider.normalize_path(
+                        f"{directory.source_path.rstrip('/')}/{name}"
+                    )
+                    if MockStorageProvider.normalize_path(child.path) != child_path:
+                        raise ValueError("SMB returned an item outside the requested folder")
+                    entries.append(
+                        {
+                            "source_path": child_path,
+                            "destination_path": MockStorageProvider.normalize_path(
+                                f"{directory.destination_path.rstrip('/')}/{name}"
+                            ),
+                            "is_dir": child.is_dir,
+                            "size_bytes": child.size_bytes,
+                            "modified_at": child.modified_at,
+                        }
+                    )
+                await self.store.aadd_transfer_manifest_items(record.id, entries)
+                if page.next_cursor is None:
+                    break
+                if page.next_cursor in seen_cursors:
+                    raise ValueError("SMB returned a repeated page cursor")
+                seen_cursors.add(page.next_cursor)
+                cursor = page.next_cursor
+            await self.store.amark_transfer_directory_scanned(record.id, directory.id)
+            current = await self.store.aget_transfer(record.id)
+            if current is not None:
+                record.files_total = current.files_total
+                record.bytes_total = current.bytes_total
+            record.current_item = directory.source_path
+            await self.publish(record)
+
+        current = await self.store.aget_transfer(record.id)
+        if current is not None:
+            record.files_total = current.files_total
+            record.bytes_total = current.bytes_total
+        if record.files_total > self.settings.smb_transfer_max_files:
+            raise self._PreflightError(
+                "TRANSFER_FILE_LIMIT_EXCEEDED",
+                "La selección supera el máximo de archivos configurado para una transferencia SMB.",
+                {"maximum_files": self.settings.smb_transfer_max_files},
+            )
+        cursor_id: uuid.UUID | None = None
+        while True:
+            page = await self.store.alist_transfer_manifest_items(
+                record.id,
+                statuses={"PENDING", "FAILED"},
+                after_id=cursor_id,
+                limit=200,
+            )
+            if not page:
+                break
+            for item in page:
+                if item.size_bytes is None:
+                    raise self._PreflightError(
+                        "TRANSFER_FILE_SIZE_UNKNOWN",
+                        "El NAS no informó el tamaño de todos los archivos; no se inició la copia.",
+                        {"file_name": PurePosixPath(item.source_path).name},
+                    )
+                if (
+                    self.settings.transfer_max_file_bytes
+                    and item.size_bytes > self.settings.transfer_max_file_bytes
+                ):
+                    raise self._PreflightError(
+                        "TRANSFER_FILE_SIZE_LIMIT_EXCEEDED",
+                        "Un archivo supera el tamaño máximo permitido para una transferencia.",
+                        {
+                            "maximum_file_bytes": self.settings.transfer_max_file_bytes,
+                            "file_bytes": item.size_bytes,
+                        },
+                    )
+            cursor_id = page[-1].id
+
+    async def _run_smb_transfer(
+        self,
+        record: TransferRecord,
+        source_connection: ConnectionRecord,
+        destination_connection: ConnectionRecord,
+    ) -> None:
+        if destination_connection.provider_type not in {"GOOGLE_DRIVE", "MEGA", "SEAFILE"}:
+            await self._fail(record, error_code="PROVIDER_PAIR_UNSUPPORTED")
+            return
+        source = self._provider(source_connection)
+        destination = self._provider(destination_connection)
+        try:
+            await self._build_smb_manifest(record, source)
+        except FileNotFoundError:
+            await self._fail(record, error_code="SOURCE_ITEM_NOT_FOUND")
+            return
+        except self._PreflightError as exc:
+            await self._fail(
+                record,
+                error_code=exc.error_code,
+                message=exc.message,
+                technical_details=exc.technical_details,
+            )
+            return
+        record = await self.store.aget_transfer(record.id) or record
+        record.status = "RUNNING"
+        record.current_item = None
+        await self.publish(record)
+
+        destination_is_mega = destination_connection.provider_type == "MEGA"
+        destination_is_api = self._uses_seafile_api(destination_connection)
+        mega_session = None
+        async with AsyncExitStack() as stack:
+            if destination_is_mega:
+                mega_session = await stack.enter_async_context(
+                    destination.open_session(
+                        transfer_id=record.id,
+                        should_cancel=self.should_cancel,
+                    )
+                )
+            await self._create_smb_destination_directories(
+                record, destination, mega_session=mega_session
+            )
+
+            cursor_id: uuid.UUID | None = None
+            while True:
+                page = await self.store.alist_transfer_manifest_items(
+                    record.id,
+                    statuses={"PENDING", "FAILED"},
+                    after_id=cursor_id,
+                    limit=200,
+                )
+                if not page:
+                    break
+                for item in page:
+                    if await self.should_cancel():
+                        await self._cancel(record)
+                        return
+                    cursor_id = item.id
+                    record.current_item = item.source_path
+                    await self.publish(record)
+                    try:
+                        outcome = await self._copy_smb_manifest_file(
+                            record,
+                            source,
+                            destination,
+                            item,
+                            destination_is_mega=destination_is_mega,
+                            destination_is_api=destination_is_api,
+                            mega_session=mega_session,
+                        )
+                        status, verified_by, error_code = outcome
+                    except (RcloneCancelledError, MegaCmdCancelledError, SeafileApiCancelledError):
+                        raise
+                    except Exception as exc:
+                        status, verified_by = "FAILED", None
+                        error_code = (
+                            self._seafile_error_code(exc)
+                            if isinstance(exc, SeafileApiError)
+                            else "TRANSFER_NETWORK_UNAVAILABLE"
+                            if isinstance(exc, (RcloneCommandError, TimeoutError))
+                            and (not isinstance(exc, RcloneCommandError) or exc.retryable)
+                            else "SMB_FILE_COPY_FAILED"
+                        )
+                        await self.store.aadd_transfer_event(
+                            record.id,
+                            level="ERROR",
+                            event_type="SMB_FILE_COPY_FAILED",
+                            message="No se pudo copiar un archivo del NAS.",
+                            technical_details={"exception_type": type(exc).__name__},
+                            provider_error_code=error_code,
+                            item_path=item.source_path,
+                        )
+                    await self.store.aupdate_transfer_manifest_item(
+                        record.id,
+                        item.id,
+                        status=status,
+                        verified_by=verified_by,
+                        error_code=error_code,
+                    )
+                    record = await self.store.aget_transfer(record.id) or record
+                    record.current_item = item.source_path
+                    record.status = "RUNNING"
+                    await self.publish(record)
+
+        counts = await self.store.aget_transfer_manifest_counts(record.id)
+        record = await self.store.aget_transfer(record.id) or record
+        record.current_item = None
+        record.progress_percent = 100.0
+        record.status = (
+            "FAILED"
+            if counts["failed"]
+            else "COMPLETED_WITH_WARNINGS"
+            if counts["skipped"]
+            else "COMPLETED"
+        )
+        record.completed_at = datetime.now(UTC)
+        await self.publish(record)
+
+    async def _create_smb_destination_directories(
+        self,
+        record: TransferRecord,
+        destination: Any,
+        *,
+        mega_session: Any | None,
+    ) -> None:
+        root = MockStorageProvider.normalize_path(record.destination_path)
+        if self._uses_seafile_api_from_provider(destination):
+            mkdir = destination.mkdir
+            async for directory in self._iterate_smb_directories(record.id):
+                if await self.should_cancel():
+                    raise SeafileApiCancelledError("Transfer cancelled")
+                await mkdir(directory.destination_path, should_cancel=self.should_cancel)
+            return
+        if mega_session is not None:
+            async for directory in self._iterate_smb_directories(record.id):
+                if await self.should_cancel():
+                    raise MegaCmdCancelledError("Transfer cancelled")
+                await mega_session.mkdir(directory.destination_path)
+            return
+        if not root:
+            return
+        # One bounded local directory tree is enough for Rclone to create even
+        # empty NAS folders. Each manifest page is released before fetching the next.
+        async with temporary_staging_area(
+            Path(self.settings.transfer_staging_path),
+            transfer_id=record.id,
+            expected_size=0,
+        ) as staging_area:
+            has_directories = False
+            async for directory in self._iterate_smb_directories(record.id):
+                has_directories = True
+                relative = self._safe_destination_relative(root, directory.destination_path)
+                if relative:
+                    staging_area.joinpath(*PurePosixPath(relative).parts).mkdir(
+                        parents=True, exist_ok=True
+                    )
+            if has_directories:
+                await self.runner.copy_local_directory_to_remote(
+                    staging_area,
+                    destination.remote_path(root),
+                    destination.config_content(),
+                    record.id,
+                    should_cancel=self.should_cancel,
+                    conflict_policy=record.conflict_policy,
+                )
+
+    @staticmethod
+    def _uses_seafile_api_from_provider(provider: Any) -> bool:
+        return isinstance(provider, SeafileApiProvider)
+
+    async def _smb_source_call(self, operation: Awaitable[Any]) -> Any:
+        try:
+            return await operation
+        except (RcloneCommandError, TimeoutError, OSError) as exc:
+            details = {
+                "retryable": exc.retryable
+                if isinstance(exc, RcloneCommandError)
+                else True
+            }
+            raise self._PreflightError(
+                "SMB_SOURCE_UNAVAILABLE",
+                "No se pudo acceder al NAS durante el inventario. Compruebe la red local "
+                "o la VPN externa y vuelva a intentarlo.",
+                details,
+            ) from None
+
+    async def _iterate_smb_directories(
+        self, transfer_id: uuid.UUID
+    ) -> AsyncIterator[TransferManifestItemRecord]:
+        cursor_id: uuid.UUID | None = None
+        while True:
+            page = await self.store.alist_transfer_manifest_items(
+                transfer_id,
+                statuses={"DIRECTORY"},
+                after_id=cursor_id,
+                limit=200,
+                include_directories=True,
+            )
+            if not page:
+                return
+            for item in page:
+                yield item
+            cursor_id = page[-1].id
+
+    @staticmethod
+    def _safe_destination_relative(root: str, path: str) -> str:
+        normalized_root = MockStorageProvider.normalize_path(root)
+        normalized_path = MockStorageProvider.normalize_path(path)
+        if normalized_path == normalized_root:
+            return ""
+        prefix = normalized_root.rstrip("/") + "/"
+        if not normalized_path.startswith(prefix):
+            raise ValueError("SMB destination path escaped selected destination")
+        relative = normalized_path[len(prefix) :]
+        return TransferExecutor._safe_relative_path(relative)
+
+    async def _copy_smb_manifest_file(
+        self,
+        record: TransferRecord,
+        source: Any,
+        destination: Any,
+        item: Any,
+        *,
+        destination_is_mega: bool,
+        destination_is_api: bool,
+        mega_session: Any | None,
+    ) -> tuple[str, str | None, str | None]:
+        try:
+            source_item = await source.get_item(item.source_path)
+        except (RcloneCommandError, TimeoutError, OSError):
+            return "FAILED", None, "SMB_SOURCE_UNAVAILABLE"
+        if source_item is None or source_item.is_dir:
+            return "FAILED", None, "SOURCE_ITEM_NOT_FOUND"
+        if (
+            source_item.size_bytes != item.size_bytes
+            or not self._same_smb_modified_at(source_item.modified_at, item.modified_at)
+        ):
+            return "FAILED", None, "SOURCE_CHANGED_DURING_MIGRATION"
+        destination_item = await (
+            mega_session.get_item(item.destination_path)
+            if mega_session is not None
+            else destination.get_item(item.destination_path)
+        )
+        if destination_item is not None:
+            if destination_item.is_dir:
+                return "FAILED", None, "DESTINATION_PATH_IS_DIRECTORY"
+            if (
+                item.copy_started
+                and not item.destination_existed_before
+                and destination_item.size_bytes == item.size_bytes
+            ):
+                return "COPIED", "SIZE", None
+            if record.conflict_policy == "SKIP" or destination_is_mega:
+                if item.copy_started and not item.destination_existed_before:
+                    return "FAILED", None, "DESTINATION_VERIFICATION_FAILED"
+                return "SKIPPED", None, None
+        if not item.copy_started:
+            await self.store.amark_transfer_manifest_item_started(
+                record.id,
+                item.id,
+                destination_existed_before=destination_item is not None,
+            )
+            item.copy_started = True
+            item.destination_existed_before = destination_item is not None
+        if not item.copy_started:
+            await self.store.amark_transfer_manifest_item_started(
+                record.id,
+                item.id,
+                destination_existed_before=destination_item is not None,
+            )
+            item.copy_started = True
+            item.destination_existed_before = destination_item is not None
+
+        if not destination_is_mega and not destination_is_api:
+            config_content = source.config_content().rstrip() + "\n" + destination.config_content()
+            parent_path = PurePosixPath(item.destination_path).parent.as_posix()
+            if not parent_path.startswith("/"):
+                parent_path = f"/{parent_path}"
+            await self.runner.run(
+                "copy",
+                [source.remote_path(item.source_path), destination.remote_path(parent_path)],
+                config_content,
+                record.id,
+                should_cancel=self.should_cancel,
+                conflict_policy=record.conflict_policy,
+            )
+            if not await self._verify_rclone_destination(
+                destination, item.destination_path, item.size_bytes or 0
+            ):
+                raise RuntimeError("Destination did not confirm the copied file")
+            return "COPIED", "SIZE", None
+
+        async with temporary_staging_area(
+            Path(self.settings.transfer_staging_path),
+            transfer_id=record.id,
+            expected_size=item.size_bytes,
+            reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+            margin_percent=self.settings.transfer_staging_margin_percent,
+        ) as staging_area:
+            await self.runner.copy_remote_to_local(
+                source.remote_path(item.source_path),
+                staging_area,
+                source.config_content(),
+                record.id,
+                should_cancel=self.should_cancel,
+            )
+            local_file = staging_area / PurePosixPath(item.source_path).name
+            if not local_file.is_file() or local_file.stat().st_size != item.size_bytes:
+                return "FAILED", None, "SOURCE_SIZE_MISMATCH"
+            if destination_is_api:
+                stored_path = await destination.upload_file(
+                    local_file,
+                    item.destination_path,
+                    replace=record.conflict_policy != "SKIP",
+                    should_cancel=self.should_cancel,
+                )
+                digest = await _sha256_file(local_file, self.should_cancel)
+                if (
+                    await destination.sha256(stored_path, should_cancel=self.should_cancel)
+                    != digest
+                ):
+                    return "FAILED", None, "DESTINATION_VERIFICATION_FAILED"
+                return "COPIED", "SHA256", None
+            if mega_session is None:
+                raise RuntimeError("MEGA session is unavailable")
+            parent = PurePosixPath(item.destination_path).parent.as_posix()
+            if not parent.startswith("/"):
+                parent = f"/{parent}"
+            await mega_session.upload_file(
+                local_file,
+                parent,
+                should_cancel=self.should_cancel,
+            )
+            uploaded = await mega_session.get_item(item.destination_path)
+            if uploaded is None or uploaded.is_dir or uploaded.size_bytes != item.size_bytes:
+                return "FAILED", None, "DESTINATION_VERIFICATION_FAILED"
+            return "COPIED", "SIZE", None
+
+    @staticmethod
+    def _same_smb_modified_at(left: datetime | None, right: datetime | None) -> bool:
+        if left is None or right is None:
+            return left is right
+        normalized_left = left.replace(tzinfo=UTC) if left.tzinfo is None else left.astimezone(UTC)
+        normalized_right = (
+            right.replace(tzinfo=UTC) if right.tzinfo is None else right.astimezone(UTC)
+        )
+        return normalized_left == normalized_right
 
     async def _run_rclone(
         self,
@@ -440,9 +956,7 @@ class TransferExecutor:
                         await self.publish(record)
 
                     source_item = copy_items[path_index]
-                    destination_path = MockStorageProvider.normalize_path(
-                        record.destination_path
-                    )
+                    destination_path = MockStorageProvider.normalize_path(record.destination_path)
                     if source_item.is_dir:
                         selected_folder_name = PurePosixPath(
                             MockStorageProvider.normalize_path(path)
@@ -1048,9 +1562,7 @@ class TransferExecutor:
                             if isinstance(exc, SeafileApiError) and exc.retry_after is not None
                             else min(5 * (2 ** (attempt - 1)) + random.random(), 300)
                         )
-                        if not await self._wait_for_retry(
-                            record, delay, next_attempt=attempt + 1
-                        ):
+                        if not await self._wait_for_retry(record, delay, next_attempt=attempt + 1):
                             return
                     if completed:
                         break
@@ -1488,9 +2000,7 @@ class TransferExecutor:
                         record.estimated_remaining_seconds = None
                         await self.publish(record)
                         delay = min(5 * (2 ** (attempt - 1)) + random.random(), 300)
-                        if not await self._wait_for_retry(
-                            record, delay, next_attempt=attempt + 1
-                        ):
+                        if not await self._wait_for_retry(record, delay, next_attempt=attempt + 1):
                             return
                         continue
                     break

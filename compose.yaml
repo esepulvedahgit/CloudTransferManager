@@ -47,6 +47,9 @@ services:
       SMTP_PASSWORD_FILE: /run/ctm-secrets/smtp_password
       MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
       TRANSFER_STAGING_PATH: ${TRANSFER_STAGING_PATH:-/var/lib/cloud-transfer/staging}
+      SMB_ALLOWED_TARGETS: ${SMB_ALLOWED_TARGETS:-}
+      SMB_INTERACTIVE_TIMEOUT_SECONDS: ${SMB_INTERACTIVE_TIMEOUT_SECONDS:-30}
+      SMB_TRANSFER_MAX_FILES: ${SMB_TRANSFER_MAX_FILES:-100000}
     secrets:
       - app_secret_key
       - postgres_password
@@ -99,6 +102,9 @@ services:
       SMTP_PASSWORD_FILE: /run/ctm-secrets/smtp_password
       MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
       TRANSFER_STAGING_PATH: ${TRANSFER_STAGING_PATH:-/var/lib/cloud-transfer/staging}
+      SMB_ALLOWED_TARGETS: ${SMB_ALLOWED_TARGETS:-}
+      SMB_INTERACTIVE_TIMEOUT_SECONDS: ${SMB_INTERACTIVE_TIMEOUT_SECONDS:-30}
+      SMB_TRANSFER_MAX_FILES: ${SMB_TRANSFER_MAX_FILES:-100000}
     secrets:
       - postgres_password
       - master_key

@@ -31,6 +31,7 @@ from app.providers.seafile_auth import (
     SeafileAuthenticationError,
     normalize_seafile_base_url,
 )
+from app.providers.smb import RcloneSmbProvider
 from app.security.credentials import CredentialCipher
 from app.security.passwords import PasswordService
 from app.services.audit import AuditLogger
@@ -104,7 +105,7 @@ class PasswordReset(BaseModel):
 
 class ConnectionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    provider_type: str = Field(pattern="^(MOCK|MEGA|GOOGLE_DRIVE|SEAFILE)$")
+    provider_type: str = Field(pattern="^(MOCK|MEGA|GOOGLE_DRIVE|SEAFILE|SMB)$")
     adapter_type: str = Field(default="RCLONE", pattern="^(RCLONE|SEAFILE_API)$")
     credentials: dict[str, str] | None = None
     is_global: bool = True
@@ -342,6 +343,19 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 connection.id,
                 credentials,
                 RcloneRunner(config.rclone_binary, config.transfer_temp_path),
+            )
+        if provider_type == "SMB":
+            allowed_targets = {
+                target.strip().casefold().rstrip(".")
+                for target in config.smb_allowed_targets.split(",")
+                if target.strip()
+            }
+            return RcloneSmbProvider(
+                connection.id,
+                credentials,
+                RcloneRunner(config.rclone_binary, config.transfer_temp_path),
+                allowed_targets=allowed_targets,
+                interactive_timeout_seconds=config.smb_interactive_timeout_seconds,
             )
         if provider_type == "SEAFILE":
             runner = RcloneRunner(
@@ -844,9 +858,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
 
     def encrypt_smtp_values(settings_id: uuid.UUID, credentials: tuple[str, str]) -> bytes:
         try:
-            return encrypt_smtp_credentials(
-                config, settings_id, credentials[0], credentials[1]
-            )
+            return encrypt_smtp_credentials(config, settings_id, credentials[0], credentials[1])
         except (OSError, ValueError):
             raise HTTPException(
                 status_code=503, detail="No se pudieron guardar las credenciales SMTP"
@@ -1018,6 +1030,20 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                     MegaCmdProvider.validate_credentials(validation_credentials)
                 elif payload.provider_type == "SEAFILE":
                     validation_credentials = validate_seafile_credentials(validation_credentials)
+                elif payload.provider_type == "SMB":
+                    validation_credentials = RcloneSmbProvider.validate_credentials(
+                        validation_credentials
+                    )
+                    provider_for(
+                        ConnectionRecord(
+                            id=connection_id,
+                            name=payload.name,
+                            provider_type="SMB",
+                            created_by=user.id,
+                            encrypted_credentials=b"",
+                        ),
+                        validation_credentials,
+                    ).config_content()
                 else:
                     validation_credentials.setdefault("refresh_token", "oauth-pending")
                     RcloneGoogleDriveProvider(
@@ -1232,6 +1258,11 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                     MegaCmdProvider.validate_credentials(payload.credentials)
                 elif connection.provider_type == "SEAFILE":
                     payload.credentials = validate_seafile_credentials(payload.credentials)
+                elif connection.provider_type == "SMB":
+                    payload.credentials = RcloneSmbProvider.validate_credentials(
+                        payload.credentials
+                    )
+                    provider_for(connection, payload.credentials).config_content()
                 else:
                     RcloneGoogleDriveProvider(
                         connection.id,
@@ -1558,6 +1589,118 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         record = await visible_transfer(transfer_id, user)
         return {"items": await app.state.store.alist_transfer_events(record.id)}
 
+    @app.get("/api/v1/transfers/{transfer_id}/items")
+    async def list_transfer_items(
+        transfer_id: uuid.UUID,
+        after_id: uuid.UUID | None = None,
+        limit: int = Query(default=200, ge=1, le=200),
+        user: UserAccount = Depends(current_user),
+    ) -> dict[str, Any]:
+        record = await visible_transfer(transfer_id, user)
+        items = await app.state.store.alist_transfer_manifest_items(
+            record.id,
+            statuses={"DIRECTORY", "PENDING", "COPIED", "SKIPPED", "FAILED"},
+            after_id=after_id,
+            limit=limit,
+            include_directories=True,
+        )
+        return {
+            "items": [item.public_dict() for item in items],
+            "next_cursor": str(items[-1].id) if len(items) == limit else None,
+            "counts": await app.state.store.aget_transfer_manifest_counts(record.id),
+        }
+
+    @app.post("/api/v1/transfers/{transfer_id}/resume", status_code=status.HTTP_202_ACCEPTED)
+    async def resume_transfer(
+        transfer_id: uuid.UUID,
+        request: Request,
+        user: UserAccount = Depends(current_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        record = await visible_transfer(transfer_id, user)
+        if record.status not in {"FAILED", "CANCELLED"}:
+            raise HTTPException(status_code=409, detail="La transferencia no se puede reanudar")
+        if record.source_credential_version < 1 or record.destination_credential_version < 1:
+            raise HTTPException(
+                status_code=409, detail="La transferencia no tiene una versión de origen válida"
+            )
+        source = await app.state.store.aget_connection(record.source_connection_id)
+        destination = await app.state.store.aget_connection(record.destination_connection_id)
+        if source is None or destination is None:
+            raise HTTPException(
+                status_code=409, detail="No se puede reanudar: una conexión ya no existe"
+            )
+        if source.provider_type != "SMB":
+            raise HTTPException(
+                status_code=409, detail="Solo se pueden reanudar transferencias SMB"
+            )
+        if (
+            source.credential_version != record.source_credential_version
+            or destination.credential_version != record.destination_credential_version
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Las credenciales o la raíz SMB cambiaron; cree una nueva transferencia.",
+            )
+        if source.status != "ACTIVE" or destination.status != "ACTIVE":
+            raise HTTPException(status_code=409, detail="Una conexión está inactiva")
+        if user.role != "ADMIN":
+            for connection_id in (source.id, destination.id):
+                if not await app.state.store.ahas_connection_access(user.id, connection_id):
+                    raise HTTPException(status_code=404, detail="Transferencia no encontrada")
+        counts = await app.state.store.aget_transfer_manifest_counts(record.id)
+        if counts["pending"] == 0 and counts["failed"] == 0:
+            raise HTTPException(status_code=409, detail="No hay elementos pendientes para reanudar")
+
+        if app.state.event_bus:
+            await app.state.event_bus.clear_cancel(str(transfer_id))
+        app.state.cancel_requests.discard(transfer_id)
+        record.status = "QUEUED"
+        record.attempt_count += 1
+        record.completed_at = None
+        record.current_item = None
+        record.current_speed_bps = None
+        record.estimated_remaining_seconds = None
+        await publish_transfer(record)
+        await audit_request(
+            request,
+            actor_user_id=user.id,
+            action="TRANSFER_RESUMED",
+            resource_type="transfer",
+            resource_id=str(record.id),
+            result="SUCCESS",
+            metadata={"public_id": record.public_id, "attempt_count": record.attempt_count},
+        )
+        if config.app_env.lower() == "production":
+            try:
+                from app.worker import run_transfer
+
+                run_transfer.delay(str(record.id))
+            except Exception as exc:
+                record.status = "FAILED"
+                record.error_count += 1
+                record.completed_at = datetime.now(UTC)
+                await publish_transfer(record)
+                raise HTTPException(
+                    status_code=503, detail="No se pudo agendar la transferencia"
+                ) from exc
+        else:
+
+            async def should_cancel_resumed_transfer() -> bool:
+                return await cancel_requested(record.id)
+
+            executor = TransferExecutor(
+                config,
+                app.state.store,
+                publish_transfer,
+                should_cancel_resumed_transfer,
+            )
+            task = asyncio.create_task(executor.execute(record.id))
+            app.state.tasks.add(task)
+            task.add_done_callback(app.state.tasks.discard)
+        return record.public_dict()
+
     @app.get("/api/v1/transfers/{transfer_id}/stream")
     async def stream_transfer(
         transfer_id: uuid.UUID, user: UserAccount = Depends(current_user)
@@ -1572,9 +1715,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 await pubsub.subscribe(channel)
                 deadline = asyncio.get_running_loop().time() + 5
                 while asyncio.get_running_loop().time() < deadline:
-                    message = await pubsub.get_message(
-                        ignore_subscribe_messages=False, timeout=1
-                    )
+                    message = await pubsub.get_message(ignore_subscribe_messages=False, timeout=1)
                     if (
                         message is not None
                         and message.get("type") == "subscribe"

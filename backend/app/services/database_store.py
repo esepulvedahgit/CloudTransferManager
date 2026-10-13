@@ -18,6 +18,7 @@ from app.models import (
     TransferCounter,
     TransferEvent,
     TransferJob,
+    TransferManifestItem,
     User,
     UserConnectionGrant,
 )
@@ -28,6 +29,7 @@ from app.services.memory_store import (
     ConnectionRecord,
     ConnectionUnavailableError,
     SMTPSettingsRecord,
+    TransferManifestItemRecord,
     TransferRecord,
     UserAccount,
 )
@@ -58,9 +60,7 @@ class DatabaseStore:
         return True
 
     @asynccontextmanager
-    async def transfer_execution_lock(
-        self, transfer_id: uuid.UUID
-    ) -> AsyncIterator[bool]:
+    async def transfer_execution_lock(self, transfer_id: uuid.UUID) -> AsyncIterator[bool]:
         """Hold a PostgreSQL session lock for the full lifetime of one worker task."""
         async with self.engine.connect() as connection:
             if connection.dialect.name != "postgresql":
@@ -123,9 +123,7 @@ class DatabaseStore:
             await session.execute(
                 statement.on_conflict_do_nothing(index_elements=[SMTPSettings.scope])
             )
-            row = await session.scalar(
-                select(SMTPSettings).where(SMTPSettings.scope == "global")
-            )
+            row = await session.scalar(select(SMTPSettings).where(SMTPSettings.scope == "global"))
             if row is None:
                 raise RuntimeError("SMTP settings reservation failed")
             await session.commit()
@@ -183,6 +181,7 @@ class DatabaseStore:
             created_by=row.created_by,
             encrypted_credentials=bytes(row.encrypted_credentials),
             status=row.status,
+            credential_version=row.credential_version,
             last_tested_at=row.last_tested_at,
             last_test_status=row.last_test_status,
             is_global=row.is_global,
@@ -197,6 +196,8 @@ class DatabaseStore:
             requested_by=row.requested_by,
             source_connection_id=row.source_connection_id,
             destination_connection_id=row.destination_connection_id,
+            source_credential_version=row.source_credential_version,
+            destination_credential_version=row.destination_credential_version,
             source_paths=list(row.source_paths),
             destination_path=row.destination_path,
             conflict_policy=row.conflict_policy,
@@ -217,6 +218,24 @@ class DatabaseStore:
             created_at=row.created_at,
             started_at=row.started_at,
             completed_at=row.completed_at,
+        )
+
+    @staticmethod
+    def _manifest_item(row: TransferManifestItem) -> TransferManifestItemRecord:
+        return TransferManifestItemRecord(
+            id=row.id,
+            transfer_id=row.transfer_job_id,
+            source_path=row.source_path,
+            destination_path=row.destination_path,
+            is_dir=row.is_dir,
+            size_bytes=row.size_bytes,
+            modified_at=row.modified_at,
+            scan_complete=row.scan_complete,
+            status=row.status,
+            copy_started=row.copy_started,
+            destination_existed_before=row.destination_existed_before,
+            error_code=row.error_code,
+            verified_by=row.verified_by,
         )
 
     async def acreate_user(
@@ -386,9 +405,11 @@ class DatabaseStore:
 
     async def alist_connections(self, user_id: uuid.UUID | None = None) -> list[ConnectionRecord]:
         async with self.sessions() as session:
-            statement = select(StorageConnection).where(
-                StorageConnection.deleted_at.is_(None)
-            ).order_by(StorageConnection.name)
+            statement = (
+                select(StorageConnection)
+                .where(StorageConnection.deleted_at.is_(None))
+                .order_by(StorageConnection.name)
+            )
             if user_id is not None:
                 granted = select(UserConnectionGrant.connection_id).where(
                     UserConnectionGrant.user_id == user_id
@@ -451,7 +472,10 @@ class DatabaseStore:
                 row.last_tested_at = connection.last_tested_at
                 row.last_test_status = connection.last_test_status
                 row.is_global = connection.is_global
+                if bytes(row.encrypted_credentials) != connection.encrypted_credentials:
+                    row.credential_version += 1
                 row.encrypted_credentials = connection.encrypted_credentials
+                connection.credential_version = row.credential_version
 
     async def _next_public_id(self, session: AsyncSession) -> str:
         year = datetime.now(UTC).year
@@ -508,6 +532,10 @@ class DatabaseStore:
                     conflict_policy=conflict_policy,
                     send_email_notification=send_email_notification,
                     status="QUEUED",
+                    source_credential_version=by_id[source_connection_id].credential_version,
+                    destination_credential_version=by_id[
+                        destination_connection_id
+                    ].credential_version,
                 )
                 session.add(row)
                 await session.flush()
@@ -548,6 +576,256 @@ class DatabaseStore:
             row.started_at = transfer.started_at
             row.completed_at = transfer.completed_at
             await session.commit()
+
+    async def aadd_transfer_manifest_items(
+        self, transfer_id: uuid.UUID, entries: list[dict[str, Any]]
+    ) -> int:
+        if not entries:
+            return 0
+        async with self.sessions() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else "postgresql"
+            insert = pg_insert if dialect == "postgresql" else sqlite_insert
+            inserted = 0
+            async with session.begin():
+                for start in range(0, len(entries), 200):
+                    values = []
+                    for entry in entries[start : start + 200]:
+                        source_path = str(entry["source_path"])
+                        is_dir = bool(entry.get("is_dir", False))
+                        values.append(
+                            {
+                                "id": uuid.uuid4(),
+                                "transfer_job_id": transfer_id,
+                                "source_path": source_path,
+                                "destination_path": str(entry["destination_path"]),
+                                "source_path_digest": hashlib.sha256(
+                                    f"{transfer_id}:{source_path}".encode()
+                                ).hexdigest(),
+                                "is_dir": is_dir,
+                                "size_bytes": entry.get("size_bytes"),
+                                "modified_at": entry.get("modified_at"),
+                                "scan_complete": False,
+                                "status": "DIRECTORY" if is_dir else "PENDING",
+                                "copy_started": False,
+                                "destination_existed_before": False,
+                            }
+                        )
+                    statement = insert(TransferManifestItem).values(values)
+                    result = await session.execute(
+                        statement.on_conflict_do_nothing(
+                            index_elements=[
+                                TransferManifestItem.transfer_job_id,
+                                TransferManifestItem.source_path_digest,
+                            ]
+                        ).returning(TransferManifestItem.id)
+                    )
+                    inserted += len(result.scalars().all())
+                transfer = await session.get(TransferJob, transfer_id)
+                if transfer is None:
+                    raise ValueError("Transfer not found")
+                transfer.files_total = int(
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(TransferManifestItem)
+                        .where(
+                            TransferManifestItem.transfer_job_id == transfer_id,
+                            TransferManifestItem.is_dir.is_(False),
+                        )
+                    )
+                    or 0
+                )
+                transfer.bytes_total = int(
+                    await session.scalar(
+                        select(func.coalesce(func.sum(TransferManifestItem.size_bytes), 0)).where(
+                            TransferManifestItem.transfer_job_id == transfer_id,
+                            TransferManifestItem.is_dir.is_(False),
+                        )
+                    )
+                    or 0
+                )
+            return inserted
+
+    async def alist_pending_scan_directories(
+        self, transfer_id: uuid.UUID, limit: int = 200
+    ) -> list[TransferManifestItemRecord]:
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.is_dir.is_(True),
+                        TransferManifestItem.scan_complete.is_(False),
+                    )
+                    .order_by(TransferManifestItem.id)
+                    .limit(max(1, min(limit, 1000)))
+                )
+            ).all()
+            return [self._manifest_item(row) for row in rows]
+
+    async def amark_transfer_directory_scanned(
+        self, transfer_id: uuid.UUID, item_id: uuid.UUID
+    ) -> None:
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(TransferManifestItem).where(
+                    TransferManifestItem.transfer_job_id == transfer_id,
+                    TransferManifestItem.id == item_id,
+                    TransferManifestItem.is_dir.is_(True),
+                )
+            )
+            if row is None:
+                raise ValueError("Manifest directory not found")
+            row.scan_complete = True
+            await session.commit()
+
+    async def amark_transfer_manifest_item_started(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        destination_existed_before: bool,
+    ) -> None:
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(TransferManifestItem)
+                .where(
+                    TransferManifestItem.transfer_job_id == transfer_id,
+                    TransferManifestItem.id == item_id,
+                    TransferManifestItem.is_dir.is_(False),
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ValueError("Manifest file not found")
+            if not row.copy_started:
+                row.copy_started = True
+                row.destination_existed_before = destination_existed_before
+            await session.commit()
+
+    async def alist_transfer_manifest_items(
+        self,
+        transfer_id: uuid.UUID,
+        statuses: set[str] | None = None,
+        after_id: uuid.UUID | None = None,
+        limit: int = 200,
+        include_directories: bool = False,
+    ) -> list[TransferManifestItemRecord]:
+        async with self.sessions() as session:
+            statement = select(TransferManifestItem).where(
+                TransferManifestItem.transfer_job_id == transfer_id,
+            )
+            if not include_directories:
+                statement = statement.where(TransferManifestItem.is_dir.is_(False))
+            if statuses:
+                statement = statement.where(TransferManifestItem.status.in_(statuses))
+            if after_id is not None:
+                statement = statement.where(TransferManifestItem.id > after_id)
+            rows = (
+                await session.scalars(
+                    statement.order_by(TransferManifestItem.id).limit(max(1, min(limit, 1000)))
+                )
+            ).all()
+            return [self._manifest_item(row) for row in rows]
+
+    async def aupdate_transfer_manifest_item(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        status: str,
+        verified_by: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        if status not in {"COPIED", "SKIPPED", "FAILED", "PENDING"}:
+            raise ValueError("Invalid manifest result")
+        async with self.sessions() as session:
+            async with session.begin():
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                item = await session.scalar(
+                    select(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.id == item_id,
+                        TransferManifestItem.is_dir.is_(False),
+                    )
+                    .with_for_update()
+                )
+                if transfer is None or item is None:
+                    raise ValueError("Manifest file not found")
+                old_status = item.status
+                if (
+                    old_status == status
+                    and item.verified_by == verified_by
+                    and item.error_code == error_code
+                ):
+                    return
+                terminal = {"COPIED", "SKIPPED", "FAILED"}
+                if old_status not in terminal and status in terminal:
+                    transfer.files_completed += 1
+                elif old_status in terminal and status not in terminal:
+                    transfer.files_completed = max(0, transfer.files_completed - 1)
+                was_copied = old_status == "COPIED"
+                becomes_copied = status == "COPIED"
+                if was_copied != becomes_copied:
+                    transfer.bytes_transferred = max(
+                        0,
+                        transfer.bytes_transferred
+                        + ((item.size_bytes or 0) if becomes_copied else -(item.size_bytes or 0)),
+                    )
+                if old_status == "FAILED":
+                    transfer.error_count = max(0, transfer.error_count - 1)
+                if old_status in {"FAILED", "SKIPPED"}:
+                    transfer.warning_count = max(0, transfer.warning_count - 1)
+                if status == "FAILED":
+                    transfer.error_count += 1
+                if status in {"FAILED", "SKIPPED"}:
+                    transfer.warning_count += 1
+                item.status = status
+                item.verified_by = verified_by
+                item.error_code = error_code
+                if transfer.bytes_total:
+                    transfer.progress_percent = min(
+                        100.0,
+                        round(transfer.bytes_transferred * 100 / transfer.bytes_total, 2),
+                    )
+                elif transfer.files_total:
+                    transfer.progress_percent = min(
+                        100.0,
+                        round(transfer.files_completed * 100 / transfer.files_total, 2),
+                    )
+
+    async def aget_transfer_manifest_counts(self, transfer_id: uuid.UUID) -> dict[str, int]:
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(TransferManifestItem.status, func.count())
+                    .where(TransferManifestItem.transfer_job_id == transfer_id)
+                    .group_by(TransferManifestItem.status)
+                )
+            ).all()
+            counts = {status: int(count) for status, count in rows}
+            pending_directories = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.is_dir.is_(True),
+                        TransferManifestItem.scan_complete.is_(False),
+                    )
+                )
+                or 0
+            )
+            return {
+                "total": sum(counts.values()),
+                "pending": counts.get("PENDING", 0) + pending_directories,
+                "copied": counts.get("COPIED", 0),
+                "skipped": counts.get("SKIPPED", 0),
+                "failed": counts.get("FAILED", 0),
+            }
 
     async def aadd_transfer_event(
         self,
