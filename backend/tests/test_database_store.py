@@ -76,6 +76,116 @@ def test_transfer_counter_year_is_not_database_generated():
 
 
 @pytest.mark.asyncio
+async def test_database_store_aggregates_manifest_summaries_for_transfer_page(tmp_path):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'manifest-summary.sqlite'}"
+    store = DatabaseStore(Settings(database_url=database_url))
+    await store.create_schema()
+    user = await store.acreate_user(
+        "manifest-owner", "manifest-owner@example.test", "hash", "ADMIN"
+    )
+    source = await store.acreate_connection("NAS", "SMB", user.id, uuid.uuid4(), b"source")
+    destination = await store.acreate_connection(
+        "Drive", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"destination"
+    )
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/NAS"], "/Archive"
+    )
+    entries = [
+        {"source_path": "/folder", "destination_path": "/Archive/folder", "is_dir": True},
+        {
+            "source_path": "/copied.bin",
+            "destination_path": "/Archive/copied.bin",
+            "is_dir": False,
+            "size_bytes": 4,
+        },
+        {
+            "source_path": "/failed.bin",
+            "destination_path": "/Archive/failed.bin",
+            "is_dir": False,
+            "size_bytes": 3,
+        },
+        {
+            "source_path": "/skipped.bin",
+            "destination_path": "/Archive/skipped.bin",
+            "is_dir": False,
+            "size_bytes": 2,
+        },
+        {
+            "source_path": "/pending.bin",
+            "destination_path": "/Archive/pending.bin",
+            "is_dir": False,
+            "size_bytes": 1,
+        },
+    ]
+
+    try:
+        await store.aadd_transfer_manifest_items(transfer.id, entries)
+        items = await store.alist_transfer_manifest_items(
+            transfer.id,
+            statuses={"PENDING"},
+            after_id=None,
+            limit=10,
+            include_directories=True,
+        )
+        statuses = {
+            "/copied.bin": "COPIED",
+            "/failed.bin": "FAILED",
+            "/skipped.bin": "SKIPPED",
+        }
+        for item in items:
+            if item.source_path in statuses:
+                await store.aupdate_transfer_manifest_item(
+                    transfer.id, item.id, status=statuses[item.source_path]
+                )
+
+        missing_id = uuid.uuid4()
+        summaries = await store.alist_transfer_manifest_summaries([transfer.id, missing_id])
+    finally:
+        await store.aclose()
+
+    assert summaries[transfer.id] == {"copied": 1, "failed": 1, "skipped": 1, "pending": 1}
+    assert summaries[missing_id] == {"copied": 0, "failed": 0, "skipped": 0, "pending": 0}
+
+
+@pytest.mark.asyncio
+async def test_database_store_live_manifest_progress_does_not_count_failed_empty_files_as_copied(
+    tmp_path,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'manifest-progress.sqlite'}"
+    store = DatabaseStore(Settings(database_url=database_url))
+    await store.create_schema()
+    user = await store.acreate_user(
+        "progress-owner", "progress-owner@example.test", "hash", "ADMIN"
+    )
+    source = await store.acreate_connection("NAS", "SMB", user.id, uuid.uuid4(), b"source")
+    destination = await store.acreate_connection(
+        "Drive", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"destination"
+    )
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/NAS"], "/Archive"
+    )
+    transfer.files_total = 1
+    await store.asave_transfer(transfer)
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [{
+            "source_path": "/empty.bin",
+            "destination_path": "/Archive/empty.bin",
+            "is_dir": False,
+            "size_bytes": 0,
+        }],
+    )
+    item = (await store.alist_transfer_manifest_items(transfer.id))[0]
+
+    await store.aupdate_transfer_manifest_item(transfer.id, item.id, status="FAILED")
+
+    refreshed = await store.aget_transfer(transfer.id)
+    await store.aclose()
+    assert refreshed is not None
+    assert refreshed.progress_percent < 100
+
+
+@pytest.mark.asyncio
 async def test_database_store_atomically_creates_one_smtp_settings_identity(tmp_path):
     key_file = tmp_path / "master_key"
     key_file.write_bytes(b"k" * 32)

@@ -30,10 +30,11 @@ Su objetivo primordial es proporcionar una interfaz visual y un motor robusto pa
 15. Panel web responsive con diseño enterprise (React + MUI).
 16. Despliegue completo y seguro mediante Docker Compose y Docker Secrets.
 17. Cifrado en reposo para credenciales sensibles (AES-256-GCM / Envelope con Master Key externa).
+18. Programación única de copias con zona horaria, modo automático/exclusivo y dependencias opcionales entre trabajos.
 
 ### Fuera del Alcance (Versiones Posteriores):
 - Proveedores adicionales: Amazon S3, Wasabi, MEGA S4, Azure Blob, OneDrive, Backblaze B2.
-- Transferencias programadas o recurrentes (CRON).
+- Programaciones recurrentes (CRON).
 - Sincronización bidireccional (`sync`).
 - Eliminación automática de archivos en origen (`move`).
 - Límites de ancho de banda o cuotas por usuario.
@@ -93,3 +94,10 @@ Su objetivo primordial es proporcionar una interfaz visual y un motor robusto pa
 28. La interfaz web es completamente responsive (Desktop >=1280px, Tablet 768-1279px, Móvil <768px).
 29. Las pruebas automatizadas (unitarias, integración y seguridad) pasan con éxito.
 30. El repositorio contiene documentación completa de instalación, variables de entorno y operación.
+
+### Criterios adicionales de programación
+- Una transferencia con fecha futura se conserva en PostgreSQL y se ejecuta una vez al llegar su hora, incluso si Beat estuvo detenido; las fechas vencidas se recuperan en el siguiente ciclo.
+- `AUTO` utiliza `TRANSFER_MAX_CONCURRENT` y deja en paralelo copias compatibles. Las copias que usan staging (SMB, MEGA y Seafile API) comparten un único cupo de staging.
+- `EXCLUSIVE` espera a que los trabajos ya admitidos terminen y actúa como barrera FIFO: los trabajos posteriores esperan hasta que la exclusiva finalice.
+- Una dependencia comienza cuando el padre termina en `COMPLETED` o `COMPLETED_WITH_WARNINGS`. Si termina en `FAILED` o `CANCELLED`, el hijo queda bloqueado hasta que se cambie su dependencia, se cancele o el padre se reanude.
+- Solo las transferencias pendientes y todavía no admitidas se pueden reprogramar o cancelar inmediatamente. Las ejecuciones admitidas se cancelan mediante el worker.

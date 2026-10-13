@@ -19,8 +19,20 @@ def test_frontend_uses_unprivileged_nginx_on_port_8080():
     assert "listen 8080;" in nginx_config
     assert '      - "8080"' in compose
     assert "http://127.0.0.1:8080/" in compose
-    assert "server frontend:8080;" in reverse_proxy
+    assert "server frontend:8080 resolve;" in reverse_proxy
     assert "    healthcheck:\n      disable: true" in compose
+
+
+def test_reverse_proxy_refreshes_service_ips_after_container_recreation():
+    reverse_proxy = (
+        PROJECT_ROOT / "infrastructure/nginx/reverse-proxy.conf"
+    ).read_text(encoding="utf-8")
+
+    assert "resolver 127.0.0.11 valid=10s ipv6=off;" in reverse_proxy
+    assert "zone ctm_backend 64k;" in reverse_proxy
+    assert "server backend:8000 resolve;" in reverse_proxy
+    assert "zone ctm_frontend 64k;" in reverse_proxy
+    assert "server frontend:8080 resolve;" in reverse_proxy
 
 
 def test_backend_root_bootstrap_has_scoped_trivy_exception_and_drops_privileges():

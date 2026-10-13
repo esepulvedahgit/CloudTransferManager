@@ -27,6 +27,17 @@ docker compose up -d --build backend worker
 
 El campo **Host** al agregar el NAS debe coincidir con uno de los destinos autorizados. El formulario guarda host, puerto, recurso compartido, carpeta base opcional, dominio y usuario; la contraseña queda cifrada en PostgreSQL. El recurso compartido y la carpeta base forman la raíz lógica que verá el explorador como `/`.
 
+## Validación funcional
+
+La conexión se validó desde **Servicios privados** con estos valores de esta instalación:
+
+- NAS: `192.168.1.11`, puerto TCP `445`.
+- Recurso compartido: `STORAGE` (sin `/` inicial).
+- Lista permitida: `SMB_ALLOWED_TARGETS=192.168.1.11`.
+- Resultado: la prueba de conexión desde la aplicación fue exitosa.
+
+Si `STORAGE` es una subcarpeta dentro de otro recurso compartido, configura el nombre del recurso compartido en ese campo y `STORAGE` como **Carpeta raíz**. Las credenciales se ingresan en la aplicación y no se incluyen en esta documentación.
+
 ## Flujo de migración
 
 1. Un administrador agrega y prueba el NAS desde **Servicios privados**.

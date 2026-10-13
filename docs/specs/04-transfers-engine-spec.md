@@ -47,7 +47,9 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
 12. **Listados completos:** Si la salida de `mega-ls` supera el límite de captura, el listado falla explícitamente; no se usa una lista parcial para navegar ni para declarar completa una transferencia.
 13. **Preevaluación acotada:** El POST valida permisos y forma de las rutas y responde sin consultar los proveedores. La validación remota e inventario ocurren en el worker antes de copiar. Se aceptan hasta 100 rutas por solicitud y hasta `TRANSFER_MAX_FILES` archivos por inventario de trabajo (predeterminado 5000). `TRANSFER_MAX_FILE_BYTES=0` desactiva el límite por archivo; un valor positivo lo activa. Un tamaño desconocido o una excedencia falla antes de modificar el destino. Los límites se evalúan contra el inventario previo a la copia. Rclone copia carpetas de forma recursiva y no ofrece una instantánea del origen: si durante la transferencia se agregan archivos o crece su tamaño, esos cambios pueden superar los límites preevaluados. Por eso, no se debe modificar el contenido del origen mientras se transfiere. Bajo cambios concurrentes, estos límites son una preevaluación de mejor esfuerzo, no una cuota estricta.
 14. **Progreso e integridad:** El progreso cuenta bytes lógicos del archivo una sola vez, aunque descarga y subida emitan sus propias métricas; se limita al tamaño informado y se reconcilia al finalizar. El tamaño local se compara con el origen. Antes de marcar un archivo Rclone como completado, se confirma que exista como archivo y tenga el mismo tamaño: hasta tres lecturas de 15 segundos, con pausas de 1 y 2 segundos. Si no se confirma, no se incrementa `files_completed` ni se vuelve a subir automáticamente. En `SKIP`, un elemento existente con tamaño distinto se conserva y queda como advertencia.
-15. **Diagnósticos seguros:** Los eventos guardan etapa, intento, nombre base del archivo cuando existe, tipo de excepción y ubicación de código acotada. No guardan texto crudo de excepción ni rutas del proveedor en los detalles técnicos.
+15. **Progreso SMB parcial:** La actualización tras cada archivo y el cierre usan bytes copiados, no archivos solo resueltos. Si existen elementos fallidos, omitidos o pendientes, el porcentaje queda por debajo de 100%, incluso cuando esos elementos tienen tamaño cero; para árboles sin bytes conocidos, el respaldo cuenta únicamente archivos copiados.
+16. **Resultado de inventario SMB:** `files_completed` representa elementos del inventario ya resueltos; puede incluir elementos `COPIED`, `SKIPPED` o `FAILED` y por sí solo no equivale a archivos copiados. El manifiesto es la fuente de verdad para los contadores `copied` (copiados y verificados), `failed` (con error de copia/verificación), `skipped` (omitidos por conflicto) y `pending` (aún no resueltos); los cuatro cuentan solo archivos y excluyen directorios. El porcentaje final SMB se calcula con los bytes copiados; si el total de bytes es cero, usa la proporción de archivos copiados. Si existe algún fallo, omisión o elemento pendiente, el porcentaje se limita a menos de 100 aunque todos los elementos estén resueltos. Una transferencia con elementos fallidos termina en `FAILED`; una con solo omisiones termina en `COMPLETED_WITH_WARNINGS`.
+17. **Diagnósticos seguros:** Los eventos guardan etapa, intento, nombre base del archivo cuando existe, tipo de excepción y ubicación de código acotada. Los fallos individuales SMB pueden incluir código de salida y si el error es reintentable. No guardan texto crudo de stderr/excepción ni rutas del proveedor en los detalles técnicos.
 
 ---
 
@@ -81,8 +83,12 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
      +----------+
 ```
 
+Una transferencia programada pasa por `SCHEDULED` hasta `scheduled_at`, luego se vuelve `QUEUED` y sigue la máquina existente. `QUEUED` también representa trabajos bloqueados por capacidad, dependencia o conexión; `wait_reason` explica el motivo.
+
 ### Estados y Semántica:
-- `QUEUED`: En cola esperando worker disponible.
+
+- `SCHEDULED`: Espera su fecha de inicio. Beat recupera fechas vencidas después de una interrupción.
+- `QUEUED`: En cola esperando capacidad, dependencias o disponibilidad de conexiones.
 - `VALIDATING`: Verificando existencia de origen y permisos de destino.
 - `RUNNING`: Proceso MEGAcmd o Rclone activo transfiriendo datos.
 - `CANCELLING`: Solicitud de cancelación recibida; enviando SIGTERM/SIGKILL al subproceso.
@@ -125,6 +131,30 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
 
 ## 6. Esquema de Base de Datos para Trabajos (`transfer_jobs`)
 
+El esquema mantiene la fila de transferencia existente y añade estos campos para programar y admitir trabajos de forma durable:
+
+```sql
+scheduled_at TIMESTAMP WITH TIME ZONE NULL,
+schedule_timezone VARCHAR(64) NOT NULL DEFAULT 'UTC',
+execution_mode VARCHAR(16) NOT NULL DEFAULT 'AUTO', -- AUTO | EXCLUSIVE
+depends_on_transfer_id UUID NULL REFERENCES transfer_jobs(id) ON DELETE RESTRICT,
+wait_reason VARCHAR(64) NULL,
+dispatch_token UUID NULL,
+dispatch_claimed_at TIMESTAMP WITH TIME ZONE NULL,
+execution_started_at TIMESTAMP WITH TIME ZONE NULL,
+execution_heartbeat_at TIMESTAMP WITH TIME ZONE NULL
+```
+
+El dispatcher serializa admisiones con un advisory lock transaccional y reserva cada transferencia antes de publicarla a Celery. El worker valida el token y vuelve a comprobar estado, permisos y versión de credenciales antes de ejecutar. Beat revisa pendientes cada 15 segundos; un token sin inicio se libera tras 120 segundos y un heartbeat vencido solo se marca interrumpido si el advisory lock de ejecución ya no está tomado. Los mensajes de reserva usan UUID nuevos para descartar entregas antiguas.
+
+`AUTO` respeta `TRANSFER_MAX_CONCURRENT`, las colisiones de lectura/escritura sobre conexiones y un cupo global de staging. `EXCLUSIVE` espera a que terminen los trabajos admitidos, levanta una barrera FIFO y evita admitir posteriores hasta finalizar. La programación no inicia una VPN ni expone el SMB: el worker debe tener conectividad de red vigente hacia el NAS.
+
+Las transferencias programadas o en espera se consultan aparte de la lista de historial. `background_only=true` devuelve trabajos activos que tienen fecha, modo exclusivo, dependencia o motivo de espera; `exclude_background=true` los omite del historial hasta que alcanzan un estado terminal. La API de listados agrega `manifest_summary` para que el historial SMB muestre resultados reales en vez de presentar `files_completed` como cantidad copiada.
+
+Los únicos padres que liberan un hijo son `COMPLETED` y `COMPLETED_WITH_WARNINGS`. `FAILED` y `CANCELLED` mantienen el hijo bloqueado para evitar una ejecución accidental.
+
+El esquema completo conserva las columnas ya existentes:
+
 ```sql
 CREATE TABLE transfer_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -137,6 +167,15 @@ CREATE TABLE transfer_jobs (
     operation VARCHAR(16) NOT NULL DEFAULT 'COPY',
     conflict_policy VARCHAR(32) NOT NULL DEFAULT 'OVERWRITE_IF_DIFFERENT',
     status VARCHAR(32) NOT NULL DEFAULT 'QUEUED',
+    scheduled_at TIMESTAMP WITH TIME ZONE NULL,
+    schedule_timezone VARCHAR(64) NOT NULL DEFAULT 'UTC',
+    execution_mode VARCHAR(16) NOT NULL DEFAULT 'AUTO',
+    depends_on_transfer_id UUID NULL REFERENCES transfer_jobs(id) ON DELETE RESTRICT,
+    wait_reason VARCHAR(64) NULL,
+    dispatch_token UUID NULL,
+    dispatch_claimed_at TIMESTAMP WITH TIME ZONE NULL,
+    execution_started_at TIMESTAMP WITH TIME ZONE NULL,
+    execution_heartbeat_at TIMESTAMP WITH TIME ZONE NULL,
     progress_percent NUMERIC(5, 2) NULL,
     files_total BIGINT NULL,
     files_completed BIGINT NOT NULL DEFAULT 0,
@@ -157,6 +196,7 @@ CREATE TABLE transfer_jobs (
 
 CREATE INDEX idx_transfer_jobs_status ON transfer_jobs(status);
 CREATE INDEX idx_transfer_jobs_requested_by ON transfer_jobs(requested_by);
+CREATE INDEX ix_transfer_dispatch ON transfer_jobs(status, scheduled_at, created_at);
 ```
 
 ---

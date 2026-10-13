@@ -360,6 +360,46 @@ button, input { font: inherit; }
   .header-navigation .MuiTab-root { transition: none; }
 }
 
+.background-transfers-trigger.MuiIconButton-root {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  color: #52637a;
+  border: 1px solid #e8edf4;
+  background: #f7f9fc;
+  transition: transform 140ms ease, background-color 160ms ease, color 160ms ease;
+}
+.background-transfers-trigger.MuiIconButton-root:hover { color: #2458bd; background: #edf3ff; }
+.background-transfers-trigger.MuiIconButton-root:active { transform: scale(.96); }
+.background-transfers-trigger .MuiBadge-badge { min-width: 17px; height: 17px; padding: 0 4px; border: 2px solid #fff; font-size: 10px; font-weight: 750; }
+.background-transfers-popover.MuiPaper-root {
+  width: min(380px, calc(100vw - 24px));
+  max-height: min(540px, calc(100vh - 100px));
+  overflow: hidden auto;
+  border: 1px solid #e4eaf2;
+  border-radius: 14px;
+  box-shadow: 0 18px 48px rgba(18,37,66,.18);
+  transform-origin: top right;
+}
+.background-transfers-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; padding: 16px 18px 12px; border-bottom: 1px solid #eef2f7; }
+.background-transfers-heading .MuiTypography-overline { font-size: 9px; font-weight: 750; letter-spacing: .12em; }
+.background-transfer-items { padding: 8px; }
+.background-transfer-item { min-width: 0; padding: 10px; border: 1px solid #edf1f6; border-radius: 10px; background: #fff; }
+.background-transfer-item-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.background-transfer-item-copy { min-width: 0; }
+.background-transfer-item-copy .MuiTypography-root:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.background-transfer-item .history-status.MuiChip-root { flex: 0 0 auto; }
+.background-transfer-detail { display: block; margin-top: 6px; }
+.background-transfer-progress-meta { display: flex; justify-content: space-between; gap: 10px; margin: 7px 0 4px; }
+.background-transfer-item .MuiLinearProgress-root { height: 4px; border-radius: 999px; background: #e9eef6; }
+.background-transfers-footer { display: flex; justify-content: flex-end; padding: 9px 12px; border-top: 1px solid #eef2f7; background: #fcfdff; }
+.background-transfers-footer .MuiButton-root { min-height: 34px; border-radius: 9px; color: #2458bd; font-weight: 700; }
+
+@media (prefers-reduced-motion: reduce) {
+  .background-transfers-trigger.MuiIconButton-root { transition: none; }
+  .background-transfers-trigger.MuiIconButton-root:active { transform: none; }
+}
+
 .transfer-action {
   position: relative;
   display: grid;
@@ -411,12 +451,25 @@ button, input { font: inherit; }
 .transfer-options .MuiFormControlLabel-root { margin-left: -5px; }
 .transfer-options .MuiFormControlLabel-label { line-height: 1.35; }
 .transfer-submit.MuiButton-root { min-width: 190px; min-height: 48px; padding-inline: 18px; white-space: nowrap; }
+.transfer-submit-actions { grid-column: 3; min-width: 190px; }
+.transfer-schedule-submit.MuiButton-root { min-height: 38px; border-color: #d5e0ef; color: #35506f; font-weight: 650; }
+.scheduled-transfer-list { overflow: hidden; border: 1px solid var(--line); border-radius: 16px !important; background: #fff; box-shadow: var(--soft-shadow); }
+.scheduled-list-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; border-bottom: 1px solid #eef2f7; }
+.scheduled-list-heading .MuiTypography-h6 { font-size: 17px; font-weight: 750; }
+.scheduled-transfer-row { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 18px; padding: 16px 20px; border-bottom: 1px solid #eef2f7; }
+.scheduled-transfer-row:last-child { border-bottom: 0; }
+.scheduled-transfer-main { min-width: 0; }
+.scheduled-transfer-meta { display: flex; flex-wrap: wrap; gap: 5px 18px; margin-top: 6px; }
+.scheduled-transfer-meta .MuiTypography-root { display: flex; align-items: baseline; gap: 6px; }
+.scheduled-transfer-meta span { color: #77869a; }
+.scheduled-wait-reason { display: block; margin-top: 6px; color: #52637a; }
+.scheduled-transfer-actions { flex-wrap: wrap; justify-content: flex-end; }
 
 @media (max-width: 1024px) {
   .transfer-action { grid-template-columns: minmax(0, 1fr) minmax(210px, .65fr); gap: 16px 22px; }
   .transfer-action-overview { grid-column: 1 / -1; }
   .transfer-options { grid-column: 1; width: 100%; }
-  .transfer-submit.MuiButton-root { grid-column: 2; justify-self: end; }
+  .transfer-submit-actions { grid-column: 2; justify-self: end; }
 }
 
 @media (max-width: 767px) {
@@ -430,6 +483,10 @@ button, input { font: inherit; }
   .transfer-route-connection .MuiTypography-root { font-size: 11px; }
   .transfer-destination-path { margin-left: 25px; font-size: 10px; }
   .transfer-options { grid-column: 1; width: 100%; }
-  .transfer-submit.MuiButton-root { grid-column: 1; justify-self: stretch; width: 100%; min-height: 48px; }
+  .transfer-submit-actions { grid-column: 1; justify-self: stretch; width: 100%; }
+  .transfer-submit-actions .MuiButton-root { width: 100%; }
+  .scheduled-list-heading { align-items: flex-start; padding: 15px 14px; }
+  .scheduled-transfer-row { grid-template-columns: minmax(0,1fr); gap: 10px; padding: 14px; }
+  .scheduled-transfer-actions { justify-content: flex-start; }
 }
 

@@ -9,8 +9,9 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlencode, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
@@ -180,12 +181,65 @@ class TransferCreate(BaseModel):
     operation: str = "COPY"
     conflict_policy: str = "OVERWRITE_IF_DIFFERENT"
     send_email_notification: bool = False
+    scheduled_at: datetime | None = None
+    schedule_timezone: str = "UTC"
+    execution_mode: Literal["AUTO", "EXCLUSIVE"] = "AUTO"
+    depends_on_transfer_id: uuid.UUID | None = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_scheduled_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.utcoffset() is None:
+            raise ValueError("La fecha programada debe incluir una zona horaria.")
+        normalized = value.astimezone(UTC)
+        if normalized <= datetime.now(UTC):
+            raise ValueError("La fecha programada debe ser futura.")
+        return normalized
+
+    @field_validator("schedule_timezone")
+    @classmethod
+    def validate_schedule_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("Selecciona una zona horaria válida.") from exc
+        return value
 
     @field_validator("source_paths")
     @classmethod
     def validate_source_path_limit(cls, value: list[str]) -> list[str]:
         if len(value) > 100:
             raise ValueError("Selecciona como máximo 100 rutas por transferencia.")
+        return value
+
+
+class TransferScheduleUpdate(BaseModel):
+    scheduled_at: datetime | None
+    schedule_timezone: str
+    execution_mode: Literal["AUTO", "EXCLUSIVE"]
+    depends_on_transfer_id: uuid.UUID | None = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_scheduled_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.utcoffset() is None:
+            raise ValueError("La fecha programada debe incluir una zona horaria.")
+        normalized = value.astimezone(UTC)
+        if normalized <= datetime.now(UTC):
+            raise ValueError("La fecha programada debe ser futura.")
+        return normalized
+
+    @field_validator("schedule_timezone")
+    @classmethod
+    def validate_schedule_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("Selecciona una zona horaria válida.") from exc
         return value
 
 
@@ -1504,6 +1558,12 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Ruta no válida") from exc
         try:
+            if payload.depends_on_transfer_id is not None:
+                parent = await app.state.store.aget_transfer(payload.depends_on_transfer_id)
+                if parent is None or (
+                    parent.requested_by != user.id and user.role != "ADMIN"
+                ):
+                    raise HTTPException(status_code=404, detail="Transferencia padre no encontrada")
             record = await app.state.store.acreate_transfer(
                 user.id,
                 source.id,
@@ -1512,6 +1572,10 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 safe_destination,
                 payload.conflict_policy,
                 payload.send_email_notification,
+                payload.scheduled_at,
+                payload.schedule_timezone,
+                payload.execution_mode,
+                payload.depends_on_transfer_id,
             )
         except ConnectionUnavailableError as exc:
             if exc.reason == "inactive":
@@ -1525,22 +1589,28 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             resource_type="transfer",
             resource_id=str(record.id),
             result="SUCCESS",
-            metadata={"public_id": record.public_id, "operation": "COPY"},
+            metadata={
+                "public_id": record.public_id,
+                "operation": "COPY",
+                "execution_mode": record.execution_mode,
+                "scheduled_at": record.scheduled_at.isoformat() if record.scheduled_at else None,
+                "depends_on_transfer_id": (
+                    str(record.depends_on_transfer_id)
+                    if record.depends_on_transfer_id
+                    else None
+                ),
+            },
         )
         if config.app_env.lower() == "production":
             try:
-                from app.worker import run_transfer
+                from app.worker import dispatch_pending_transfers
 
-                run_transfer.delay(str(record.id))
-            except Exception as exc:
-                record.status = "FAILED"
-                record.error_count += 1
-                record.completed_at = datetime.now(UTC)
-                await publish_transfer(record)
-                raise HTTPException(
-                    status_code=503, detail="No se pudo agendar la transferencia"
-                ) from exc
-        else:
+                dispatch_pending_transfers.delay()
+            except Exception:
+                # The transfer is persisted first; Celery Beat retries dispatch
+                # after a broker outage without losing the scheduled request.
+                pass
+        elif payload.scheduled_at is None:
 
             async def should_cancel_transfer() -> bool:
                 return await cancel_requested(record.id)
@@ -1562,16 +1632,114 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=404, detail="Transferencia no encontrada")
         return cast(TransferRecord, record)
 
+    @app.get("/api/v1/transfers/capabilities")
+    async def transfer_capabilities(
+        _user: UserAccount = Depends(current_user),
+    ) -> dict[str, Any]:
+        return {
+            "scheduled_transfers": True,
+            "recurrence": False,
+            "execution_modes": ["AUTO", "EXCLUSIVE"],
+            "max_parallel_transfers": config.transfer_max_concurrent,
+            "schedule_timezone_format": "IANA",
+        }
+
+    @app.patch("/api/v1/transfers/{transfer_id}")
+    async def update_transfer_schedule(
+        transfer_id: uuid.UUID,
+        payload: TransferScheduleUpdate,
+        request: Request,
+        user: UserAccount = Depends(current_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        record = await visible_transfer(transfer_id, user)
+        if record.status not in {"SCHEDULED", "QUEUED"} or record.dispatch_token is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Solo se puede reprogramar una transferencia pendiente de ejecución.",
+            )
+        if payload.depends_on_transfer_id is not None:
+            parent = await app.state.store.aget_transfer(payload.depends_on_transfer_id)
+            if parent is None or (
+                parent.requested_by != user.id and user.role != "ADMIN"
+            ):
+                raise HTTPException(status_code=404, detail="Transferencia padre no encontrada")
+        try:
+            updated = await app.state.store.aupdate_transfer_schedule(
+                transfer_id,
+                scheduled_at=payload.scheduled_at,
+                schedule_timezone=payload.schedule_timezone,
+                execution_mode=payload.execution_mode,
+                depends_on_transfer_id=payload.depends_on_transfer_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if updated is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "La transferencia ya está admitida para ejecución "
+                    "y no se puede reprogramar."
+                ),
+            )
+        await publish_transfer(updated)
+        await audit_request(
+            request,
+            actor_user_id=user.id,
+            action="TRANSFER_RESCHEDULED",
+            resource_type="transfer",
+            resource_id=str(transfer_id),
+            result="SUCCESS",
+            metadata={
+                "scheduled_at": updated.scheduled_at.isoformat() if updated.scheduled_at else None,
+                "execution_mode": updated.execution_mode,
+                "depends_on_transfer_id": (
+                    str(updated.depends_on_transfer_id)
+                    if updated.depends_on_transfer_id
+                    else None
+                ),
+            },
+        )
+        if config.app_env.lower() == "production":
+            try:
+                from app.worker import dispatch_pending_transfers
+
+                dispatch_pending_transfers.delay()
+            except Exception:
+                pass
+        return cast(dict[str, Any], updated.public_dict())
+
     @app.get("/api/v1/transfers")
     async def list_transfers(
         offset: int = Query(default=0, ge=0),
         page_size: int = Query(default=50, ge=1, le=200),
+        pending_only: bool = Query(default=False),
+        background_only: bool = Query(default=False),
+        exclude_background: bool = Query(default=False),
         user: UserAccount = Depends(current_user),
     ) -> dict[str, Any]:
         user_filter = None if user.role == "ADMIN" else user.id
-        records = await app.state.store.alist_transfers(user_filter)
+        records = await app.state.store.alist_transfers(
+            user_filter,
+            pending_only,
+            background_only,
+            exclude_background,
+        )
+        page_records = records[offset : offset + page_size]
+        summaries = await app.state.store.alist_transfer_manifest_summaries(
+            [record.id for record in page_records]
+        )
+        items = []
+        for record in page_records:
+            item = record.public_dict()
+            item["manifest_summary"] = summaries.get(
+                record.id,
+                {"copied": 0, "failed": 0, "skipped": 0, "pending": 0},
+            )
+            items.append(item)
         return {
-            "items": [record.public_dict() for record in records[offset : offset + page_size]],
+            "items": items,
             "total_count": len(records),
         }
 
@@ -1653,15 +1821,13 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         if counts["pending"] == 0 and counts["failed"] == 0:
             raise HTTPException(status_code=409, detail="No hay elementos pendientes para reanudar")
 
+        resumed = await app.state.store.aresume_transfer(transfer_id)
+        if resumed is None:
+            raise HTTPException(status_code=409, detail="La transferencia ya no se puede reanudar")
+        record = cast(TransferRecord, resumed)
         if app.state.event_bus:
             await app.state.event_bus.clear_cancel(str(transfer_id))
         app.state.cancel_requests.discard(transfer_id)
-        record.status = "QUEUED"
-        record.attempt_count += 1
-        record.completed_at = None
-        record.current_item = None
-        record.current_speed_bps = None
-        record.estimated_remaining_seconds = None
         await publish_transfer(record)
         await audit_request(
             request,
@@ -1674,17 +1840,12 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         )
         if config.app_env.lower() == "production":
             try:
-                from app.worker import run_transfer
+                from app.worker import dispatch_pending_transfers
 
-                run_transfer.delay(str(record.id))
-            except Exception as exc:
-                record.status = "FAILED"
-                record.error_count += 1
-                record.completed_at = datetime.now(UTC)
-                await publish_transfer(record)
-                raise HTTPException(
-                    status_code=503, detail="No se pudo agendar la transferencia"
-                ) from exc
+                dispatch_pending_transfers.delay()
+            except Exception:
+                # The resumed job remains queued in PostgreSQL for the next Beat tick.
+                pass
         else:
 
             async def should_cancel_resumed_transfer() -> bool:
@@ -1798,11 +1959,16 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         record = await visible_transfer(transfer_id, user)
         if record.status in {"COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "CANCELLED"}:
             raise HTTPException(status_code=409, detail="La transferencia ya terminó")
-        if app.state.event_bus:
-            await app.state.event_bus.request_cancel(str(transfer_id))
-        else:
-            app.state.cancel_requests.add(transfer_id)
-        record.status = "CANCELLING"
+        record, needs_worker_signal = await app.state.store.acancel_transfer(
+            transfer_id, datetime.now(UTC)
+        )
+        if record is None:
+            raise HTTPException(status_code=409, detail="La transferencia ya terminó")
+        if needs_worker_signal:
+            if app.state.event_bus:
+                await app.state.event_bus.request_cancel(str(transfer_id))
+            else:
+                app.state.cancel_requests.add(transfer_id)
         await publish_transfer(record)
         await audit_request(
             request,
@@ -1812,7 +1978,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             resource_id=str(transfer_id),
             result="SUCCESS",
         )
-        return record.public_dict()
+        return cast(dict[str, Any], record.public_dict())
 
     return app
 

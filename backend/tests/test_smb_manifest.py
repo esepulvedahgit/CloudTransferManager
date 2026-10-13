@@ -67,6 +67,67 @@ async def test_manifest_batches_are_idempotent_and_track_directory_and_file_resu
 
 
 @pytest.mark.asyncio
+async def test_memory_store_live_manifest_progress_does_not_count_failed_empty_files_as_copied():
+    store = MemoryStore()
+    transfer = transfer_record(uuid.uuid4())
+    transfer.files_total = 1
+    store.transfers[transfer.id] = transfer
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [manifest_entry("/empty.bin", is_dir=False, size_bytes=0)],
+    )
+    item = (await store.alist_transfer_manifest_items(transfer.id))[0]
+
+    await store.aupdate_transfer_manifest_item(transfer.id, item.id, status="FAILED")
+
+    refreshed = await store.aget_transfer(transfer.id)
+    assert refreshed is not None
+    assert refreshed.progress_percent < 100
+
+
+@pytest.mark.asyncio
+async def test_memory_store_aggregates_file_manifest_summaries_without_directories():
+    store = MemoryStore()
+    transfer = transfer_record(uuid.uuid4())
+    store.transfers[transfer.id] = transfer
+    entries = [
+        manifest_entry("/folder", is_dir=True),
+        manifest_entry("/copied.bin", is_dir=False, size_bytes=4),
+        manifest_entry("/failed.bin", is_dir=False, size_bytes=3),
+        manifest_entry("/skipped.bin", is_dir=False, size_bytes=2),
+        manifest_entry("/pending.bin", is_dir=False, size_bytes=1),
+    ]
+    await store.aadd_transfer_manifest_items(transfer.id, entries)
+    items = await store.alist_transfer_manifest_items(
+        transfer.id,
+        statuses={"PENDING"},
+        after_id=None,
+        limit=10,
+    )
+    statuses = {
+        "/copied.bin": "COPIED",
+        "/failed.bin": "FAILED",
+        "/skipped.bin": "SKIPPED",
+    }
+    for item in items:
+        if item.source_path in statuses:
+            await store.aupdate_transfer_manifest_item(
+                transfer.id, item.id, status=statuses[item.source_path]
+            )
+
+    missing_id = uuid.uuid4()
+    summaries = await store.alist_transfer_manifest_summaries([transfer.id, missing_id])
+
+    assert summaries[transfer.id] == {
+        "copied": 1,
+        "failed": 1,
+        "skipped": 1,
+        "pending": 1,
+    }
+    assert summaries[missing_id] == {"copied": 0, "failed": 0, "skipped": 0, "pending": 0}
+
+
+@pytest.mark.asyncio
 async def test_manifest_supports_more_than_five_thousand_files_in_fixed_size_batches():
     store = MemoryStore()
     transfer = transfer_record(uuid.uuid4())

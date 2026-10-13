@@ -123,6 +123,63 @@ services:
       - ctm_internal
       - provider_egress
 
+  control-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+        "--queues=control",
+      ]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/ctm-secrets/postgres_password
+    secrets:
+      - postgres_password
+    tmpfs:
+      - /run/ctm-secrets:mode=0700,size=1m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "beat",
+        "--loglevel=INFO",
+        "--pidfile=/tmp/celerybeat.pid",
+      ]
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped

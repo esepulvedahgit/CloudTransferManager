@@ -24,9 +24,22 @@ def test_transfer_and_notification_tasks_use_worker_queue():
     assert celery_app.conf.broker_transport_options["visibility_timeout"] >= 24 * 60 * 60
 
 
+def test_persistent_dispatcher_runs_on_a_separate_control_queue_every_15_seconds():
+    assert (
+        celery_app.conf.task_routes["app.worker.dispatch_pending_transfers"]["queue"]
+        == "control"
+    )
+    assert celery_app.conf.beat_schedule["dispatch-pending-transfers"]["schedule"] == 15.0
+    assert (
+        celery_app.conf.beat_schedule["dispatch-pending-transfers"]["options"]["queue"]
+        == "control"
+    )
+
+
 @pytest.mark.asyncio
 async def test_redelivered_transfer_does_not_run_or_clear_active_cancellation(monkeypatch):
     transfer_id = uuid.uuid4()
+    dispatch_token = uuid.uuid4()
     calls: list[str] = []
 
     class LockedStore:
@@ -34,6 +47,9 @@ async def test_redelivered_transfer_does_not_run_or_clear_active_cancellation(mo
         async def transfer_execution_lock(self, supplied_id):
             calls.append(f"lock:{supplied_id}")
             yield False
+
+        async def arelease_transfer_dispatch(self, supplied_id, supplied_token):
+            calls.append(f"release:{supplied_id}:{supplied_token}")
 
         async def aclose(self):
             calls.append("store_closed")
@@ -63,9 +79,14 @@ async def test_redelivered_transfer_does_not_run_or_clear_active_cancellation(mo
         lambda *_args, **_kwargs: pytest.fail("a duplicate delivery must not notify"),
     )
 
-    await worker._execute_transfer(transfer_id)
+    await worker._execute_transfer(transfer_id, dispatch_token)
 
-    assert calls == [f"lock:{transfer_id}", "event_bus_closed", "store_closed"]
+    assert calls == [
+        f"lock:{transfer_id}",
+        f"release:{transfer_id}:{dispatch_token}",
+        "event_bus_closed",
+        "store_closed",
+    ]
 
 
 @pytest.mark.asyncio

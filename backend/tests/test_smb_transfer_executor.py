@@ -86,6 +86,37 @@ class SmallSmbTree:
         return "[smb]\ntype = smb\n"
 
 
+class MultiFileSmbTree:
+    provider_type = "SMB"
+
+    def __init__(self, files: dict[str, int]) -> None:
+        self.items = {
+            "/NAS": StorageItem(name="NAS", path="/NAS", is_dir=True, provider_type="SMB")
+        }
+        for name, size in files.items():
+            path = f"/NAS/{name}"
+            self.items[path] = StorageItem(
+                name=name,
+                path=path,
+                is_dir=False,
+                size_bytes=size,
+                provider_type="SMB",
+            )
+
+    async def get_item(self, path: str) -> StorageItem | None:
+        return self.items.get(path)
+
+    async def list_items(self, path: str, cursor=None, page_size=200, **_kwargs):
+        children = [item for item in self.items.values() if item.path.rpartition("/")[0] == path]
+        return PaginatedItems(items=children, next_cursor=None, total_count=len(children))
+
+    def remote_path(self, path: str) -> str:
+        return f"ctm_{'1' * 32}:{path}"
+
+    def config_content(self) -> str:
+        return "[smb]\ntype = smb\n"
+
+
 class FakeCloudDestination:
     provider_type = "GOOGLE_DRIVE"
 
@@ -126,6 +157,70 @@ class FakeCopyRunner:
                 path.relative_to(local_directory).as_posix() for path in local_directory.rglob("*")
             )
         )
+
+
+class SelectiveFailureCopyRunner(FakeCopyRunner):
+    async def run(self, command, remote_paths, config, job_id, **kwargs):
+        if remote_paths[0].endswith("failed.bin"):
+            raise RcloneCommandError(23, b"temporary failure PRIVATE STDERR MARKER")
+        return await super().run(command, remote_paths, config, job_id, **kwargs)
+
+
+async def run_smb_transfer_case(
+    tmp_path: Path,
+    files: dict[str, int],
+    *,
+    conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+    preexisting_destination_items: list[StorageItem] | None = None,
+    failing_runner: bool = False,
+    published_progress: list[float] | None = None,
+):
+    store = MemoryStore()
+    actor = uuid.uuid4()
+    source_connection = ConnectionRecord(
+        id=uuid.uuid4(), name="NAS", provider_type="SMB", created_by=actor,
+        encrypted_credentials=b"encrypted",
+    )
+    destination_connection = ConnectionRecord(
+        id=uuid.uuid4(), name="Drive", provider_type="GOOGLE_DRIVE", created_by=actor,
+        encrypted_credentials=b"encrypted",
+    )
+    store.connections[source_connection.id] = source_connection
+    store.connections[destination_connection.id] = destination_connection
+    transfer = TransferRecord(
+        id=uuid.uuid4(), public_id="TRF-2026-000098", requested_by=actor,
+        source_connection_id=source_connection.id,
+        destination_connection_id=destination_connection.id,
+        source_paths=["/NAS"], destination_path="/Archive", conflict_policy=conflict_policy,
+    )
+    store.transfers[transfer.id] = transfer
+    source = MultiFileSmbTree(files)
+    destination = FakeCloudDestination()
+    for item in preexisting_destination_items or []:
+        destination.items[item.path] = item
+    runner_type = SelectiveFailureCopyRunner if failing_runner else FakeCopyRunner
+    runner = runner_type(destination)
+
+    async def publish(published_transfer):
+        if published_progress is not None:
+            published_progress.append(published_transfer.progress_percent)
+        return None
+
+    async def not_cancelled():
+        return False
+
+    executor = TransferExecutor(
+        Settings(transfer_temp_path=str(tmp_path), transfer_staging_path=str(tmp_path)),
+        store,
+        publish,
+        not_cancelled,
+        runner=runner,
+    )
+    executor._provider = lambda connection: (
+        source if connection.provider_type == "SMB" else destination
+    )
+    await executor._run_smb_transfer(transfer, source_connection, destination_connection)
+    return store, transfer
 
 
 @pytest.mark.asyncio
@@ -173,6 +268,86 @@ async def test_smb_inventory_is_persisted_page_by_page_above_legacy_file_limit(t
         transfer.id, statuses={"PENDING"}, after_id=None, limit=200
     )
     assert len(first_page) == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_size", [5, 0])
+async def test_smb_failed_manifest_item_does_not_report_100_percent(tmp_path, failed_size):
+    store, transfer = await run_smb_transfer_case(
+        tmp_path,
+        {"copied.bin": 7, "failed.bin": failed_size},
+        failing_runner=True,
+    )
+
+    assert transfer.status == "FAILED"
+    assert transfer.bytes_transferred == 7
+    if failed_size:
+        assert transfer.bytes_transferred < transfer.bytes_total
+    assert transfer.progress_percent < 100
+    assert transfer.files_completed == transfer.files_total == 2
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert counts["copied"] == 1
+    assert counts["failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_smb_live_progress_never_reaches_100_for_a_failed_empty_file(tmp_path):
+    published_progress: list[float] = []
+    await run_smb_transfer_case(
+        tmp_path,
+        {"failed.bin": 0},
+        failing_runner=True,
+        published_progress=published_progress,
+    )
+
+    assert published_progress
+    assert max(published_progress) < 100
+
+
+@pytest.mark.asyncio
+async def test_smb_skipped_manifest_item_reports_warning_summary(tmp_path):
+    skipped_item = StorageItem(
+        name="skipped.bin",
+        path="/Archive/NAS/skipped.bin",
+        is_dir=False,
+        size_bytes=5,
+        provider_type="GOOGLE_DRIVE",
+    )
+    store, transfer = await run_smb_transfer_case(
+        tmp_path,
+        {"copied.bin": 7, "skipped.bin": 5},
+        conflict_policy="SKIP",
+        preexisting_destination_items=[skipped_item],
+    )
+
+    assert transfer.status == "COMPLETED_WITH_WARNINGS"
+    assert transfer.bytes_total == 12
+    assert transfer.bytes_transferred == 7
+    assert transfer.progress_percent < 100
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert counts["copied"] == 1
+    assert counts["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_smb_copy_failure_records_safe_rclone_diagnostics(tmp_path):
+    store, transfer = await run_smb_transfer_case(
+        tmp_path,
+        {"copied.bin": 7, "failed.bin": 5},
+        failing_runner=True,
+    )
+
+    failure_events = [
+        event
+        for event in await store.alist_transfer_events(transfer.id)
+        if event["event_type"] == "SMB_FILE_COPY_FAILED"
+    ]
+    assert len(failure_events) == 1
+    details = failure_events[0]["technical_details"]
+    assert details["exception_type"] == "RcloneCommandError"
+    assert details["return_code"] == 23
+    assert details["retryable"] is True
+    assert "PRIVATE STDERR MARKER" not in str(details)
 
 
 @pytest.mark.asyncio

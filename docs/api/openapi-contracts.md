@@ -236,6 +236,8 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 
 ### `POST /api/v1/transfers`
 - Acepta hasta 100 rutas de origen y responde `201 Created` al registrar y agendar el trabajo. La existencia de cada ruta se valida en el worker para que una consulta lenta del proveedor no bloquee la solicitud HTTP.
+- `scheduled_at` opcional acepta una fecha futura con offset; el servidor la normaliza a UTC. `schedule_timezone` debe ser una zona IANA y conserva la zona mostrada en la interfaz. Si no se envía `scheduled_at`, el trabajo queda en la cola normal.
+- `execution_mode` opcional admite `AUTO` (predeterminado) o `EXCLUSIVE`. `depends_on_transfer_id` es opcional y solo libera el trabajo cuando el padre finaliza correctamente, incluso con advertencias.
 - El worker aplica `TRANSFER_MAX_FILES` (predeterminado 5000), el límite opcional `TRANSFER_MAX_FILE_BYTES` (0 = sin límite fijo) y la reserva de staging antes de escribir en destino. Si el preflight falla, la transferencia pasa a `FAILED`; el usuario puede ver el mensaje seguro en `/api/v1/transfers/{transfer_id}/events`.
 - **Request Body:**
 ```json
@@ -248,7 +250,11 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
   "destination_path": "/Migraciones/Octubre",
   "operation": "COPY",
   "conflict_policy": "OVERWRITE_IF_DIFFERENT",
-  "send_email_notification": true
+  "send_email_notification": true,
+  "scheduled_at": "2026-11-20T18:45:00-03:00",
+  "schedule_timezone": "America/Santiago",
+  "execution_mode": "AUTO",
+  "depends_on_transfer_id": null
 }
 ```
 - **Response `201 Created`:**
@@ -256,16 +262,33 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 {
   "id": "8e84620d-7a44-4ea4-a526-dab19de6b81c",
   "public_id": "TRF-2026-000001",
-  "status": "QUEUED",
+  "status": "SCHEDULED",
+  "scheduled_at": "2026-11-20T21:45:00Z",
+  "schedule_timezone": "America/Santiago",
+  "execution_mode": "AUTO",
+  "wait_reason": "WAITING_UNTIL",
   "created_at": "2026-10-10T10:15:00Z"
 }
 ```
+
+### `GET /api/v1/transfers/capabilities`
+- Informa si hay programación, recurrencia (por ahora `false`), modos de ejecución y capacidad global configurada.
+
+### `PATCH /api/v1/transfers/{transfer_id}`
+- Actualiza `scheduled_at`, `schedule_timezone`, `execution_mode` y `depends_on_transfer_id` mientras el trabajo siga `SCHEDULED` o `QUEUED` y todavía no tenga reserva de despacho.
+- Devuelve `409` si la transferencia ya fue admitida. Las fechas deben ser futuras; enviar `scheduled_at: null` la deja lista para ejecutarse al liberarse la cola.
+- `wait_reason` puede ser `WAITING_UNTIL`, `WAITING_PARENT`, `BLOCKED_PARENT_FAILED`, `WAITING_CAPACITY`, `WAITING_EXCLUSIVE`, `WAITING_CONNECTION`, `WAITING_STAGING`, `WAITING_CONNECTION_ACTIVE`, `WAITING_CONNECTION_ACCESS`, `WAITING_USER_ACTIVE` o `BLOCKED_CONNECTION_CHANGED`.
+- `can_edit_schedule` indica si el trabajo aún admite reprogramación.
 
 ### `GET /api/v1/transfers/{transfer_id}/stream`
 - **Response `200 OK`:** `Content-Type: text/event-stream` emitiendo telemetría en tiempo real.
 
 ### `GET /api/v1/transfers`
 - Devuelve historial paginado con `offset` y `page_size`; ADMIN ve todas las transferencias y USER solo las propias.
+- `pending_only=true` limita la lista a estados `SCHEDULED` y `QUEUED`, para recorrer la cola completa por páginas.
+- `background_only=true` limita la lista a tareas administradas por **Programaciones** que sigan en estados no terminales: `SCHEDULED`, `QUEUED`, `VALIDATING`, `RUNNING`, `RETRYING` o `CANCELLING`. Una tarea pertenece a Programaciones cuando tiene `scheduled_at`, `wait_reason`, modo `EXCLUSIVE` o una transferencia padre (`depends_on_transfer_id`). La respuesta conserva `total_count` después de aplicar el filtro de propietario.
+- `exclude_background=true` omite únicamente esas tareas no terminales de Programaciones. Las transferencias terminales, incluidas las programadas, siguen disponibles en la lista general.
+- Cada elemento incluye `manifest_summary`: `copied` son archivos copiados y verificados, `failed` son archivos con error, `skipped` son archivos omitidos por conflicto y `pending` son archivos aún no resueltos. Los cuatro contadores excluyen entradas de directorio. En SMB, `files_completed` cuenta elementos resueltos y no equivale a `copied`.
 
 ### `GET /api/v1/transfers/{transfer_id}`
 - Devuelve el estado y métricas actuales de la transferencia visible para el usuario.
@@ -274,7 +297,7 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 - Devuelve eventos auditables con categorías de error y detalles técnicos sanitizados; solo el solicitante o ADMIN puede consultarlos.
 
 ### `POST /api/v1/transfers/{transfer_id}/cancel`
-- **Response `200 OK`:** Envía orden de cancelación inmediata al worker.
+- Para una transferencia pendiente sin reserva, la cancela de inmediato. Si ya fue admitida, envía la orden al worker y pasa a `CANCELLING`.
 
 ## 7. Auditoría (`/audit-events`) [Solo ADMIN]
 

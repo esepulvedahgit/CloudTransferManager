@@ -36,6 +36,7 @@ from app.services.memory_store import (
 from app.services.rclone import RcloneCancelledError, RcloneCommandError, RcloneRunner
 from app.services.staging import StagingSpaceError, temporary_staging_area
 from app.services.telemetry import parse_mega_progress_line, parse_rclone_stats_line
+from app.services.transfer_progress import smb_manifest_progress_percent
 from app.settings import Settings
 
 
@@ -448,12 +449,20 @@ class TransferExecutor:
                             and (not isinstance(exc, RcloneCommandError) or exc.retryable)
                             else "SMB_FILE_COPY_FAILED"
                         )
+                        technical_details: dict[str, Any] = {
+                            "exception_type": type(exc).__name__
+                        }
+                        if isinstance(exc, RcloneCommandError):
+                            technical_details.update(
+                                return_code=exc.return_code,
+                                retryable=exc.retryable,
+                            )
                         await self.store.aadd_transfer_event(
                             record.id,
                             level="ERROR",
                             event_type="SMB_FILE_COPY_FAILED",
                             message="No se pudo copiar un archivo del NAS.",
-                            technical_details={"exception_type": type(exc).__name__},
+                            technical_details=technical_details,
                             provider_error_code=error_code,
                             item_path=item.source_path,
                         )
@@ -472,7 +481,12 @@ class TransferExecutor:
         counts = await self.store.aget_transfer_manifest_counts(record.id)
         record = await self.store.aget_transfer(record.id) or record
         record.current_item = None
-        record.progress_percent = 100.0
+        record.progress_percent = smb_manifest_progress_percent(
+            bytes_transferred=record.bytes_transferred,
+            bytes_total=record.bytes_total,
+            files_total=record.files_total,
+            counts=counts,
+        )
         record.status = (
             "FAILED"
             if counts["failed"]

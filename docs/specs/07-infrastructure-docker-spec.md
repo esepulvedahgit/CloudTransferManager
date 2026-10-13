@@ -33,21 +33,26 @@ Definir la topología de contenedores, la gestión de volúmenes persistentes, l
         +---------------+---------------+                               |
         |                               |                               v
         v :5432                         v :6379                 +---------------+
-+---------------+               +---------------+               |    worker     |
-|   postgres    |               |     redis     | <-----------+ | (Celery+MEGAcmd) |
-+---------------+               +---------------+               +---------------+
++---------------+               +---------------+       +---------------+   +---------------+
+|   postgres    |               |     redis     | <-----| control-worker|   |     beat      |
++---------------+               +---------------+       +---------------+   +---------------+
+                                          ^                       |
+                                          +-------- worker --------+
 ```
 
 ### Invariante de Red:
 - Uvicorn usa explícitamente `--loop asyncio`: MEGAcmd con login por stdin se bloquea bajo uvloop en este despliegue. No dejar la selección del event loop en `auto`.
 - Nginx enruta exactamente `/api/v1/transfers` al backend para GET/POST, sin agregar una barra ni redirigir. El prefijo `/api/v1/transfers/` conserva el streaming SSE sin buffering. La regresión se verifica con `docker compose exec -T --user ctm backend python < scripts/check_transfer_proxy.py`.
+- El reverse proxy usa el resolver DNS de Docker con resolución dinámica para backend y frontend; al recrear esos contenedores, Nginx actualiza sus IP sin reiniciar el proxy.
 - La imagen del worker incluye también Rclone para Google Drive.
 - Solo el servicio `reverse-proxy` expone puertos al exterior del host Docker; estos se publican explícitamente sobre `0.0.0.0` para acceso desde otros equipos de la red.
-- `postgres`, `redis`, `backend` y `worker` residen en la red interna `ctm_internal` sin mapeo de puertos al host.
+- `postgres`, `redis`, `backend`, `worker`, `control-worker` y `beat` residen en `ctm_internal` sin mapeo de puertos al host. El worker de transferencias conserva salida hacia proveedores; el worker de control solo necesita PostgreSQL y Redis.
+- `control-worker` consume la cola `control` y despacha reservas persistidas; `beat` solicita el despacho cada 15 segundos. Mantener una sola instancia de Beat por despliegue. Un advisory lock de PostgreSQL protege el despacho aunque coincidan una petición HTTP y un tick de Beat.
 - `reverse-proxy` también se conecta a la red dedicada `ctm_proxy_edge` (bridge no interno). Docker Engine 29 no materializa los puertos publicados para contenedores conectados únicamente a una red `internal`; mantener `ctm_internal` aislada evita dar salida externa a los servicios privados.
 - `0.0.0.0` escucha en todas las interfaces del host, no restringe el origen a la LAN. La restricción LAN-only depende del firewall del host y de no configurar reenvío de esos puertos en el router.
 - El frontend usa `nginxinc/nginx-unprivileged`, escucha en `8080` y ejecuta Nginx como UID `101`; el reverse proxy y el healthcheck apuntan a ese puerto.
 - La imagen del backend define un healthcheck HTTP predeterminado; Compose lo reemplaza para `backend` y lo desactiva en `worker`, que no expone HTTP.
+- Los trabajos programados requieren los servicios `beat` y `control-worker`; ambos son internos y no publican puertos.
 
 ---
 

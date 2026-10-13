@@ -121,10 +121,14 @@ class TransferJob(Base):
     __table_args__ = (
         CheckConstraint("operation = 'COPY'", name="ck_transfer_copy_only"),
         CheckConstraint(
-            "status IN ('QUEUED', 'VALIDATING', 'RUNNING', 'CANCELLING', 'CANCELLED', "
+            "status IN ('SCHEDULED', 'QUEUED', 'VALIDATING', 'RUNNING', 'CANCELLING', 'CANCELLED', "
             "'COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'RETRYING')",
             name="ck_transfer_status",
         ),
+        CheckConstraint(
+            "execution_mode IN ('AUTO', 'EXCLUSIVE')", name="ck_transfer_execution_mode"
+        ),
+        Index("ix_transfer_dispatch", "status", "scheduled_at", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -144,6 +148,25 @@ class TransferJob(Base):
     conflict_policy: Mapped[str] = mapped_column(String(32), default="OVERWRITE_IF_DIFFERENT")
     send_email_notification: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(32), default="QUEUED", index=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    schedule_timezone: Mapped[str] = mapped_column(
+        String(64), default="UTC", server_default="UTC"
+    )
+    execution_mode: Mapped[str] = mapped_column(String(16), default="AUTO", server_default="AUTO")
+    depends_on_transfer_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("transfer_jobs.id", ondelete="RESTRICT"), nullable=True
+    )
+    wait_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    dispatch_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    dispatch_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    execution_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    execution_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     progress_percent: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     files_total: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     files_completed: Mapped[int] = mapped_column(BigInteger, default=0)

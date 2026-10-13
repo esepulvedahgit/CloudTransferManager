@@ -1,6 +1,6 @@
 FROM python:3.12-slim-bookworm
 
-ARG RCLONE_VERSION=1.75.2
+ARG RCLONE_RELEASE=1.75.2
 ARG TARGETARCH=amd64
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -11,16 +11,19 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg gosu unzip; \
-    curl -fsSLo /tmp/rclone.zip \
-        "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-${TARGETARCH}.zip"; \
+    rclone_archive_name="rclone-v${RCLONE_RELEASE}-linux-${TARGETARCH}.zip"; \
+    curl -fsSLo "/tmp/${rclone_archive_name}" \
+        "https://downloads.rclone.org/v${RCLONE_RELEASE}/rclone-v${RCLONE_RELEASE}-linux-${TARGETARCH}.zip"; \
     curl -fsSLo /tmp/rclone-SHA256SUMS \
-        "https://downloads.rclone.org/v${RCLONE_VERSION}/SHA256SUMS"; \
+        "https://downloads.rclone.org/v${RCLONE_RELEASE}/SHA256SUMS"; \
     cd /tmp; \
-    grep "rclone-v${RCLONE_VERSION}-linux-${TARGETARCH}.zip" rclone-SHA256SUMS | sha256sum --check --status; \
-    unzip -q /tmp/rclone.zip -d /tmp/rclone; \
-    install -m 0755 "/tmp/rclone/rclone-v${RCLONE_VERSION}-linux-${TARGETARCH}/rclone" /usr/bin/rclone; \
-    test "$(/usr/bin/rclone version | head -n 1)" = "rclone v${RCLONE_VERSION}"; \
-    rm -rf /tmp/rclone /tmp/rclone.zip /tmp/rclone-SHA256SUMS; \
+    grep -F "  ${rclone_archive_name}" rclone-SHA256SUMS > /tmp/rclone-checksum; \
+    test -s /tmp/rclone-checksum; \
+    sha256sum --check --status /tmp/rclone-checksum; \
+    unzip -q "/tmp/${rclone_archive_name}" -d /tmp/rclone; \
+    install -m 0755 "/tmp/rclone/rclone-v${RCLONE_RELEASE}-linux-${TARGETARCH}/rclone" /usr/bin/rclone; \
+    test "$(/usr/bin/rclone version | head -n 1)" = "rclone v${RCLONE_RELEASE}"; \
+    rm -rf /tmp/rclone "/tmp/${rclone_archive_name}" /tmp/rclone-SHA256SUMS /tmp/rclone-checksum; \
     curl -fsSL https://mega.nz/linux/repo/Debian_12/Release.key -o /tmp/mega-release.key; \
     gpg --dearmor --yes -o /usr/share/keyrings/meganz-archive-keyring.gpg /tmp/mega-release.key; \
     rm /tmp/mega-release.key; \

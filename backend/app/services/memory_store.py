@@ -6,8 +6,11 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from app.security.sanitize import sanitize_data
+from app.services.transfer_progress import smb_manifest_progress_percent
 
-ACTIVE_TRANSFER_STATUSES = frozenset({"QUEUED", "VALIDATING", "RUNNING", "RETRYING", "CANCELLING"})
+ACTIVE_TRANSFER_STATUSES = frozenset(
+    {"SCHEDULED", "QUEUED", "VALIDATING", "RUNNING", "RETRYING", "CANCELLING"}
+)
 
 
 class ConnectionInUseError(ValueError):
@@ -91,6 +94,16 @@ class TransferRecord:
     conflict_policy: str = "OVERWRITE_IF_DIFFERENT"
     send_email_notification: bool = False
     status: str = "QUEUED"
+    scheduled_at: datetime | None = None
+    schedule_timezone: str = "UTC"
+    execution_mode: str = "AUTO"
+    depends_on_transfer_id: uuid.UUID | None = None
+    wait_reason: str | None = None
+    dispatch_token: uuid.UUID | None = None
+    dispatch_claimed_at: datetime | None = None
+    execution_started_at: datetime | None = None
+    execution_heartbeat_at: datetime | None = None
+    cancel_requested_at: datetime | None = None
     progress_percent: float = 0.0
     files_total: int = 0
     files_completed: int = 0
@@ -131,6 +144,18 @@ class TransferRecord:
             "destination_path": self.destination_path,
             "conflict_policy": self.conflict_policy,
             "send_email_notification": self.send_email_notification,
+            "scheduled_at": self.scheduled_at.isoformat() if self.scheduled_at else None,
+            "schedule_timezone": self.schedule_timezone,
+            "execution_mode": self.execution_mode,
+            "depends_on_transfer_id": (
+                str(self.depends_on_transfer_id) if self.depends_on_transfer_id else None
+            ),
+            "wait_reason": self.wait_reason,
+            "can_edit_schedule": (
+                self.status in {"SCHEDULED", "QUEUED"}
+                and self.dispatch_token is None
+                and self.execution_started_at is None
+            ),
             "created_at": self.created_at.isoformat(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -166,6 +191,15 @@ class TransferManifestItemRecord:
             "error_code": self.error_code,
             "verified_by": self.verified_by,
         }
+
+
+def is_programmed_background_transfer(transfer: TransferRecord) -> bool:
+    return transfer.status in ACTIVE_TRANSFER_STATUSES and bool(
+        transfer.scheduled_at is not None
+        or transfer.wait_reason is not None
+        or transfer.execution_mode == "EXCLUSIVE"
+        or transfer.depends_on_transfer_id is not None
+    )
 
 
 class MemoryStore:
@@ -293,7 +327,12 @@ class MemoryStore:
         send_email_notification: bool = False,
         source_credential_version: int = 1,
         destination_credential_version: int = 1,
+        scheduled_at: datetime | None = None,
+        schedule_timezone: str = "UTC",
+        execution_mode: str = "AUTO",
+        depends_on_transfer_id: uuid.UUID | None = None,
     ) -> TransferRecord:
+        is_scheduled = scheduled_at is not None and scheduled_at > datetime.now(UTC)
         record = TransferRecord(
             id=uuid.uuid4(),
             public_id=self.next_public_id(),
@@ -306,6 +345,12 @@ class MemoryStore:
             destination_path=destination_path,
             conflict_policy=conflict_policy,
             send_email_notification=send_email_notification,
+            status="SCHEDULED" if is_scheduled else "QUEUED",
+            scheduled_at=scheduled_at,
+            schedule_timezone=schedule_timezone,
+            execution_mode=execution_mode,
+            depends_on_transfer_id=depends_on_transfer_id,
+            wait_reason="WAITING_UNTIL" if is_scheduled else None,
         )
         self.transfers[record.id] = record
         return record
@@ -313,11 +358,20 @@ class MemoryStore:
     def get_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
         return self.transfers.get(transfer_id)
 
-    def list_transfers(self, requested_by: uuid.UUID | None = None) -> list[TransferRecord]:
+    def list_transfers(
+        self,
+        requested_by: uuid.UUID | None = None,
+        pending_only: bool = False,
+        background_only: bool = False,
+        exclude_background: bool = False,
+    ) -> list[TransferRecord]:
         records = [
             record
             for record in self.transfers.values()
-            if requested_by is None or record.requested_by == requested_by
+            if (requested_by is None or record.requested_by == requested_by)
+            and (not pending_only or record.status in {"SCHEDULED", "QUEUED"})
+            and (not background_only or is_programmed_background_transfer(record))
+            and (not exclude_background or not is_programmed_background_transfer(record))
         ]
         return sorted(records, key=lambda record: record.created_at, reverse=True)
 
@@ -458,8 +512,19 @@ class MemoryStore:
     async def aget_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
         return self.get_transfer(transfer_id)
 
-    async def alist_transfers(self, requested_by: uuid.UUID | None = None) -> list[TransferRecord]:
-        return self.list_transfers(requested_by)
+    async def alist_transfers(
+        self,
+        requested_by: uuid.UUID | None = None,
+        pending_only: bool = False,
+        background_only: bool = False,
+        exclude_background: bool = False,
+    ) -> list[TransferRecord]:
+        return self.list_transfers(
+            requested_by,
+            pending_only,
+            background_only,
+            exclude_background,
+        )
 
     async def acreate_transfer(
         self,
@@ -470,6 +535,10 @@ class MemoryStore:
         destination_path: str,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
         send_email_notification: bool = False,
+        scheduled_at: datetime | None = None,
+        schedule_timezone: str = "UTC",
+        execution_mode: str = "AUTO",
+        depends_on_transfer_id: uuid.UUID | None = None,
     ) -> TransferRecord:
         for connection_id in {source_connection_id, destination_connection_id}:
             connection = self.get_connection(connection_id)
@@ -489,10 +558,94 @@ class MemoryStore:
             send_email_notification,
             source.credential_version if source else 1,
             destination.credential_version if destination else 1,
+            scheduled_at,
+            schedule_timezone,
+            execution_mode,
+            depends_on_transfer_id,
         )
 
     async def asave_transfer(self, transfer: TransferRecord) -> None:
         self.transfers[transfer.id] = transfer
+
+    async def aupdate_transfer_schedule(
+        self,
+        transfer_id: uuid.UUID,
+        *,
+        scheduled_at: datetime | None,
+        schedule_timezone: str,
+        execution_mode: str,
+        depends_on_transfer_id: uuid.UUID | None,
+    ) -> TransferRecord | None:
+        transfer = self.transfers.get(transfer_id)
+        if (
+            transfer is None
+            or transfer.status not in {"SCHEDULED", "QUEUED"}
+            or transfer.dispatch_token is not None
+            or transfer.execution_started_at is not None
+        ):
+            return None
+        seen = {transfer_id}
+        ancestor_id = depends_on_transfer_id
+        while ancestor_id is not None:
+            if ancestor_id in seen:
+                raise ValueError("La dependencia crearía un ciclo.")
+            seen.add(ancestor_id)
+            ancestor = self.transfers.get(ancestor_id)
+            if ancestor is None:
+                raise ValueError("La transferencia padre no existe.")
+            ancestor_id = ancestor.depends_on_transfer_id
+        transfer.scheduled_at = scheduled_at
+        transfer.schedule_timezone = schedule_timezone
+        transfer.execution_mode = execution_mode
+        transfer.depends_on_transfer_id = depends_on_transfer_id
+        due_later = scheduled_at is not None and scheduled_at > datetime.now(UTC)
+        transfer.status = "SCHEDULED" if due_later else "QUEUED"
+        transfer.wait_reason = "WAITING_UNTIL" if due_later else None
+        return transfer
+
+    async def acancel_transfer(
+        self, transfer_id: uuid.UUID, now: datetime
+    ) -> tuple[TransferRecord | None, bool]:
+        transfer = self.transfers.get(transfer_id)
+        if transfer is None or transfer.status in {
+            "COMPLETED",
+            "COMPLETED_WITH_WARNINGS",
+            "FAILED",
+            "CANCELLED",
+        }:
+            return None, False
+        transfer.cancel_requested_at = now.astimezone(UTC)
+        if (
+            transfer.status in {"QUEUED", "SCHEDULED"}
+            and transfer.execution_started_at is None
+        ):
+            transfer.status = "CANCELLED"
+            transfer.completed_at = now.astimezone(UTC)
+            transfer.wait_reason = None
+            transfer.dispatch_token = None
+            transfer.dispatch_claimed_at = None
+            transfer.execution_heartbeat_at = None
+            return transfer, False
+        transfer.status = "CANCELLING"
+        return transfer, True
+
+    async def aresume_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
+        transfer = self.transfers.get(transfer_id)
+        if transfer is None or transfer.status not in {"FAILED", "CANCELLED"}:
+            return None
+        transfer.status = "QUEUED"
+        transfer.attempt_count += 1
+        transfer.completed_at = None
+        transfer.current_item = None
+        transfer.current_speed_bps = None
+        transfer.estimated_remaining_seconds = None
+        transfer.wait_reason = None
+        transfer.dispatch_token = None
+        transfer.dispatch_claimed_at = None
+        transfer.execution_started_at = None
+        transfer.execution_heartbeat_at = None
+        transfer.cancel_requested_at = None
+        return transfer
 
     async def aadd_transfer_manifest_items(
         self, transfer_id: uuid.UUID, entries: list[dict[str, Any]]
@@ -625,14 +778,19 @@ class MemoryStore:
         item.status = status
         item.verified_by = verified_by
         item.error_code = error_code
-        if transfer.bytes_total:
-            transfer.progress_percent = min(
-                100.0, round(transfer.bytes_transferred * 100 / transfer.bytes_total, 2)
-            )
-        elif transfer.files_total:
-            transfer.progress_percent = min(
-                100.0, round(transfer.files_completed * 100 / transfer.files_total, 2)
-            )
+        # For SMB manifests, warning_count tracks failed and skipped file outcomes.
+        counts = {
+            "copied": max(0, transfer.files_completed - transfer.warning_count),
+            "failed": transfer.error_count,
+            "skipped": max(0, transfer.warning_count - transfer.error_count),
+            "pending": max(0, transfer.files_total - transfer.files_completed),
+        }
+        transfer.progress_percent = smb_manifest_progress_percent(
+            bytes_transferred=transfer.bytes_transferred,
+            bytes_total=transfer.bytes_total,
+            files_total=transfer.files_total,
+            counts=counts,
+        )
 
     async def aget_transfer_manifest_counts(self, transfer_id: uuid.UUID) -> dict[str, int]:
         rows = [
@@ -651,6 +809,26 @@ class MemoryStore:
             "skipped": sum(1 for item in rows if item.status == "SKIPPED"),
             "failed": sum(1 for item in rows if item.status == "FAILED"),
         }
+
+    async def alist_transfer_manifest_summaries(
+        self, transfer_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, dict[str, int]]:
+        summaries = {
+            transfer_id: {"copied": 0, "failed": 0, "skipped": 0, "pending": 0}
+            for transfer_id in transfer_ids
+        }
+        status_keys = {
+            "COPIED": "copied",
+            "FAILED": "failed",
+            "SKIPPED": "skipped",
+            "PENDING": "pending",
+        }
+        for (transfer_id, _), item in self.transfer_manifest_items.items():
+            key = status_keys.get(item.status)
+            summary = summaries.get(transfer_id)
+            if summary is not None and not item.is_dir and key is not None:
+                summary[key] += 1
+        return summaries
 
     def _manifest_item(
         self, transfer_id: uuid.UUID, item_id: uuid.UUID

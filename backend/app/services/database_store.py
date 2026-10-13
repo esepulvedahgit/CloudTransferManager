@@ -2,10 +2,10 @@ import hashlib
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -32,6 +32,14 @@ from app.services.memory_store import (
     TransferManifestItemRecord,
     TransferRecord,
     UserAccount,
+)
+from app.services.transfer_progress import smb_manifest_progress_percent
+from app.services.transfer_scheduling import (
+    DispatchBatch,
+    TransferReservation,
+    admission_wait_reason,
+    dependency_wait_reason,
+    transfer_requires_staging,
 )
 from app.settings import Settings, get_settings
 
@@ -67,9 +75,7 @@ class DatabaseStore:
                 yield True
                 return
 
-            lock_key = int.from_bytes(
-                hashlib.sha256(transfer_id.bytes).digest()[:8], "big", signed=True
-            )
+            lock_key = self._transfer_lock_key(transfer_id)
             lock_parameters = {"lock_key": lock_key}
             acquired = bool(
                 await connection.scalar(
@@ -88,6 +94,10 @@ class DatabaseStore:
                     text("SELECT pg_advisory_unlock(:lock_key)"), lock_parameters
                 )
                 await connection.commit()
+
+    @staticmethod
+    def _transfer_lock_key(transfer_id: uuid.UUID) -> int:
+        return int.from_bytes(hashlib.sha256(transfer_id.bytes).digest()[:8], "big", signed=True)
 
     @staticmethod
     def _smtp_settings(row: SMTPSettings) -> SMTPSettingsRecord:
@@ -203,6 +213,16 @@ class DatabaseStore:
             conflict_policy=row.conflict_policy,
             send_email_notification=row.send_email_notification,
             status=row.status,
+            scheduled_at=row.scheduled_at,
+            schedule_timezone=row.schedule_timezone,
+            execution_mode=row.execution_mode,
+            depends_on_transfer_id=row.depends_on_transfer_id,
+            wait_reason=row.wait_reason,
+            dispatch_token=row.dispatch_token,
+            dispatch_claimed_at=row.dispatch_claimed_at,
+            execution_started_at=row.execution_started_at,
+            execution_heartbeat_at=row.execution_heartbeat_at,
+            cancel_requested_at=row.cancel_requested_at,
             progress_percent=float(row.progress_percent or 0),
             files_total=row.files_total or 0,
             files_completed=row.files_completed,
@@ -501,6 +521,10 @@ class DatabaseStore:
         destination_path: str,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
         send_email_notification: bool = False,
+        scheduled_at: datetime | None = None,
+        schedule_timezone: str = "UTC",
+        execution_mode: str = "AUTO",
+        depends_on_transfer_id: uuid.UUID | None = None,
     ) -> TransferRecord:
         async with self.sessions() as session:
             connection_ids = sorted({source_connection_id, destination_connection_id})
@@ -531,11 +555,25 @@ class DatabaseStore:
                     operation="COPY",
                     conflict_policy=conflict_policy,
                     send_email_notification=send_email_notification,
-                    status="QUEUED",
+                    status=(
+                        "SCHEDULED"
+                        if scheduled_at is not None and scheduled_at > datetime.now(UTC)
+                        else "QUEUED"
+                    ),
+                    scheduled_at=scheduled_at,
+                    schedule_timezone=schedule_timezone,
+                    execution_mode=execution_mode,
+                    depends_on_transfer_id=depends_on_transfer_id,
+                    wait_reason=(
+                        "WAITING_UNTIL"
+                        if scheduled_at is not None and scheduled_at > datetime.now(UTC)
+                        else None
+                    ),
                     source_credential_version=by_id[source_connection_id].credential_version,
                     destination_credential_version=by_id[
                         destination_connection_id
                     ].credential_version,
+                    created_at=datetime.now(UTC),
                 )
                 session.add(row)
                 await session.flush()
@@ -547,11 +585,616 @@ class DatabaseStore:
             row = await session.get(TransferJob, transfer_id)
             return self._transfer(row) if row else None
 
-    async def alist_transfers(self, requested_by: uuid.UUID | None = None) -> list[TransferRecord]:
+    async def adispatch_due_transfers(
+        self,
+        now: datetime,
+        *,
+        max_concurrent: int,
+    ) -> DispatchBatch:
+        """Reserve eligible transfers transactionally before sending them to Celery."""
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be positive")
+        active_statuses = {"VALIDATING", "RUNNING", "RETRYING", "CANCELLING"}
+        changed_ids: set[uuid.UUID] = set()
+        admitted_ids: list[uuid.UUID] = []
+        now = now.astimezone(UTC)
+
+        async with self.sessions() as session:
+            async with session.begin():
+                if session.bind is not None and session.bind.dialect.name == "postgresql":
+                    await session.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": 0x43544D5343484544},
+                    )
+
+                stale_dispatches = await session.scalars(
+                    select(TransferJob).where(
+                        TransferJob.status.in_({"QUEUED", "SCHEDULED"}),
+                        TransferJob.dispatch_token.is_not(None),
+                        TransferJob.execution_started_at.is_(None),
+                        TransferJob.dispatch_claimed_at < now - timedelta(seconds=120),
+                    )
+                )
+                for stale in stale_dispatches:
+                    stale.dispatch_token = None
+                    stale.dispatch_claimed_at = None
+                    changed_ids.add(stale.id)
+
+                stale_running = list(
+                    await session.scalars(
+                        select(TransferJob).where(
+                            TransferJob.status.in_({"QUEUED", *active_statuses}),
+                            TransferJob.execution_started_at.is_not(None),
+                            TransferJob.execution_heartbeat_at
+                            < now - timedelta(seconds=60),
+                        )
+                    )
+                )
+                for stale in stale_running:
+                    worker_alive = False
+                    if session.bind is not None and session.bind.dialect.name == "postgresql":
+                        lock_key = self._transfer_lock_key(stale.id)
+                        connection = await session.connection()
+                        lock_available = bool(
+                            await connection.scalar(
+                                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                                {"lock_key": lock_key},
+                            )
+                        )
+                        if lock_available:
+                            await connection.execute(
+                                text("SELECT pg_advisory_unlock(:lock_key)"),
+                                {"lock_key": lock_key},
+                            )
+                        else:
+                            worker_alive = True
+                    if worker_alive:
+                        continue
+                    stale.status = "FAILED"
+                    stale.completed_at = now
+                    stale.error_count += 1
+                    stale.current_item = None
+                    stale.wait_reason = None
+                    stale.dispatch_token = None
+                    stale.dispatch_claimed_at = None
+                    stale.execution_started_at = None
+                    stale.execution_heartbeat_at = None
+                    session.add(
+                        TransferEvent(
+                            transfer_job_id=stale.id,
+                            level="ERROR",
+                            event_type="WORKER_INTERRUPTED",
+                            message=(
+                                "La ejecución se interrumpió; revisa el destino "
+                                "antes de reintentar."
+                            ),
+                            technical_details={"reason": "STALE_WORKER_HEARTBEAT"},
+                            provider_error_code="WORKER_INTERRUPTED",
+                            correlation_id=stale.id,
+                        )
+                    )
+                    changed_ids.add(stale.id)
+
+                candidates = list(
+                    await session.scalars(
+                        select(TransferJob)
+                        .where(
+                            TransferJob.status.in_({"SCHEDULED", "QUEUED"}),
+                            TransferJob.dispatch_token.is_(None),
+                            or_(
+                                TransferJob.scheduled_at.is_(None),
+                                TransferJob.scheduled_at <= now,
+                            ),
+                        )
+                        .order_by(
+                            func.coalesce(TransferJob.scheduled_at, TransferJob.created_at),
+                            TransferJob.created_at,
+                            TransferJob.id,
+                        )
+                        .with_for_update()
+                    )
+                )
+                running = list(
+                    await session.scalars(
+                        select(TransferJob).where(
+                            or_(
+                                and_(
+                                    TransferJob.dispatch_token.is_not(None),
+                                    TransferJob.status.in_(ACTIVE_TRANSFER_STATUSES),
+                                ),
+                                TransferJob.status.in_(active_statuses),
+                            )
+                        )
+                    )
+                )
+                connection_ids = {
+                    connection_id
+                    for transfer in [*candidates, *running]
+                    for connection_id in (
+                        transfer.source_connection_id,
+                        transfer.destination_connection_id,
+                    )
+                }
+                connection_rows = list(
+                    await session.scalars(
+                        select(StorageConnection).where(StorageConnection.id.in_(connection_ids))
+                    )
+                ) if connection_ids else []
+                connections = {connection.id: connection for connection in connection_rows}
+
+                active = [
+                    TransferReservation(
+                        transfer_id=transfer.id,
+                        source_connection_id=transfer.source_connection_id,
+                        destination_connection_id=transfer.destination_connection_id,
+                        execution_mode=transfer.execution_mode,
+                        uses_staging=self._transfer_uses_staging(
+                            transfer, connections
+                        ),
+                    )
+                    for transfer in running
+                ]
+                exclusive_barrier = False
+                reason: str | None = None
+
+                for transfer in candidates:
+                    scheduled_at = transfer.scheduled_at
+                    if scheduled_at is not None and scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=UTC)
+                    if scheduled_at is not None and scheduled_at > now:
+                        if transfer.wait_reason != "WAITING_UNTIL":
+                            transfer.wait_reason = "WAITING_UNTIL"
+                            changed_ids.add(transfer.id)
+                        if transfer.status != "SCHEDULED":
+                            transfer.status = "SCHEDULED"
+                            changed_ids.add(transfer.id)
+                        continue
+
+                    if transfer.status == "SCHEDULED":
+                        transfer.status = "QUEUED"
+                        changed_ids.add(transfer.id)
+
+                    if transfer.depends_on_transfer_id is not None:
+                        parent = await session.get(TransferJob, transfer.depends_on_transfer_id)
+                        parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
+                        if parent_wait is not None:
+                            if transfer.wait_reason != parent_wait:
+                                transfer.wait_reason = parent_wait
+                                changed_ids.add(transfer.id)
+                            continue
+
+                    owner = await session.get(User, transfer.requested_by)
+                    if owner is None or not owner.is_active:
+                        reason = "WAITING_USER_ACTIVE"
+                        if transfer.wait_reason != reason:
+                            transfer.wait_reason = reason
+                            changed_ids.add(transfer.id)
+                        continue
+
+                    source = connections.get(transfer.source_connection_id)
+                    destination = connections.get(transfer.destination_connection_id)
+                    if (
+                        source is None
+                        or destination is None
+                        or source.deleted_at is not None
+                        or destination.deleted_at is not None
+                        or source.status != "ACTIVE"
+                        or destination.status != "ACTIVE"
+                    ):
+                        reason = "WAITING_CONNECTION_ACTIVE"
+                        if transfer.wait_reason != reason:
+                            transfer.wait_reason = reason
+                            changed_ids.add(transfer.id)
+                        continue
+                    if (
+                        source.credential_version != transfer.source_credential_version
+                        or destination.credential_version != transfer.destination_credential_version
+                    ):
+                        reason = "BLOCKED_CONNECTION_CHANGED"
+                        if transfer.wait_reason != reason:
+                            transfer.wait_reason = reason
+                            changed_ids.add(transfer.id)
+                        continue
+                    if owner.role != "ADMIN":
+                        grants = set(
+                            (
+                                await session.scalars(
+                                    select(UserConnectionGrant.connection_id).where(
+                                        UserConnectionGrant.user_id == owner.id,
+                                        UserConnectionGrant.connection_id.in_(
+                                            [source.id, destination.id]
+                                        ),
+                                    )
+                                )
+                            ).all()
+                        )
+                        if any(
+                            not connection.is_global and connection.id not in grants
+                            for connection in (source, destination)
+                        ):
+                            reason = "WAITING_CONNECTION_ACCESS"
+                            if transfer.wait_reason != reason:
+                                transfer.wait_reason = reason
+                                changed_ids.add(transfer.id)
+                            continue
+
+                    if exclusive_barrier:
+                        reason = "WAITING_EXCLUSIVE"
+                    else:
+                        reason = admission_wait_reason(
+                            source_connection_id=transfer.source_connection_id,
+                            destination_connection_id=transfer.destination_connection_id,
+                            execution_mode=transfer.execution_mode,
+                            uses_staging=self._transfer_uses_staging(transfer, connections),
+                            active=active,
+                            max_concurrent=max_concurrent,
+                        )
+
+                    if reason is not None:
+                        if transfer.wait_reason != reason:
+                            transfer.wait_reason = reason
+                            changed_ids.add(transfer.id)
+                        if transfer.execution_mode == "EXCLUSIVE":
+                            exclusive_barrier = True
+                        continue
+
+                    transfer.dispatch_token = uuid.uuid4()
+                    transfer.dispatch_claimed_at = now
+                    transfer.execution_started_at = None
+                    transfer.execution_heartbeat_at = None
+                    transfer.wait_reason = None
+                    changed_ids.add(transfer.id)
+                    admitted_ids.append(transfer.id)
+                    active.append(
+                        TransferReservation(
+                            transfer_id=transfer.id,
+                            source_connection_id=transfer.source_connection_id,
+                            destination_connection_id=transfer.destination_connection_id,
+                            execution_mode=transfer.execution_mode,
+                            uses_staging=self._transfer_uses_staging(transfer, connections),
+                        )
+                    )
+                    if transfer.execution_mode == "EXCLUSIVE":
+                        exclusive_barrier = True
+
+                rows = list(
+                    await session.scalars(
+                        select(TransferJob).where(
+                            TransferJob.id.in_(changed_ids | set(admitted_ids))
+                        )
+                    )
+                ) if changed_ids or admitted_ids else []
+                rows_by_id = {row.id: row for row in rows}
+                admitted = [self._transfer(rows_by_id[item_id]) for item_id in admitted_ids]
+                changed = [
+                    self._transfer(rows_by_id[item_id])
+                    for item_id in changed_ids
+                    if item_id in rows_by_id
+                ]
+
+        return DispatchBatch(admitted=admitted, changed=changed)
+
+    @staticmethod
+    def _transfer_uses_staging(
+        transfer: TransferJob, connections: dict[uuid.UUID, StorageConnection]
+    ) -> bool:
+        source = connections.get(transfer.source_connection_id)
+        destination = connections.get(transfer.destination_connection_id)
+        if source is None or destination is None:
+            return False
+        return transfer_requires_staging(
+            source.provider_type,
+            destination.provider_type,
+            source.adapter_type,
+            destination.adapter_type,
+        )
+
+    async def arelease_transfer_dispatch(
+        self, transfer_id: uuid.UUID, dispatch_token: uuid.UUID
+    ) -> None:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.dispatch_token == dispatch_token,
+                        TransferJob.execution_started_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                if row is not None:
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+
+    async def aupdate_transfer_schedule(
+        self,
+        transfer_id: uuid.UUID,
+        *,
+        scheduled_at: datetime | None,
+        schedule_timezone: str,
+        execution_mode: str,
+        depends_on_transfer_id: uuid.UUID | None,
+    ) -> TransferRecord | None:
+        now = datetime.now(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                if session.bind is not None and session.bind.dialect.name == "postgresql":
+                    await session.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": 0x43544D5343484544},
+                    )
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.status.in_({"SCHEDULED", "QUEUED"}),
+                        TransferJob.dispatch_token.is_(None),
+                        TransferJob.execution_started_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    return None
+                if depends_on_transfer_id == transfer_id:
+                    raise ValueError("Una transferencia no puede depender de sí misma.")
+                seen: set[uuid.UUID] = set()
+                ancestor_id = depends_on_transfer_id
+                while ancestor_id is not None:
+                    if ancestor_id == transfer_id or ancestor_id in seen:
+                        raise ValueError("La dependencia crearía un ciclo.")
+                    seen.add(ancestor_id)
+                    ancestor = await session.get(TransferJob, ancestor_id)
+                    if ancestor is None:
+                        raise ValueError("La transferencia padre no existe.")
+                    ancestor_id = ancestor.depends_on_transfer_id
+                row.scheduled_at = scheduled_at
+                row.schedule_timezone = schedule_timezone
+                row.execution_mode = execution_mode
+                row.depends_on_transfer_id = depends_on_transfer_id
+                due_later = scheduled_at is not None and scheduled_at > now
+                row.status = "SCHEDULED" if due_later else "QUEUED"
+                row.wait_reason = "WAITING_UNTIL" if due_later else None
+                await session.flush()
+                return self._transfer(row)
+
+    async def acancel_transfer(
+        self, transfer_id: uuid.UUID, now: datetime
+    ) -> tuple[TransferRecord | None, bool]:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(TransferJob.id == transfer_id)
+                    .with_for_update()
+                )
+                if row is None or row.status in {
+                    "COMPLETED",
+                    "COMPLETED_WITH_WARNINGS",
+                    "FAILED",
+                    "CANCELLED",
+                }:
+                    return None, False
+                row.cancel_requested_at = now
+                if (
+                    row.status in {"QUEUED", "SCHEDULED"}
+                    and row.execution_started_at is None
+                ):
+                    row.status = "CANCELLED"
+                    row.completed_at = now
+                    row.wait_reason = None
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+                    row.execution_heartbeat_at = None
+                    needs_worker_signal = False
+                else:
+                    row.status = "CANCELLING"
+                    needs_worker_signal = True
+                await session.flush()
+                return self._transfer(row), needs_worker_signal
+
+    async def aresume_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.status.in_({"FAILED", "CANCELLED"}),
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    return None
+                row.status = "QUEUED"
+                row.attempt_count += 1
+                row.completed_at = None
+                row.current_item = None
+                row.current_speed_bps = None
+                row.estimated_remaining_seconds = None
+                row.wait_reason = None
+                row.dispatch_token = None
+                row.dispatch_claimed_at = None
+                row.execution_started_at = None
+                row.execution_heartbeat_at = None
+                row.cancel_requested_at = None
+                await session.flush()
+                return self._transfer(row)
+
+    async def astart_transfer_dispatch(
+        self, transfer_id: uuid.UUID, dispatch_token: uuid.UUID, now: datetime
+    ) -> bool:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.dispatch_token == dispatch_token,
+                        TransferJob.status.in_({"QUEUED", "CANCELLING"}),
+                        TransferJob.execution_started_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    return False
+                if row.status != "CANCELLING":
+                    owner = await session.get(User, row.requested_by)
+                    source = await session.get(StorageConnection, row.source_connection_id)
+                    destination = await session.get(
+                        StorageConnection, row.destination_connection_id
+                    )
+                    wait_reason: str | None = None
+                    if owner is None or not owner.is_active:
+                        wait_reason = "WAITING_USER_ACTIVE"
+                    elif (
+                        source is None
+                        or destination is None
+                        or source.deleted_at is not None
+                        or destination.deleted_at is not None
+                        or source.status != "ACTIVE"
+                        or destination.status != "ACTIVE"
+                    ):
+                        wait_reason = "WAITING_CONNECTION_ACTIVE"
+                    elif (
+                        source.credential_version != row.source_credential_version
+                        or destination.credential_version != row.destination_credential_version
+                    ):
+                        wait_reason = "BLOCKED_CONNECTION_CHANGED"
+                    elif owner.role != "ADMIN":
+                        for connection in (source, destination):
+                            if (
+                                not connection.is_global
+                                and await session.get(
+                                    UserConnectionGrant, (owner.id, connection.id)
+                                )
+                                is None
+                            ):
+                                wait_reason = "WAITING_CONNECTION_ACCESS"
+                                break
+                    if wait_reason is not None:
+                        row.status = "QUEUED"
+                        row.wait_reason = wait_reason
+                        row.dispatch_token = None
+                        row.dispatch_claimed_at = None
+                        return False
+                row.execution_started_at = now.astimezone(UTC)
+                row.execution_heartbeat_at = now.astimezone(UTC)
+                return True
+
+    async def aheartbeat_transfer_dispatch(
+        self, transfer_id: uuid.UUID, dispatch_token: uuid.UUID, now: datetime
+    ) -> bool:
+        async with self.sessions() as session:
+            updated_id = await session.scalar(
+                update(TransferJob)
+                .where(
+                    TransferJob.id == transfer_id,
+                    TransferJob.dispatch_token == dispatch_token,
+                    TransferJob.execution_started_at.is_not(None),
+                )
+                .values(execution_heartbeat_at=now.astimezone(UTC))
+                .returning(TransferJob.id)
+            )
+            await session.commit()
+            return updated_id is not None
+
+    async def afinish_transfer_dispatch(
+        self, transfer_id: uuid.UUID, dispatch_token: uuid.UUID
+    ) -> None:
+        terminal_statuses = {
+            "COMPLETED",
+            "COMPLETED_WITH_WARNINGS",
+            "FAILED",
+            "CANCELLED",
+        }
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.dispatch_token == dispatch_token,
+                    )
+                    .with_for_update()
+                )
+                if row is not None and row.status in terminal_statuses:
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+                    row.execution_started_at = None
+                    row.execution_heartbeat_at = None
+
+    async def afail_transfer_dispatch(
+        self,
+        transfer_id: uuid.UUID,
+        dispatch_token: uuid.UUID,
+        *,
+        event_type: str,
+        message: str,
+    ) -> None:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.dispatch_token == dispatch_token,
+                    )
+                    .with_for_update()
+                )
+                if row is None or row.status in {
+                    "COMPLETED",
+                    "COMPLETED_WITH_WARNINGS",
+                    "FAILED",
+                    "CANCELLED",
+                }:
+                    return
+                row.status = "FAILED"
+                row.completed_at = datetime.now(UTC)
+                row.error_count += 1
+                row.current_item = None
+                row.wait_reason = None
+                row.dispatch_token = None
+                row.dispatch_claimed_at = None
+                row.execution_started_at = None
+                row.execution_heartbeat_at = None
+                session.add(
+                    TransferEvent(
+                        transfer_job_id=row.id,
+                        level="ERROR",
+                        event_type=event_type,
+                        message=message,
+                        technical_details={"reason": event_type},
+                        provider_error_code=event_type,
+                        correlation_id=row.id,
+                    )
+                )
+
+    async def alist_transfers(
+        self,
+        requested_by: uuid.UUID | None = None,
+        pending_only: bool = False,
+        background_only: bool = False,
+        exclude_background: bool = False,
+    ) -> list[TransferRecord]:
         async with self.sessions() as session:
             statement = select(TransferJob).order_by(TransferJob.created_at.desc())
             if requested_by is not None:
                 statement = statement.where(TransferJob.requested_by == requested_by)
+            if pending_only:
+                statement = statement.where(TransferJob.status.in_({"SCHEDULED", "QUEUED"}))
+            programmed = or_(
+                TransferJob.scheduled_at.is_not(None),
+                TransferJob.wait_reason.is_not(None),
+                TransferJob.execution_mode == "EXCLUSIVE",
+                TransferJob.depends_on_transfer_id.is_not(None),
+            )
+            background = and_(programmed, TransferJob.status.in_(ACTIVE_TRANSFER_STATUSES))
+            if background_only:
+                statement = statement.where(background)
+            if exclude_background:
+                statement = statement.where(~background)
             rows = (await session.scalars(statement)).all()
             return [self._transfer(row) for row in rows]
 
@@ -561,6 +1204,11 @@ class DatabaseStore:
             if row is None:
                 return
             row.status = transfer.status
+            row.scheduled_at = transfer.scheduled_at
+            row.schedule_timezone = transfer.schedule_timezone
+            row.execution_mode = transfer.execution_mode
+            row.depends_on_transfer_id = transfer.depends_on_transfer_id
+            row.wait_reason = transfer.wait_reason
             row.progress_percent = transfer.progress_percent
             row.files_total = transfer.files_total
             row.files_completed = transfer.files_completed
@@ -786,16 +1434,18 @@ class DatabaseStore:
                 item.status = status
                 item.verified_by = verified_by
                 item.error_code = error_code
-                if transfer.bytes_total:
-                    transfer.progress_percent = min(
-                        100.0,
-                        round(transfer.bytes_transferred * 100 / transfer.bytes_total, 2),
-                    )
-                elif transfer.files_total:
-                    transfer.progress_percent = min(
-                        100.0,
-                        round(transfer.files_completed * 100 / transfer.files_total, 2),
-                    )
+                # For SMB manifests, warning_count tracks failed and skipped file outcomes.
+                transfer.progress_percent = smb_manifest_progress_percent(
+                    bytes_transferred=transfer.bytes_transferred,
+                    bytes_total=transfer.bytes_total or 0,
+                    files_total=transfer.files_total or 0,
+                    counts={
+                        "copied": max(0, transfer.files_completed - transfer.warning_count),
+                        "failed": transfer.error_count,
+                        "skipped": max(0, transfer.warning_count - transfer.error_count),
+                        "pending": max(0, (transfer.files_total or 0) - transfer.files_completed),
+                    },
+                )
 
     async def aget_transfer_manifest_counts(self, transfer_id: uuid.UUID) -> dict[str, int]:
         async with self.sessions() as session:
@@ -826,6 +1476,50 @@ class DatabaseStore:
                 "skipped": counts.get("SKIPPED", 0),
                 "failed": counts.get("FAILED", 0),
             }
+
+    async def alist_transfer_manifest_summaries(
+        self, transfer_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, dict[str, int]]:
+        summaries = {
+            transfer_id: {"copied": 0, "failed": 0, "skipped": 0, "pending": 0}
+            for transfer_id in transfer_ids
+        }
+        if not transfer_ids:
+            return summaries
+
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TransferManifestItem.transfer_job_id,
+                        func.sum(
+                            case((TransferManifestItem.status == "COPIED", 1), else_=0)
+                        ).label("copied"),
+                        func.sum(
+                            case((TransferManifestItem.status == "FAILED", 1), else_=0)
+                        ).label("failed"),
+                        func.sum(
+                            case((TransferManifestItem.status == "SKIPPED", 1), else_=0)
+                        ).label("skipped"),
+                        func.sum(
+                            case((TransferManifestItem.status == "PENDING", 1), else_=0)
+                        ).label("pending"),
+                    )
+                    .where(
+                        TransferManifestItem.transfer_job_id.in_(transfer_ids),
+                        TransferManifestItem.is_dir.is_(False),
+                    )
+                    .group_by(TransferManifestItem.transfer_job_id)
+                )
+            ).all()
+        for transfer_id, copied, failed, skipped, pending in rows:
+            summaries[transfer_id] = {
+                "copied": int(copied or 0),
+                "failed": int(failed or 0),
+                "skipped": int(skipped or 0),
+                "pending": int(pending or 0),
+            }
+        return summaries
 
     async def aadd_transfer_event(
         self,

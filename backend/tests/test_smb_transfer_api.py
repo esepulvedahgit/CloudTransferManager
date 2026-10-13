@@ -126,8 +126,12 @@ async def test_smb_transfer_resume_requeues_failed_items_and_clears_cancel(monke
         store=store,
     )
     app.state.event_bus = None
-    queued: list[str] = []
-    monkeypatch.setattr("app.worker.run_transfer.delay", queued.append)
+    dispatch_requests: list[bool] = []
+
+    def enqueue_dispatch() -> None:
+        dispatch_requests.append(True)
+
+    monkeypatch.setattr("app.worker.dispatch_pending_transfers.delay", enqueue_dispatch)
     app.state.cancel_requests.add(transfer.id)
     client = await logged_in_client(app, user.username)
     response = await client.post(
@@ -139,6 +143,6 @@ async def test_smb_transfer_resume_requeues_failed_items_and_clears_cancel(monke
 
     assert response.status_code == 202
     assert response.json()["status"] == "QUEUED"
-    assert queued == [str(transfer.id)]
+    assert dispatch_requests == [True]
     assert transfer.id not in app.state.cancel_requests
     assert resumed is not None and resumed.attempt_count == 2

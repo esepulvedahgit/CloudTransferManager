@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, waitForElementToBeRemoved, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, waitForElementToBeRemoved, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 
@@ -7,6 +7,10 @@ function jsonResponse(value: unknown, status = 200) {
     status,
     headers: { 'content-type': 'application/json' },
   });
+}
+
+function isTransferCollectionRequest(path: string) {
+  return /^\/api\/v1\/transfers(?:\?.*)?$/.test(path);
 }
 
 class TestEventSource {
@@ -35,6 +39,7 @@ async function signIn(fetchMock: ReturnType<typeof vi.fn>) {
 describe('Cloud Transfer Manager', () => {
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     TestEventSource.instances = [];
     document.cookie = 'ctm_csrf=; Max-Age=0; path=/';
@@ -113,7 +118,7 @@ describe('Cloud Transfer Manager', () => {
         return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
       }
       if (path.endsWith('/connections')) return jsonResponse({ items: [] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [transfer] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [transfer] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -124,6 +129,531 @@ describe('Cloud Transfer Manager', () => {
     expect(requestedAt).toBeVisible();
     expect(requestedAt).toHaveTextContent(/2026/);
   });
+
+  it('shows SMB manifest outcomes instead of labeling resolved files as copied', async () => {
+    const transfer = {
+      id: 'smb-history-1',
+      public_id: 'TRF-2026-000205',
+      status: 'COMPLETED_WITH_WARNINGS',
+      progress_percent: 99.99,
+      files_total: 6,
+      files_completed: 4,
+      bytes_total: 4096,
+      bytes_transferred: 3072,
+      current_item: null,
+      average_speed_bps: null,
+      current_speed_bps: null,
+      source_connection_id: 'nas',
+      destination_connection_id: 'cloud',
+      source_paths: ['/STORAGE'],
+      destination_path: '/Archive',
+      manifest_summary: { copied: 2, failed: 1, skipped: 3, pending: 0 },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) {
+        return jsonResponse({ items: [
+          { id: 'nas', name: 'NAS local', provider_type: 'SMB' },
+          { id: 'cloud', name: 'MEGA', provider_type: 'MEGA' },
+        ] });
+      }
+      if (isTransferCollectionRequest(path)) {
+        return path.includes('background_only=true') || path.includes('pending_only=true')
+          ? jsonResponse({ items: [], total_count: 0 })
+          : jsonResponse({ items: [transfer], total_count: 1 });
+      }
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+
+    expect(await screen.findByText(/2 copiados · 1 con error · 3 omitidos/)).toBeVisible();
+    expect(screen.getByText('99%')).toBeVisible();
+    expect(document.querySelector('[aria-label="Avance 99 por ciento"]')).toBeVisible();
+    expect(screen.queryByText('100%')).not.toBeInTheDocument();
+    expect(screen.queryByText(/4 de 6 archivos/)).not.toBeInTheDocument();
+  });
+
+  it('keeps scheduled transfers out of history and shows a compact background transfer indicator', async () => {
+    vi.stubGlobal('EventSource', TestEventSource);
+    const waiting = {
+      id: 'scheduled-waiting',
+      public_id: 'TRF-2026-000201',
+      status: 'QUEUED',
+      progress_percent: 0,
+      files_completed: 0,
+      files_total: 3,
+      bytes_transferred: 0,
+      bytes_total: 2048,
+      current_item: null,
+      average_speed_bps: null,
+      current_speed_bps: null,
+      destination_connection_id: 'destination',
+      destination_path: '/Archive',
+      scheduled_at: null,
+      execution_mode: 'AUTO',
+      depends_on_transfer_id: null,
+      wait_reason: 'WAITING_CAPACITY',
+    };
+    const running = {
+      ...waiting,
+      id: 'scheduled-running',
+      public_id: 'TRF-2026-000202',
+      status: 'RUNNING',
+      progress_percent: 50,
+      bytes_transferred: 1024,
+      scheduled_at: '2026-10-20T12:00:00Z',
+      wait_reason: null,
+    };
+    const backgroundItems = [waiting, running];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) {
+        if (path.includes('background_only=true')) {
+          return jsonResponse({ items: backgroundItems, total_count: backgroundItems.length });
+        }
+        if (path.includes('pending_only=true')) {
+          return jsonResponse({ items: [waiting], total_count: 1 });
+        }
+        return jsonResponse({ items: [], total_count: 0 });
+      }
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+
+    expect(screen.queryByText(waiting.public_id)).not.toBeInTheDocument();
+    expect(screen.queryByText(running.public_id)).not.toBeInTheDocument();
+    expect(screen.queryByText(/TRANSFERENCIA ACTIVA/i)).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/transfers?exclude_background=true'),
+      expect.anything(),
+    );
+    expect(await screen.findByText('2')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: /transferencias en segundo plano/i }));
+
+    expect(await screen.findByText(waiting.public_id)).toBeVisible();
+    expect(screen.getByText(running.public_id)).toBeVisible();
+    expect(screen.getByText(/En cola: no hay un espacio de ejecución disponible/i)).toBeVisible();
+    expect(screen.getByText(/1\.00 KiB de 2\.00 KiB/i)).toBeVisible();
+    expect(screen.getByText('50%')).toBeVisible();
+  });
+
+  it('moves a completed background transfer to history when its SSE event arrives', async () => {
+    vi.stubGlobal('EventSource', TestEventSource);
+    const running = {
+      id: 'scheduled-running',
+      public_id: 'TRF-2026-000203',
+      status: 'RUNNING',
+      progress_percent: 84,
+      files_completed: 2,
+      files_total: 3,
+      bytes_transferred: 1024,
+      bytes_total: 2048,
+      current_item: '/NAS/report.csv',
+      average_speed_bps: 1024,
+      current_speed_bps: 1024,
+      destination_connection_id: 'destination',
+      destination_path: '/Archive',
+      scheduled_at: '2026-10-20T12:00:00Z',
+      execution_mode: 'AUTO',
+      depends_on_transfer_id: null,
+      wait_reason: null,
+    };
+    const completed = { ...running, status: 'COMPLETED', progress_percent: 100 };
+    let finished = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) {
+        if (path.includes('background_only=true')) {
+          const items = finished ? [] : [running];
+          return jsonResponse({ items, total_count: items.length });
+        }
+        if (path.includes('pending_only=true')) return jsonResponse({ items: [], total_count: 0 });
+        const items = finished ? [completed] : [];
+        return jsonResponse({ items, total_count: items.length });
+      }
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    await waitFor(() => expect(TestEventSource.instances.length).toBeGreaterThan(0));
+    expect(screen.getByText('1')).toBeVisible();
+    finished = true;
+    TestEventSource.instances[0].emit(completed);
+
+    expect(await screen.findByText(completed.public_id)).toBeVisible();
+    await waitFor(() => expect(screen.getByRole('button', { name: /0 transferencias en segundo plano/i })).toBeVisible());
+    expect(screen.queryByText(/TRANSFERENCIA ACTIVA/i)).not.toBeInTheDocument();
+  });
+
+  it('refreshes the scheduled transfer history after 15 seconds when SSE is missed', async () => {
+    vi.stubGlobal('EventSource', TestEventSource);
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const running = {
+      id: 'scheduled-polling',
+      public_id: 'TRF-2026-000204',
+      status: 'RUNNING',
+      progress_percent: 90,
+      files_completed: 1,
+      files_total: 1,
+      bytes_transferred: 9,
+      bytes_total: 10,
+      current_item: '/NAS/report.csv',
+      average_speed_bps: 1,
+      current_speed_bps: 1,
+      destination_connection_id: 'destination',
+      destination_path: '/Archive',
+      scheduled_at: '2026-10-20T12:00:00Z',
+      execution_mode: 'AUTO',
+      depends_on_transfer_id: null,
+      wait_reason: null,
+    };
+    const completed = { ...running, status: 'COMPLETED', progress_percent: 100 };
+    let finished = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) {
+        if (path.includes('background_only=true')) {
+          const items = finished ? [] : [running];
+          return jsonResponse({ items, total_count: items.length });
+        }
+        if (path.includes('pending_only=true')) return jsonResponse({ items: [], total_count: 0 });
+        const items = finished ? [completed] : [];
+        return jsonResponse({ items, total_count: items.length });
+      }
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    expect(screen.queryByText(completed.public_id)).not.toBeInTheDocument();
+    finished = true;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+
+    expect(await screen.findByText(completed.public_id)).toBeVisible();
+    expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).includes('/api/v1/transfers?background_only=true')
+    ))).toBe(true);
+  });
+
+  it('keeps cancellation available for a running scheduled transfer in Programaciones', async () => {
+    vi.stubGlobal('EventSource', TestEventSource);
+    const running = {
+      id: 'scheduled-running-cancellable',
+      public_id: 'TRF-2026-000206',
+      status: 'RUNNING',
+      progress_percent: 35,
+      files_completed: 1,
+      files_total: 4,
+      bytes_transferred: 350,
+      bytes_total: 1000,
+      current_item: '/NAS/report.csv',
+      average_speed_bps: 10,
+      current_speed_bps: 10,
+      destination_connection_id: 'destination',
+      destination_path: '/Archive',
+      scheduled_at: '2026-10-20T12:00:00Z',
+      execution_mode: 'AUTO',
+      depends_on_transfer_id: null,
+      wait_reason: null,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path.endsWith(`/transfers/${running.id}/cancel`) && init?.method === 'POST') {
+        return jsonResponse({ ...running, status: 'CANCELLING' });
+      }
+      if (isTransferCollectionRequest(path)) {
+        if (path.includes('background_only=true')) return jsonResponse({ items: [running], total_count: 1 });
+        return jsonResponse({ items: [], total_count: 0 });
+      }
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('tab', { name: 'Programaciones' }));
+
+    expect(await screen.findByText(running.public_id)).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancelar' }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/transfers/${running.id}/cancel`,
+      expect.objectContaining({ method: 'POST' }),
+    ));
+    expect(screen.getByText('Se solicitó cancelar la transferencia.')).toBeVisible();
+  });
+
+  it('loads older active transfers after the first 200 scheduled background jobs', async () => {
+    vi.stubGlobal('EventSource', TestEventSource);
+    const pending = Array.from({ length: 200 }, (_value, index) => ({
+      id: `scheduled-new-${index}`,
+      public_id: `TRF-2026-${String(index + 300).padStart(6, '0')}`,
+      status: 'SCHEDULED',
+      progress_percent: 0,
+      files_completed: 0,
+      files_total: 1,
+      bytes_transferred: 0,
+      bytes_total: 4,
+      current_item: null,
+      average_speed_bps: null,
+      current_speed_bps: null,
+      destination_connection_id: 'destination',
+      destination_path: '/Archive',
+      scheduled_at: '2026-10-20T12:00:00Z',
+      execution_mode: 'AUTO',
+      depends_on_transfer_id: null,
+      wait_reason: 'WAITING_UNTIL',
+    }));
+    const olderRunning = {
+      ...pending[0],
+      id: 'scheduled-running-old',
+      public_id: 'TRF-2026-000299',
+      status: 'RUNNING',
+      progress_percent: 55,
+      current_item: '/NAS/older.bin',
+      wait_reason: null,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path.endsWith(`/transfers/${olderRunning.id}/cancel`) && init?.method === 'POST') {
+        return jsonResponse({ ...olderRunning, status: 'CANCELLING' });
+      }
+      if (isTransferCollectionRequest(path)) {
+        if (path.includes('background_only=true')) {
+          const offset = new URL(path, window.location.origin).searchParams.get('offset');
+          const items = offset === '200' ? [olderRunning] : pending;
+          return jsonResponse({ items, total_count: 201 });
+        }
+        if (path.includes('pending_only=true')) return jsonResponse({ items: pending, total_count: 200 });
+        return jsonResponse({ items: [], total_count: 0 });
+      }
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('tab', { name: 'Programaciones' }));
+    await waitFor(
+      () => expect(screen.getByRole('button', { name: 'Cargar más trabajos activos' })).toBeVisible(),
+      { timeout: 10_000 },
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Cargar más trabajos activos' }));
+
+    await waitFor(() => expect(screen.getByText(olderRunning.public_id)).toBeVisible(), { timeout: 10_000 });
+    expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).includes('background_only=true&offset=200&page_size=200')
+    ))).toBe(true);
+    const olderRow = screen.getByText(olderRunning.public_id).closest('.scheduled-transfer-row');
+    expect(olderRow).not.toBeNull();
+    TestEventSource.instances[0].emit({ ...olderRunning, status: 'RETRYING' });
+    await waitFor(() => expect(within(olderRow as HTMLElement).getByText('Reintentando')).toBeVisible());
+    fireEvent.click(within(olderRow as HTMLElement).getByRole('button', { name: 'Cancelar' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/transfers/${olderRunning.id}/cancel`,
+      expect.objectContaining({ method: 'POST' }),
+    ));
+  }, 30_000);
+
+  it('schedules a selected transfer with its browser timezone and execution mode', async () => {
+    let savedTransfer: Record<string, unknown> | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [
+        { id: 'source', name: 'Origen', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
+        { id: 'destination', name: 'Destino', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
+      ] });
+      if (path.includes('/connections/source/items')) return jsonResponse({ items: [
+        { name: 'archivo.txt', path: '/archivo.txt', is_dir: false, size_bytes: 4, modified_at: null, mime_type: 'text/plain', provider_type: 'MOCK' },
+      ], next_cursor: null, total_count: 1 });
+      if (path.includes('/transfers?pending_only=true')) {
+        return jsonResponse({ items: savedTransfer ? [savedTransfer] : [], total_count: savedTransfer ? 1 : 0 });
+      }
+      if (isTransferCollectionRequest(path) && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        savedTransfer = {
+          id: 'scheduled-1', public_id: 'TRF-2026-000010', status: 'SCHEDULED',
+          source_connection_id: 'source', destination_connection_id: 'destination',
+          scheduled_at: body.scheduled_at, schedule_timezone: body.schedule_timezone,
+          execution_mode: body.execution_mode, depends_on_transfer_id: body.depends_on_transfer_id,
+          wait_reason: 'WAITING_UNTIL', progress_percent: 0, files_completed: 0, files_total: 0,
+          bytes_transferred: 0, bytes_total: 0, current_item: null, average_speed_bps: null,
+          current_speed_bps: null, estimated_remaining_seconds: null,
+        };
+        return jsonResponse(savedTransfer, 201);
+      }
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: savedTransfer ? [savedTransfer] : [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Seleccionar archivo.txt' }));
+    fireEvent.click(screen.getByRole('button', { name: /Programar transferencia/i }));
+    const dateInput = await screen.findByLabelText(/Fecha y hora/i);
+    const future = new Date(Date.now() + 5 * 24 * 60 * 60_000);
+    const futureLocal = new Date(future.getTime() - future.getTimezoneOffset() * 60_000)
+      .toISOString()
+      .slice(0, 16);
+    fireEvent.change(dateInput, { target: { value: futureLocal } });
+    fireEvent.mouseDown(screen.getByLabelText(/Modo de ejecución/i));
+    fireEvent.click(await screen.findByRole('option', { name: /Exclusiva/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Confirmar programación/i }));
+
+    await waitFor(() => expect(savedTransfer).not.toBeNull());
+    const createCall = fetchMock.mock.calls.find(([path, init]) => (
+      isTransferCollectionRequest(String(path)) && init?.method === 'POST'
+    ));
+    expect(createCall).toBeDefined();
+    const body = JSON.parse(String(createCall?.[1]?.body)) as Record<string, unknown>;
+    expect(body.scheduled_at).toBe(new Date(futureLocal).toISOString());
+    expect(body.schedule_timezone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    expect(body.execution_mode).toBe('EXCLUSIVE');
+    const scheduledTab = await screen.findByRole('tab', { name: /Programaciones/i });
+    expect(scheduledTab).toBeVisible();
+    fireEvent.click(scheduledTab);
+    expect(await screen.findByText('A la espera de la hora programada')).toBeVisible();
+  });
+
+  it.each(['SSE', 'poll'])('moves a scheduled transfer into history on terminal %s without a stale active card', async (completionSource) => {
+    vi.stubGlobal('EventSource', TestEventSource);
+    if (completionSource === 'poll') vi.useFakeTimers({ shouldAdvanceTime: true });
+    let scheduledTransfer: Record<string, unknown> | null = null;
+    let backgroundTransfer: Record<string, unknown> | null = null;
+    let completedTransfer: Record<string, unknown> | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [
+        { id: 'source', name: 'Origen', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
+        { id: 'destination', name: 'Destino', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
+      ] });
+      if (path.includes('/connections/source/items')) return jsonResponse({ items: [
+        { name: 'archivo.txt', path: '/archivo.txt', is_dir: false, size_bytes: 4, modified_at: null, mime_type: 'text/plain', provider_type: 'MOCK' },
+      ], next_cursor: null, total_count: 1 });
+      if (isTransferCollectionRequest(path) && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        scheduledTransfer = {
+          id: 'scheduled-terminal', public_id: 'TRF-2026-000207', status: 'SCHEDULED',
+          source_connection_id: 'source', destination_connection_id: 'destination',
+          source_paths: ['/archivo.txt'], destination_path: '/', scheduled_at: body.scheduled_at,
+          execution_mode: 'AUTO', wait_reason: 'WAITING_UNTIL', progress_percent: 0,
+          files_completed: 0, files_total: 1, bytes_transferred: 0, bytes_total: 4,
+          current_item: null, average_speed_bps: null, current_speed_bps: null,
+          estimated_remaining_seconds: null,
+        };
+        backgroundTransfer = { ...scheduledTransfer, status: 'RUNNING', wait_reason: null, current_item: '/archivo.txt' };
+        return jsonResponse(scheduledTransfer, 201);
+      }
+      if (isTransferCollectionRequest(path)) {
+        if (path.includes('background_only=true')) {
+          const items = backgroundTransfer && !completedTransfer ? [backgroundTransfer] : [];
+          return jsonResponse({ items, total_count: items.length });
+        }
+        if (path.includes('pending_only=true')) {
+          const items = scheduledTransfer && !backgroundTransfer ? [scheduledTransfer] : [];
+          return jsonResponse({ items, total_count: items.length });
+        }
+        const items = completedTransfer ? [completedTransfer] : [];
+        return jsonResponse({ items, total_count: items.length });
+      }
+      if (path.includes('/connections/destination/items')) return jsonResponse({ items: [], next_cursor: null, total_count: 0 });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Seleccionar archivo.txt' }));
+    fireEvent.click(screen.getByRole('button', { name: /Programar transferencia/i }));
+    const dateInput = await screen.findByLabelText(/Fecha y hora/i);
+    const future = new Date(Date.now() + 5 * 24 * 60 * 60_000);
+    const futureLocal = new Date(future.getTime() - future.getTimezoneOffset() * 60_000)
+      .toISOString()
+      .slice(0, 16);
+    fireEvent.change(dateInput, { target: { value: futureLocal } });
+    fireEvent.click(screen.getByRole('button', { name: /Confirmar programación/i }));
+    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1));
+
+    expect(backgroundTransfer).not.toBeNull();
+    completedTransfer = {
+      ...(backgroundTransfer ?? {}),
+      status: 'COMPLETED', progress_percent: 100, files_completed: 1, bytes_transferred: 4,
+    };
+    if (completionSource === 'SSE') {
+      TestEventSource.instances[0].emit(completedTransfer);
+    } else {
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    }
+
+    expect(await screen.findByText('Completada')).toBeVisible();
+    expect(screen.queryByText(/TRANSFERENCIA ACTIVA · TRF-2026-000207/)).not.toBeInTheDocument();
+  }, 10_000);
 
   it('signs in and opens the transfer workspace', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -138,7 +668,7 @@ describe('Cloud Transfer Manager', () => {
       if (path.endsWith('/auth/login')) {
         return jsonResponse({ id: 'user-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
       }
-      if (path.endsWith('/connections') || path.endsWith('/transfers')) {
+      if (path.endsWith('/connections') || isTransferCollectionRequest(path)) {
         return jsonResponse({ items: [], total_count: 0 });
       }
       return jsonResponse({ detail: 'Not found' }, 404);
@@ -186,7 +716,7 @@ describe('Cloud Transfer Manager', () => {
           last_test_status: 'SUCCESS',
         },
       ] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [], total_count: 0 });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [], total_count: 0 });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -245,7 +775,7 @@ describe('Cloud Transfer Manager', () => {
         return jsonResponse({ success: true, message: 'Seafile verificado' });
       }
       if (path.endsWith('/connections')) return jsonResponse({ items: connections });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -330,7 +860,7 @@ describe('Cloud Transfer Manager', () => {
         return new Response(null, { status: 204 });
       }
       if (path.endsWith('/connections')) return jsonResponse({ items: connections });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       if (path.includes('/connections/source/items')) return jsonResponse({
         items: [{ name: 'informe.txt', path: '/informe.txt', is_dir: false, size_bytes: 8, modified_at: null, mime_type: 'text/plain', provider_type: 'MOCK' }],
         next_cursor: null, total_count: 1,
@@ -381,7 +911,7 @@ describe('Cloud Transfer Manager', () => {
         { id: 'source', name: 'Origen', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false, is_global: true },
         { id: 'destination', name: 'Destino', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false, is_global: false },
       ] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -420,7 +950,7 @@ describe('Cloud Transfer Manager', () => {
         if (connectionListRequests > 1) return jsonResponse({ detail: 'Servicio temporalmente no disponible' }, 503);
         return jsonResponse({ items: connections });
       }
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -450,7 +980,7 @@ describe('Cloud Transfer Manager', () => {
       if (path.endsWith('/auth/login')) {
         return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
       }
-      if (path.endsWith('/connections') || path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (path.endsWith('/connections') || isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -480,7 +1010,7 @@ describe('Cloud Transfer Manager', () => {
         { id: 'source', name: 'Drive de operaciones', provider_type: 'GOOGLE_DRIVE', status: 'ACTIVE', credentials_configured: true },
         { id: 'destination', name: 'MEGA de respaldo', provider_type: 'MEGA', status: 'ACTIVE', credentials_configured: true },
       ] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       if (path.includes('/connections/source/items')) return jsonResponse({
         items: [{ name: 'informe.csv', path: '/informe.csv', is_dir: false, size_bytes: 120, modified_at: null, mime_type: 'text/csv', provider_type: 'GOOGLE_DRIVE' }],
         next_cursor: null,
@@ -523,7 +1053,7 @@ describe('Cloud Transfer Manager', () => {
         { id: 'source', name: 'Origen', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
         { id: 'destination', name: 'Destino', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
       ] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       if (path.includes('/connections/source/items')) {
         if (path.includes('cursor=50')) return jsonResponse({
           items: [{ name: 'archivo-51.txt', path: '/archivo-51.txt', is_dir: false, size_bytes: 1, modified_at: null, mime_type: null, provider_type: 'MOCK' }],
@@ -592,11 +1122,11 @@ describe('Cloud Transfer Manager', () => {
           { id: 'source', name: 'Origen', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
           { id: 'destination', name: 'Destino', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
         ] });
-        if (path.endsWith('/transfers') && init?.method === 'POST') return jsonResponse(transfer, 201);
+        if (isTransferCollectionRequest(path) && init?.method === 'POST') return jsonResponse(transfer, 201);
         if (path.endsWith('/events')) return jsonResponse({ items: [
           { event_type: 'FAILURE_DIAGNOSTIC', message: 'No hay espacio temporal suficiente.' },
         ] });
-        if (path.endsWith('/transfers')) {
+        if (isTransferCollectionRequest(path)) {
           return jsonResponse({ items: completedTransfer ? [completedTransfer] : [] });
         }
         if (path.includes('/connections/source/items')) return jsonResponse({ items: [
@@ -626,8 +1156,10 @@ describe('Cloud Transfer Manager', () => {
       await waitFor(() => expect(destinationItemsRequests).toBe(1));
 
       const eventSource = TestEventSource.instances[0];
-      eventSource.emit({ ...transfer, status: 'RUNNING', progress_percent: 50, current_item: null });
+      eventSource.emit({ ...transfer, status: 'RUNNING', progress_percent: 99.99, current_item: null });
       await waitFor(() => expect(screen.getAllByText('En curso').length).toBeGreaterThan(0));
+      expect(screen.getByText('99.9%')).toBeVisible();
+      expect(screen.queryByText('100.0%')).not.toBeInTheDocument();
       expect(destinationItemsRequests).toBe(1);
 
       completedTransfer = {
@@ -658,6 +1190,7 @@ describe('Cloud Transfer Manager', () => {
   );
 
   it('clears a transfer failure notice when polling confirms that the same transfer completed', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     const transfer = {
       id: 'transfer-1',
       public_id: 'TRF-2026-000001',
@@ -693,11 +1226,11 @@ describe('Cloud Transfer Manager', () => {
         { id: 'source', name: 'Origen', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
         { id: 'destination', name: 'Destino', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
       ] });
-      if (path.endsWith('/transfers') && init?.method === 'POST') return jsonResponse(transfer, 201);
+      if (isTransferCollectionRequest(path) && init?.method === 'POST') return jsonResponse(transfer, 201);
       if (path.endsWith('/events')) return jsonResponse({ items: [
         { event_type: 'FAILURE_DIAGNOSTIC', message: 'No se pudo completar la transferencia.' },
       ] });
-      if (path.endsWith('/transfers')) {
+      if (isTransferCollectionRequest(path)) {
         return jsonResponse({ items: latestTransfer ? [latestTransfer] : [] });
       }
       if (path.includes('/connections/source/items')) return jsonResponse({ items: [
@@ -729,10 +1262,8 @@ describe('Cloud Transfer Manager', () => {
       files_completed: 1,
       bytes_transferred: 4,
     };
-    await waitFor(
-      () => expect(screen.queryByText('No se pudo completar la transferencia.')).not.toBeInTheDocument(),
-      { timeout: 6_000 },
-    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    expect(screen.queryByText('No se pudo completar la transferencia.')).not.toBeInTheDocument();
   }, 10_000);
 
   it('requires the user to change an initial password before normal use', async () => {
@@ -747,7 +1278,7 @@ describe('Cloud Transfer Manager', () => {
         return jsonResponse({ id: 'user-1', username: 'newuser', email: 'new@example.test', role: 'USER', must_change_password: true });
       }
       if (path.endsWith('/auth/password')) return jsonResponse({ message: 'Contraseña actualizada' });
-      if (path.endsWith('/connections') || path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (path.endsWith('/connections') || isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -781,7 +1312,7 @@ describe('Cloud Transfer Manager', () => {
       }, 201);
       if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
       if (path.endsWith('/connections')) return jsonResponse({ items: [] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -813,7 +1344,7 @@ describe('Cloud Transfer Manager', () => {
       if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
       if (path.endsWith('/connections')) return jsonResponse({ items: [] });
       if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -847,7 +1378,7 @@ describe('Cloud Transfer Manager', () => {
       if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
       if (path.endsWith('/connections')) return jsonResponse({ items: [] });
       if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -893,7 +1424,7 @@ describe('Cloud Transfer Manager', () => {
       if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
       if (path.endsWith('/connections')) return jsonResponse({ items: [] });
       if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -942,7 +1473,7 @@ describe('Cloud Transfer Manager', () => {
       if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
       if (path.endsWith('/connections')) return jsonResponse({ items: [] });
       if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -991,7 +1522,7 @@ describe('Cloud Transfer Manager', () => {
       if (path.endsWith('/users')) return jsonResponse({ items: [], total_count: 0 });
       if (path.endsWith('/connections')) return jsonResponse({ items: [] });
       if (path.endsWith('/audit-events?limit=20')) return jsonResponse({ items: [] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
@@ -1038,7 +1569,7 @@ describe('Cloud Transfer Manager', () => {
         return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
       }
       if (path.endsWith('/connections')) return jsonResponse({ items: [smb, drive] });
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       if (path.includes('/items?')) return jsonResponse({ items: [], next_cursor: null, total_count: 0 });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
@@ -1096,7 +1627,7 @@ describe('Cloud Transfer Manager', () => {
           { id: 'drive', name: 'Google Drive', provider_type: 'GOOGLE_DRIVE', status: 'ACTIVE', credentials_configured: true },
         ] });
       }
-      if (path.endsWith('/transfers') && init?.method === 'POST') return jsonResponse(failedTransfer, 201);
+      if (isTransferCollectionRequest(path) && init?.method === 'POST') return jsonResponse(failedTransfer, 201);
       if (path.endsWith('/items?limit=100')) {
         return jsonResponse({
           items: [{
@@ -1119,7 +1650,7 @@ describe('Cloud Transfer Manager', () => {
         resumed = true;
         return jsonResponse({ ...failedTransfer, status: 'QUEUED', attempt_count: 2 }, 202);
       }
-      if (path.endsWith('/transfers')) return jsonResponse({ items: [failedTransfer] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [failedTransfer] });
       return jsonResponse({ detail: 'Not found' }, 404);
     });
 
