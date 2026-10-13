@@ -51,6 +51,7 @@ import { Controller, useForm } from 'react-hook-form';
 import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { z } from 'zod';
 import { apiRequest, ApiError } from './api';
+import DocumentationSection from './DocumentationSection';
 import './styles.css';
 
 type User = { id: string; username: string; email: string; role: 'ADMIN' | 'USER'; must_change_password?: boolean };
@@ -1620,7 +1621,7 @@ function TransferWorkspace({
   onUserUpdated: (patch: Partial<User>) => void;
 }) {
   const queryClient = useQueryClient();
-  const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections' | 'private' | 'scheduled'>('explorer');
+  const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections' | 'private' | 'scheduled' | 'documentation'>('explorer');
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
     queryFn: () => apiRequest<{ items: Connection[] }>('/api/v1/connections'),
@@ -2186,12 +2187,13 @@ function TransferWorkspace({
           <Tabs
             className="header-navigation"
             value={workspaceSection}
-            onChange={(_event, value: 'explorer' | 'connections' | 'private' | 'scheduled') => setWorkspaceSection(value)}
+            onChange={(_event, value: 'explorer' | 'connections' | 'private' | 'scheduled' | 'documentation') => setWorkspaceSection(value)}
             aria-label="Secciones principales"
           >
             <Tab value="explorer" label="Explorador" />
             <Tab value="private" label="Servicios privados" />
             <Tab value="scheduled" label="Programaciones" />
+            <Tab value="documentation" label="Documentación" />
             {user.role === 'ADMIN' && <Tab value="connections" label="Conexiones" />}
           </Tabs>
           <Stack className="topbar-actions" direction="row" alignItems="center" spacing={1.5}>
@@ -2349,14 +2351,18 @@ function TransferWorkspace({
                 ? 'ADMINISTRACIÓN DE CONEXIONES'
                 : workspaceSection === 'private'
                   ? 'ORÍGENES DE RED PRIVADA'
-                  : workspaceSection === 'scheduled' ? 'COLA DE TRANSFERENCIAS' : 'CENTRO DE TRANSFERENCIAS'}
+                  : workspaceSection === 'scheduled'
+                    ? 'COLA DE TRANSFERENCIAS'
+                    : workspaceSection === 'documentation' ? 'GUÍA DE USO' : 'CENTRO DE TRANSFERENCIAS'}
             </Typography>
             <Typography variant="h4" component="h1">
               {workspaceSection === 'connections'
                 ? 'Conexiones'
                 : workspaceSection === 'private'
                   ? 'Servicios privados'
-                  : workspaceSection === 'scheduled' ? 'Programaciones' : 'Explorador de archivos'}
+                  : workspaceSection === 'scheduled'
+                    ? 'Programaciones'
+                    : workspaceSection === 'documentation' ? 'Documentación' : 'Explorador de archivos'}
             </Typography>
             <Typography color="text.secondary" sx={{ mt: 0.6 }}>
               {workspaceSection === 'connections'
@@ -2365,7 +2371,9 @@ function TransferWorkspace({
                   ? 'Explora carpetas del NAS accesible desde la red de Cloud Transfer Manager.'
                   : workspaceSection === 'scheduled'
                     ? 'Revisa horarios, dependencias y acciones de las transferencias programadas.'
-                    : 'Copia archivos entre tus servicios cloud y los NAS conectados.'}
+                    : workspaceSection === 'documentation'
+                      ? 'Conoce cómo transferir archivos y cómo se administran la cola, la capacidad y el progreso.'
+                      : 'Copia archivos entre tus servicios cloud y los NAS conectados.'}
             </Typography>
           </Box>
         </Box>
@@ -2500,6 +2508,8 @@ function TransferWorkspace({
               </Typography>
             )}
           </Paper>
+        ) : workspaceSection === 'documentation' ? (
+          <DocumentationSection />
         ) : (
           <>
             {connectionsQuery.isError && <Alert severity="error" sx={{ mb: 2 }}>No se pudieron cargar las conexiones.</Alert>}

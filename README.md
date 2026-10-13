@@ -6,6 +6,8 @@ Cloud Transfer Manager (CTM) es una aplicación web privada para explorar y copi
 
 La aplicación incluye autenticación y administración de usuarios, conexiones cloud y privadas, exploración de archivos, transferencias inmediatas o programadas, seguimiento de progreso en vivo e historial. El backend y los workers persistentes usan PostgreSQL y Redis; el modo de desarrollo también ofrece `MemoryStore` y `MockStorageProvider`.
 
+El estado por módulo, las extensiones agregadas desde el alcance inicial y las validaciones todavía pendientes están resumidos en [Estado de implementación](docs/implementation-status.md). La disponibilidad de adaptadores en el código no implica que se hayan probado contra las credenciales y servicios de cada instalación.
+
 | Área | Implementación disponible |
 |---|---|
 | Usuarios | Roles `ADMIN` y `USER`, sesiones con cookies `HttpOnly`, contraseñas con Argon2id, cambio inicial de contraseña y alta del primer administrador mediante CLI. |
@@ -14,6 +16,7 @@ La aplicación incluye autenticación y administración de usuarios, conexiones 
 | Transferencias | Copias inmediatas y programadas de una sola ejecución; modos `AUTO` y `EXCLUSIVE`, dependencias opcionales, reintentos, cancelación y reanudación donde el adaptador lo permite. |
 | Seguimiento | Progreso por SSE, estados en segundo plano, historial y resultado por archivo para transferencias SMB. |
 | Administración | Gestión de usuarios, permisos de conexiones privadas, auditoría reciente y configuración/prueba de correo SMTP. |
+| Interfaz | Navegación principal por secciones y acciones de cuenta (administración, cambio de contraseña y cierre de sesión) agrupadas en el menú del perfil. |
 
 Las programaciones no son recurrentes. Una programación tampoco crea conectividad de red: para SMB, el host Docker debe poder llegar al NAS cuando se ejecute el trabajo. CTM no crea ni administra VPN. La interfaz no ofrece operaciones de borrado, movimiento, sincronización ni creación manual de carpetas. Las carpetas seleccionadas se copian con su estructura.
 

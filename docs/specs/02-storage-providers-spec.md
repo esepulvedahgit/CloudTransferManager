@@ -80,7 +80,7 @@ class StorageProvider(ABC):
 - **Motor:** El binario oficial MEGAcmd gestiona la sesión, exploración, cuota, descargas y subidas de MEGA; Rclone no se usa como backend MEGA.
 - **Seguridad y ciclo de vida:** El login se envía a `mega-cmd` por stdin (nunca como argumento del proceso). Cada sesión usa un `HOME` privado y efímero, ejecuta logout/quit y elimina su caché al cerrarse.
 - **Límites de espera:** Login: 30 s; listado/cuota: 10 s; logout/quit: 3 s por cliente, con cierre acotado a 5 s por paso. Las tuberías heredadas por el daemon no pueden dejar el cliente esperando indefinidamente. Un logout agotado no impide intentar quit; si quit falla, se conserva el HOME y se informa el fallo. Las descargas/subidas no tienen este límite de metadatos.
-- **Comandos permitidos:** `mega-ls`, `mega-df`, `mega-get`, `mega-put -c`, `mega-logout` y `mega-quit`; no se invocan comandos remotos destructivos.
+- **Comandos permitidos:** `mega-ls`, `mega-df`, `mega-get`, `mega-put -c`, `mega-mkdir -p` (solo carpetas de destino), `mega-logout` y `mega-quit`; no se invocan comandos remotos destructivos.
 - MEGA no garantiza hashes ni fechas de modificación en todas las respuestas; los metadatos opcionales permanecen como `None` cuando no están disponibles.
 - El parser de `mega-ls -l` excluye los encabezados de columnas (`FLAGS ... NAME`) y los títulos de directorio con ruta absoluta antes de crear elementos, paginar o contar archivos. Un archivo real llamado `NAME` se conserva.
 - Las transferencias con MEGA se realizan por archivo individual mediante staging local temporal, que se elimina antes de procesar el siguiente archivo.
@@ -108,6 +108,13 @@ class StorageProvider(ABC):
 ### D. Proveedor Mock (`MockStorageProvider`)
 - Implementación en memoria que simula un árbol de directorios con archivos ficticios y latencias programables.
 - **Uso obligatorio en la Fase 2** para construir y validar el *Vertical Slice* de la aplicación antes de depender de credenciales reales.
+
+### E. Recursos SMB/NAS (`RcloneSmbProvider`)
+- SMB se registra como `provider_type=SMB` y permite explorar un recurso compartido y una carpeta base configurada. El host debe estar en `SMB_ALLOWED_TARGETS`; una lista vacía deniega el acceso.
+- En el flujo de migración de la UI, el NAS es origen y MEGA, Google Drive o Seafile es destino. La aplicación no crea ni administra la VPN o las rutas de red necesarias.
+- Rclone usa SMB únicamente desde el backend/worker, con configuración temporal por trabajo y la misma allowlist de comandos. El worker inventaría el árbol en un manifiesto persistido por páginas y registra el resultado por archivo.
+- La credencial queda cifrada como las demás conexiones. El host, recurso compartido y carpeta base forman la raíz lógica visible como `/`. La UI excluye SMB del selector de destino, pero `POST /api/v1/transfers` no valida ese límite por tipo de proveedor; agregar o mantener una restricción de servidor si SMB debe ser solo origen.
+- La guía operativa y sus límites están en [`docs/integrations/smb-nas-setup.md`](../integrations/smb-nas-setup.md).
 
 ---
 

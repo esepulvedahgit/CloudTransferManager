@@ -70,11 +70,16 @@ Para evitar almacenar credenciales sensibles en variables de entorno, Compose mo
 ```yaml
 volumes:
   postgres_data:
-    driver: local
+  redis_data:
   application_logs:
-    driver: local
 ```
-*Los archivos de configuración Rclone se guardan en un `tmpfs` privado por contenedor y se eliminan al terminar cada invocación. El staging MEGA↔Drive es configurable, disk-backed y no persistente; cada directorio temporal por archivo se elimina antes de procesar el siguiente.*
+
+- `postgres_data`: datos de PostgreSQL, incluidas credenciales cifradas.
+- `redis_data`: persistencia AOF de Redis.
+- `application_logs`: logs de aplicación y workers.
+- Las configuraciones efímeras de Rclone están bajo `TRANSFER_TEMP_PATH` (por defecto `/var/lib/cloud-transfer/tmp`), montado como `tmpfs` de 64 MiB en backend y worker. Se crea un archivo por invocación, modo `0600`, que se elimina incluso tras error o cancelación.
+- `TRANSFER_STAGING_PATH` (por defecto `/var/lib/cloud-transfer/staging`) es temporal disk-backed dentro del filesystem writable del contenedor, no es volumen ni `tmpfs`. Los adaptadores que lo requieren usan un archivo a la vez y limpian su directorio al terminar cada archivo. Dimensionar el disco Docker para el archivo mayor más la reserva/margen configurados.
+- `/run/ctm-secrets` es `tmpfs` efímero para las copias de secretos que crea el entrypoint con modo `0700`; no confundirlo con datos persistentes.
 
 ---
 
@@ -95,8 +100,9 @@ volumes:
 ```ini
 APP_ENV=production
 APP_BASE_URL=https://cloud-transfer.intranet
-APP_SECRET_KEY=cambiar_en_produccion_clave_secreta_de_sesiones_64_caracteres
-MASTER_ENCRYPTION_KEY_FILE=/run/ctm-secrets/master_key
+HTTP_PORT=8080
+HTTPS_PORT=8443
+APP_SECRET_KEY_FILE=/run/ctm-secrets/app_secret_key
 POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 POSTGRES_DB=cloud_transfer
@@ -105,6 +111,9 @@ POSTGRES_PASSWORD_FILE=/run/ctm-secrets/postgres_password
 REDIS_URL=redis://redis:6379/0
 RCLONE_BINARY=/usr/bin/rclone
 MEGACMD_BINARY_DIR=/usr/bin
+SMB_ALLOWED_TARGETS=
+SMB_INTERACTIVE_TIMEOUT_SECONDS=30
+SMB_TRANSFER_MAX_FILES=100000
 TRANSFER_MAX_CONCURRENT=1
 TRANSFER_MAX_FILES=5000
 TRANSFER_MAX_FILE_BYTES=0
@@ -113,12 +122,14 @@ TRANSFER_STAGING_MARGIN_PERCENT=20
 TRANSFER_TEMP_PATH=/var/lib/cloud-transfer/tmp
 TRANSFER_STAGING_PATH=/var/lib/cloud-transfer/staging
 TRANSFER_MAX_RETRIES=5
-SMTP_HOST=smtp.intranet.local
+SMTP_HOST=
 SMTP_PORT=587
-SMTP_USERNAME=notificaciones@intranet.local
+SMTP_USERNAME=
 SMTP_PASSWORD_FILE=/run/ctm-secrets/smtp_password
 SMTP_USE_TLS=true
-SMTP_FROM_ADDRESS=notificaciones@intranet.local
+SMTP_FROM_ADDRESS=
 SESSION_COOKIE_SECURE=true
 SESSION_MAX_AGE_SECONDS=28800
 ```
+
+Los archivos reales se generan con `scripts/setup-local-secrets.sh`; este ejemplo no contiene sus valores. Compose suministra `MASTER_ENCRYPTION_KEY_FILE=/run/ctm-secrets/master_key` al backend y a los workers que necesitan descifrar credenciales. El catálogo completo y las reglas de cambio de rutas/temporales están en `README.md`.

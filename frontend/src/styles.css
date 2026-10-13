@@ -366,6 +366,88 @@ button, input { font: inherit; }
   .header-navigation .MuiTab-root { transition: none; }
 }
 
+.documentation-page { display: grid; gap: 22px; padding-bottom: 14px; }
+.documentation-intro.MuiPaper-root {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 24px 28px;
+  border: 1px solid #e3eaf3;
+  border-radius: 16px;
+  background: #fff;
+}
+.documentation-eyebrow.MuiTypography-overline { color: #2864dc; font-size: 10px; font-weight: 750; letter-spacing: .13em; }
+.documentation-intro .MuiTypography-h5 { margin-top: 2px; font-size: clamp(1.2rem, 2.5vw, 1.55rem); font-weight: 750; letter-spacing: -.025em; }
+.documentation-intro-badge { display: grid; justify-items: center; align-content: center; min-width: 100px; min-height: 90px; padding: 10px; border: 1px solid #dce8ff; border-radius: 14px; background: #f4f8ff; }
+.documentation-intro-badge .MuiTypography-overline { color: #6e7f98; font-size: 9px; font-weight: 750; letter-spacing: .1em; }
+.documentation-intro-badge .MuiTypography-h6 { color: #2458bd; font-size: 19px; font-weight: 800; }
+.documentation-index-nav { display: flex; flex-wrap: wrap; gap: 4px; padding: 5px; border: 1px solid #e3eaf3; border-radius: 12px; background: rgba(255,255,255,.78); }
+.documentation-index-nav .MuiButton-root { min-height: 36px; padding-inline: 12px; border-radius: 8px; color: #63738a; font-size: 12px; font-weight: 650; text-transform: none; }
+.documentation-index-nav .MuiButton-root:focus-visible { outline: 3px solid rgba(40,100,220,.35); outline-offset: 1px; }
+.documentation-block { display: grid; gap: 14px; scroll-margin-top: 118px; }
+.documentation-block-heading { display: flex; align-items: center; gap: 12px; }
+.documentation-block-heading .MuiTypography-h5 { color: #18283f; font-size: 20px; font-weight: 750; letter-spacing: -.02em; }
+.documentation-block-heading .documentation-eyebrow { display: block; margin-bottom: 1px; }
+.documentation-index.MuiChip-root { width: 38px; height: 38px; border: 1px solid #dce8ff; border-radius: 12px; background: #edf3ff; color: #2458bd; font-size: 12px; font-weight: 800; }
+.documentation-step-grid, .documentation-mode-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.documentation-card.MuiCard-root { height: 100%; border-color: #e3eaf3; border-radius: 13px; background: #fff; }
+.documentation-card .MuiCardContent-root { padding: 18px 20px; }
+.documentation-card .MuiCardContent-root:last-child { padding-bottom: 18px; }
+.documentation-card .MuiTypography-subtitle1 { color: #253a56; font-size: 14px; line-height: 1.4; }
+.documentation-card .MuiTypography-body2 { line-height: 1.65; }
+.documentation-card code { padding: 1px 4px; border-radius: 4px; background: #f0f4f9; color: #354b69; font-size: .88em; }
+.documentation-note.MuiAlert-root { border: 1px solid #dce8ff; border-radius: 12px; background: #f4f8ff; color: #42546c; }
+.documentation-note .MuiAlert-icon { color: #2864dc; }
+.documentation-table-wrap { overflow-x: auto; border: 1px solid #e3eaf3; border-radius: 13px; background: #fff; }
+.documentation-limits-table { width: 100%; min-width: 700px; border-collapse: collapse; text-align: left; }
+.documentation-limits-table th, .documentation-limits-table td { padding: 13px 16px; border-bottom: 1px solid #edf1f6; vertical-align: top; font-size: 13px; line-height: 1.55; }
+.documentation-limits-table thead th { background: #f8fafc; color: #68788e; font-size: 10px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+.documentation-limits-table tbody th { width: 25%; color: #253a56; font-weight: 700; }
+.documentation-limits-table tbody td:nth-child(2) { width: 130px; color: #2458bd; white-space: nowrap; }
+.documentation-limits-table tbody td:last-child { color: #63738a; }
+.documentation-limits-table tbody tr:last-child th, .documentation-limits-table tbody tr:last-child td { border-bottom: 0; }
+.documentation-two-column { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.documentation-callout.MuiPaper-root, .documentation-mode-card.MuiPaper-root { height: 100%; padding: 18px 20px; border: 1px solid #e3eaf3; border-radius: 13px; background: #fff; }
+.documentation-callout .MuiTypography-subtitle1, .documentation-mode-card .MuiTypography-subtitle1 { color: #253a56; font-size: 14px; }
+.documentation-callout .MuiTypography-body2, .documentation-mode-card .MuiTypography-body2 { line-height: 1.65; }
+.documentation-mode-grid { margin-top: 12px; }
+.documentation-mode-card.MuiPaper-root { background: #f9fbfe; }
+.documentation-inline-note { padding: 4px 2px; line-height: 1.65 !important; }
+.documentation-three-column { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.documentation-statuses { padding: 17px 20px; border: 1px solid #e3eaf3; border-radius: 13px; background: #fff; }
+.documentation-diagram-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
+.documentation-diagram-card.MuiPaper-root { display: grid; gap: 12px; min-width: 0; margin: 0; padding: 18px; border: 1px solid #e3eaf3; border-radius: 14px; background: #fff; }
+.documentation-diagram-copy .MuiTypography-subtitle1 { color: #253a56; font-size: 15px; }
+.documentation-diagram-copy .MuiTypography-body2 { margin-top: 4px; line-height: 1.6; }
+.documentation-diagram-image-link { display: block; overflow: auto; border: 1px solid #edf1f6; border-radius: 10px; background: #f4f7fb; line-height: 0; }
+.documentation-diagram-image { display: block; width: 100%; height: auto; }
+.documentation-diagram-image-link:focus-visible { outline: 3px solid rgba(40,100,220,.45); outline-offset: 2px; }
+.documentation-diagram-card figcaption { line-height: 1.5; }
+.documentation-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 15px 2px 0; border-top: 1px solid #e3eaf3; }
+.documentation-footer .MuiTypography-caption { max-width: 920px; line-height: 1.6; }
+
+@media (hover: hover) and (pointer: fine) {
+  .documentation-index-nav .MuiButton-root:hover { color: #2458bd; background: #edf3ff; }
+  .documentation-diagram-image-link:hover { border-color: #cddcf5; }
+}
+
+@media (max-width: 900px) {
+  .documentation-three-column { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .documentation-diagram-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 620px) {
+  .documentation-page { gap: 18px; }
+  .documentation-intro.MuiPaper-root { align-items: flex-start; padding: 19px; }
+  .documentation-intro-badge { min-width: 78px; min-height: 78px; }
+  .documentation-index-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .documentation-index-nav .MuiButton-root { justify-content: flex-start; padding-inline: 9px; }
+  .documentation-step-grid, .documentation-mode-grid, .documentation-two-column, .documentation-three-column { grid-template-columns: minmax(0, 1fr); }
+  .documentation-card .MuiCardContent-root, .documentation-callout.MuiPaper-root, .documentation-mode-card.MuiPaper-root { padding: 16px; }
+  .documentation-footer { align-items: flex-start; flex-direction: column; }
+}
+
 .background-transfers-trigger.MuiIconButton-root {
   width: 38px;
   height: 38px;

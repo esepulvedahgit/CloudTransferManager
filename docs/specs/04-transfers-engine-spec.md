@@ -29,7 +29,7 @@ El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Co
    - `lsjson`: Listado detallado de elementos en JSON.
    - `about`: Consulta de cuota y espacio.
    - `size`: Cálculo de tamaño total y cantidad de archivos.
-3. **Lista Blanca de MEGAcmd:** Solo `mega-ls`, `mega-df`, `mega-get`, `mega-put -c`, `mega-logout` y `mega-quit`.
+3. **Lista Blanca de MEGAcmd:** Solo `mega-ls`, `mega-df`, `mega-get`, `mega-put -c`, `mega-mkdir -p` (para estructura de destino), `mega-logout` y `mega-quit`.
 4. **Comandos Estrictamente Prohibidos:**
    - `delete`, `purge`, `sync`, `move`, `moveto`, `rmdir`, `dedupe`, `serve`, `mount`, `config dump`.
 5. **Archivo de Configuración Temporal Efímero para Rclone:**

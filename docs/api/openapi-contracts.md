@@ -25,7 +25,8 @@ Todas las mutaciones requieren el encabezado `X-CSRF-Token`. Obtenerlo con `GET 
   "id": "e267fe79-086e-4519-a749-5be01e034efe",
   "username": "admin",
   "email": "admin@intranet.local",
-  "role": "ADMIN"
+  "role": "ADMIN",
+  "must_change_password": true
 }
 ```
 - **Response `401 Unauthorized`:**
@@ -39,7 +40,7 @@ Todas las mutaciones requieren el encabezado `X-CSRF-Token`. Obtenerlo con `GET 
 - **Response `200 OK`:** Invalida sesión y limpia cookie.
 
 ### `GET /api/v1/auth/me`
-- **Response `200 OK`:** Devuelve datos del usuario autenticado.
+- **Response `200 OK`:** Devuelve `id`, `username`, `email`, `role` y `must_change_password` del usuario autenticado.
 
 ### `POST /api/v1/auth/password`
 - **Request Body:** `{ "current_password": "...", "new_password": "..." }` (mínimo 12 caracteres).
@@ -110,10 +111,10 @@ Todas las rutas requieren una sesión de administrador. `PUT` y `POST .../test` 
 
 ---
 
-## 4. Conexiones (`/connections`)
+## 4. Conexiones (`/connections`) [Creación y administración solo ADMIN]
 
 `GET /api/v1/connections` devuelve únicamente las conexiones globales o asignadas al usuario. Los campos de credenciales nunca forman parte de las respuestas.
-Las conexiones MEGA, Google Drive y Seafile nuevas quedan `INACTIVE` hasta superar la prueba; las simuladas quedan activas. Un administrador puede ejecutar la prueba desde el explorador o mediante el endpoint siguiente.
+Las conexiones MEGA, Google Drive, Seafile y SMB nuevas quedan `INACTIVE` hasta superar la prueba; las simuladas quedan activas. Un administrador puede ejecutar la prueba desde el explorador o mediante el endpoint siguiente.
 
 ### `DELETE /api/v1/connections/{connection_id}` [Solo ADMIN]
 - Requiere CSRF y archiva la conexión de forma lógica; no elimina la fila ni las referencias de transferencias históricas.
@@ -166,6 +167,25 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 - `adapter_type` acepta `RCLONE` o `SEAFILE_API`; omitirlo equivale a `RCLONE`. La API es una elección explícita por conexión y un error nunca cambia de adaptador.
 - `library` y `library_password` son opcionales. Sin biblioteca fija, el explorador muestra las bibliotecas disponibles; la contraseña se usa solo para una biblioteca cifrada.
 - La respuesta contiene `adapter_type` y `credentials_configured`, pero nunca credenciales, OTP ni token de Seafile.
+
+- **Request Body (SMB/NAS):**
+```json
+{
+  "name": "NAS de proyectos",
+  "provider_type": "SMB",
+  "is_global": false,
+  "credentials": {
+    "host": "nas.example.intranet",
+    "port": 445,
+    "share": "proyectos",
+    "base_path": "",
+    "domain": "INTRANET",
+    "username": "operador",
+    "password": "secreto"
+  }
+}
+```
+El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB se usa como origen; el operador debe preparar la ruta y el firewall hacia el NAS.
 
 ### `POST /api/v1/connections/{connection_id}/google-oauth/start` [Solo ADMIN]
 - **Response `200 OK`:** `{ "authorization_url": "https://accounts.google.com/..." }`. El estado anti-CSRF queda vinculado a la sesión del administrador; el navegador no recibe el secreto del cliente ni tokens.
@@ -236,6 +256,7 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 
 ### `POST /api/v1/transfers`
 - Acepta hasta 100 rutas de origen y responde `201 Created` al registrar y agendar el trabajo. La existencia de cada ruta se valida en el worker para que una consulta lenta del proveedor no bloquee la solicitud HTTP.
+- La interfaz solo ofrece conexiones SMB como origen y filtra SMB del selector de destino. El endpoint no impone actualmente esa restricción por tipo de proveedor.
 - `scheduled_at` opcional acepta una fecha futura con offset; el servidor la normaliza a UTC. `schedule_timezone` debe ser una zona IANA y conserva la zona mostrada en la interfaz. Si no se envía `scheduled_at`, el trabajo queda en la cola normal.
 - `execution_mode` opcional admite `AUTO` (predeterminado) o `EXCLUSIVE`. `depends_on_transfer_id` es opcional y solo libera el trabajo cuando el padre finaliza correctamente, incluso con advertencias.
 - El worker aplica `TRANSFER_MAX_FILES` (predeterminado 5000), el límite opcional `TRANSFER_MAX_FILE_BYTES` (0 = sin límite fijo) y la reserva de staging antes de escribir en destino. Si el preflight falla, la transferencia pasa a `FAILED`; el usuario puede ver el mensaje seguro en `/api/v1/transfers/{transfer_id}/events`.
@@ -296,6 +317,14 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 ### `GET /api/v1/transfers/{transfer_id}/events`
 - Devuelve eventos auditables con categorías de error y detalles técnicos sanitizados; solo el solicitante o ADMIN puede consultarlos.
 
+### `GET /api/v1/transfers/{transfer_id}/items`
+- Devuelve una página del manifiesto (entradas de directorio y estados `PENDING`, `COPIED`, `SKIPPED` o `FAILED`).
+- Acepta `after_id` como cursor y `limit` de 1 a 200; la respuesta incluye `next_cursor` y los conteos agregados.
+
+### `POST /api/v1/transfers/{transfer_id}/resume`
+- Disponible para transferencias SMB en estado `FAILED` o `CANCELLED` cuando el manifiesto conserva archivos pendientes/fallidos y ambas conexiones siguen activas.
+- Requiere que las versiones de credenciales y la raíz SMB coincidan con las capturadas por el trabajo. Responde `202 Accepted`; no reanuda transferencias de otros proveedores.
+
 ### `POST /api/v1/transfers/{transfer_id}/cancel`
 - Para una transferencia pendiente sin reserva, la cancela de inmediato. Si ya fue admitida, envía la orden al worker y pasa a `CANCELLING`.
 
@@ -303,3 +332,12 @@ Para Google Drive se envían inicialmente `client_id` y `client_secret` (más `t
 
 ### `GET /api/v1/audit-events?limit=100`
 - Devuelve los eventos de auditoría más recientes, con secretos sanitizados.
+
+## 8. Salud del servicio
+
+### `GET /health/live`
+- `200 OK` cuando el proceso HTTP responde.
+
+### `GET /health/ready`
+- `200 OK` cuando el almacenamiento, Redis y los componentes requeridos para el modo de despliegue están disponibles.
+- `503 Service Unavailable` cuando falta una dependencia o un worker Celery requerido.

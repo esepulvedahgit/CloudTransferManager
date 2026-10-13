@@ -28,6 +28,9 @@ CREATE INDEX idx_audit_events_action ON audit_events(action);
 CREATE INDEX idx_audit_events_created_at ON audit_events(created_at);
 ```
 
+### Estado de implementación
+La aplicación agrega eventos y expone solo una consulta administrativa; no tiene rutas para editarlos o borrarlos. El esquema actual no define un trigger ni permisos SQL que impidan modificar/borrar filas directamente. Por lo tanto, el registro es append-only en el flujo de aplicación, pero la inmutabilidad frente a una cuenta con acceso de escritura a PostgreSQL sigue pendiente si se exige como garantía de seguridad.
+
 ### Eventos Auditados Obligatoriamente:
 - Inicio de sesión (exitoso y fallido) y cierre de sesión.
 - Cambio y restablecimiento de contraseña.

@@ -1,18 +1,20 @@
 # Especificación 00: Visión General y Alcance del MVP
 
 ## 1. Contexto y Objetivos del Producto
-**Cloud Transfer Manager (CTM)** es una aplicación web multiusuario privada, desplegada localmente mediante Docker y accesible exclusivamente desde la red interna de una organización.
+**Cloud Transfer Manager (CTM)** es una aplicación web multiusuario privada, desplegada mediante Docker Compose y pensada para una red controlada por la organización. El reverse proxy publica la interfaz; PostgreSQL, Redis, API y workers permanecen en redes internas. El acceso desde una LAN depende también del firewall y del DNS/TLS administrados por la instalación.
 
 Su objetivo primordial es proporcionar una interfaz visual y un motor robusto para explorar y transferir archivos entre servicios de almacenamiento en la nube, usando **Rclone** como motor interno aislado.
 
-### Caso de Uso Primario del MVP:
-> Transferir archivos y carpetas bidireccionalmente entre **MEGA** y **Google Drive** (`MEGA -> Google Drive` y `Google Drive -> MEGA`), estableciendo una arquitectura extensible para admitir posteriormente Wasabi, Amazon S3, MEGA S4 y Azure Blob Storage sin reescribir el núcleo.
+### Caso de Uso Base y Alcance Actual
+El caso inicial era transferir archivos y carpetas bidireccionalmente entre **MEGA** y **Google Drive** mediante `COPY`. La aplicación actual conserva ese flujo y amplía el alcance: admite **Seafile** mediante Rclone o su adaptador API opcional, y permite explorar recursos **SMB/NAS como origen** y copiarlos a MEGA, Google Drive o Seafile.
+
+El detalle de qué está implementado y qué necesita validación operacional se mantiene en [Estado de implementación](../implementation-status.md). Las especificaciones describen contratos y restricciones; no son por sí solas evidencia de que una ejecución de CI o una prueba contra un proveedor externo haya pasado.
 
 ---
 
 ## 2. Alcance del MVP vs Fuera de Alcance
 
-### En el Alcance (MVP):
+### Alcance base y funcionalidades implementadas
 1. Autenticación local mediante sesiones seguras (cookies HttpOnly/SameSite/CSRF).
 2. Cuenta de administrador inicial creada por comando CLI seguro (`python -m app.cli create-admin`).
 3. Administración de usuarios (CRUD, activación/desactivación, restablecimiento de clave).
@@ -32,9 +34,11 @@ Su objetivo primordial es proporcionar una interfaz visual y un motor robusto pa
 17. Cifrado en reposo para credenciales sensibles (AES-256-GCM / Envelope con Master Key externa).
 18. Programación única de copias con zona horaria, modo automático/exclusivo y dependencias opcionales entre trabajos.
 
-### Fuera del Alcance (Versiones Posteriores):
-- Proveedores adicionales: Amazon S3, Wasabi, MEGA S4, Azure Blob, OneDrive, Backblaze B2.
-- Programaciones recurrentes (CRON).
+Las capacidades que se añadieron después del alcance inicial se detallan en las especificaciones e integraciones correspondientes: SMB/NAS, Seafile, archivado lógico de conexiones, configuración SMTP desde Administración, programación durable y su indicador de trabajos en segundo plano. No se debe interpretar esta lista como un resultado de certificación: la [matriz de estado](../implementation-status.md) separa implementación en el repositorio de comprobación en un despliegue real.
+
+### Fuera del Alcance actual
+- Proveedores cloud adicionales: Amazon S3, Wasabi, MEGA S4, Azure Blob, OneDrive y Backblaze B2.
+- Programaciones recurrentes (CRON); solo hay ejecuciones únicas.
 - Sincronización bidireccional (`sync`).
 - Eliminación automática de archivos en origen (`move`).
 - Límites de ancho de banda o cuotas por usuario.
@@ -52,9 +56,10 @@ Su objetivo primordial es proporcionar una interfaz visual y un motor robusto pa
 2. **Operación Exclusiva `COPY`:**
    - En el MVP, las transferencias solo copian. **NUNCA** se eliminan ni alteran archivos en el proveedor de origen.
    - Operaciones destructivas (`delete`, `purge`, `sync`, `move`) están deshabilitadas a nivel de código y bloqueadas por lista blanca.
-3. **Persistencia Cero de Archivos Locales:**
-   - Las transferencias deben transmitirse por streaming o mediante almacenamiento temporal acotado (`/var/lib/cloud-transfer/tmp`).
-   - El almacenamiento temporal debe auto-limpiarse inmediatamente al terminar o fallar el trabajo.
+3. **Sin persistencia de contenido de transferencia:**
+   - Los archivos pueden pasar por staging local por archivo en `/var/lib/cloud-transfer/staging` cuando el adaptador lo requiere. Ese directorio es disk-backed, no es un volumen persistente ni `tmpfs`, y se limpia antes de continuar con el siguiente archivo.
+   - Las configuraciones efímeras de Rclone se guardan en `/var/lib/cloud-transfer/tmp`, montado como `tmpfs`, con modo `0600`; se eliminan tras éxito, fallo o cancelación.
+   - Ver [Despliegue](../../README.md#temporales-secretos-y-datos-persistentes) para capacidad, rutas y operación de los temporales.
 4. **Terminología Adaptada por Proveedor:**
    - **Google Drive:** Unidades, Unidades Compartidas, Carpetas y Archivos.
    - **MEGA Tradicional:** Carpetas y Archivos (NO presentar como buckets).
@@ -62,7 +67,9 @@ Su objetivo primordial es proporcionar una interfaz visual y un motor robusto pa
 
 ---
 
-## 4. Los 30 Criterios de Aceptación del MVP
+## 4. Los 30 Criterios de Aceptación del alcance inicial
+
+Estos criterios conservan la lista base del MVP. Su estado actual no se deduce del texto de requisito: véase el seguimiento separado en [`docs/implementation-status.md`](../implementation-status.md), que distingue código presente, aprobación de CI y validación contra servicios reales.
 
 1. El administrador puede iniciar sesión exitosamente con credenciales válidas.
 2. El administrador puede crear nuevos usuarios desde el panel.
