@@ -1592,6 +1592,124 @@ describe('Cloud Transfer Manager', () => {
     });
   });
 
+  it('lets an admin archive a NAS from Servicios privados after confirmation', async () => {
+    const nas = {
+      id: 'smb-archive-1',
+      name: 'NAS Finanzas',
+      provider_type: 'SMB',
+      status: 'ACTIVE',
+      credentials_configured: true,
+      is_global: true,
+    };
+    let archived = false;
+    const archiveRequests: Array<{ path: string; method: string | undefined }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: archived ? [] : [nas] });
+      if (path === `/api/v1/connections/${nas.id}` && init?.method === 'DELETE') {
+        archiveRequests.push({ path, method: init.method });
+        archived = true;
+        return new Response(null, { status: 204 });
+      }
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('tab', { name: 'Servicios privados' }));
+
+    const archiveButton = await screen.findByRole('button', { name: 'Archivar NAS Finanzas' });
+    fireEvent.click(archiveButton);
+    expect(await screen.findByRole('dialog', { name: 'Archivar conexión' })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancelar' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Archivar conexión' })).not.toBeInTheDocument());
+    expect(archiveRequests).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archivar NAS Finanzas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirmar archivado' }));
+
+    expect(await screen.findByText(/Conexión “NAS Finanzas” archivada/)).toBeVisible();
+    await waitFor(() => expect(screen.queryByText('NAS Finanzas', { exact: true })).not.toBeInTheDocument());
+    expect(archiveRequests).toEqual([{ path: '/api/v1/connections/smb-archive-1', method: 'DELETE' }]);
+  });
+
+  it('keeps an NAS visible and shows the error when an active transfer blocks archiving', async () => {
+    const nas = {
+      id: 'smb-busy-1',
+      name: 'NAS Operaciones',
+      provider_type: 'SMB',
+      status: 'ACTIVE',
+      credentials_configured: true,
+      is_global: true,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [nas] });
+      if (path === `/api/v1/connections/${nas.id}` && init?.method === 'DELETE') {
+        return jsonResponse({ detail: 'No se puede archivar mientras tenga transferencias activas.' }, 409);
+      }
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('tab', { name: 'Servicios privados' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Archivar NAS Operaciones' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirmar archivado' }));
+
+    expect(await screen.findByText('No se puede archivar mientras tenga transferencias activas.')).toBeVisible();
+    expect(screen.getByRole('dialog', { name: 'Archivar conexión' })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancelar' }));
+    expect(await screen.findByText('NAS Operaciones', { exact: true })).toBeVisible();
+  });
+
+  it('does not offer NAS archiving to regular users', async () => {
+    const nas = {
+      id: 'smb-user-1',
+      name: 'NAS Compartido',
+      provider_type: 'SMB',
+      status: 'ACTIVE',
+      credentials_configured: true,
+      is_global: true,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [nas] });
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('tab', { name: 'Servicios privados' }));
+
+    expect(await screen.findByText('NAS Compartido', { exact: true })).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Archivar NAS Compartido' })).not.toBeInTheDocument();
+  });
+
   it('shows the SMB file report and resumes a failed NAS transfer', async () => {
     vi.stubGlobal('EventSource', TestEventSource);
     const failedTransfer = {

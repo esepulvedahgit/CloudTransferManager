@@ -24,6 +24,8 @@ button, input { font: inherit; }
 }
 .connection-inventory-head { min-height: 44px; background: #f8fafc; color: #68788e; font-size: 11px; font-weight: 750; letter-spacing: .07em; text-transform: uppercase; }
 .connection-row { min-height: 82px; border-top: 1px solid #eef2f7; transition: background-color 150ms ease; }
+.private-service-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+.private-service-actions { justify-self: end; flex-wrap: wrap; }
 @media (hover: hover) and (pointer: fine) {
   .connection-row:hover { background: #fafcff; }
 }
@@ -159,6 +161,8 @@ button, input { font: inherit; }
     gap: 14px 12px;
     padding: 16px;
   }
+  .private-service-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .private-service-actions { grid-column: 1 / -1; justify-self: stretch; justify-content: flex-end; }
   .connection-name-field { grid-column: 1 / -1; }
   .connection-field-label { position: static; width: auto; height: auto; margin: 0; overflow: visible; clip: auto; color: #68788e; font-size: 10px; font-weight: 750; letter-spacing: .07em; text-transform: uppercase; white-space: normal; }
   .connection-test-field { grid-column: 1 / -1; }

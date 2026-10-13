@@ -1232,32 +1232,13 @@ function ConnectionManagementSection({
   onArchive: (connection: Connection) => Promise<void>;
 }) {
   const [selectedConnection, setSelectedConnection] = useState<Connection | null>(null);
-  const [archiveError, setArchiveError] = useState('');
-  const [archiving, setArchiving] = useState(false);
 
   const requestArchive = (connection: Connection) => {
-    setArchiveError('');
     setSelectedConnection(connection);
   };
 
   const closeArchiveDialog = () => {
-    if (archiving) return;
     setSelectedConnection(null);
-    setArchiveError('');
-  };
-
-  const confirmArchive = async () => {
-    if (!selectedConnection || archiving) return;
-    setArchiving(true);
-    setArchiveError('');
-    try {
-      await onArchive(selectedConnection);
-      setSelectedConnection(null);
-    } catch (caught) {
-      setArchiveError(caught instanceof Error ? caught.message : 'No se pudo archivar la conexión.');
-    } finally {
-      setArchiving(false);
-    }
   };
 
   return (
@@ -1341,36 +1322,77 @@ function ConnectionManagementSection({
         ))}
       </Paper>
 
-      <Dialog
-        open={Boolean(selectedConnection)}
+      <ConnectionArchiveDialog
+        connection={selectedConnection}
         onClose={closeArchiveDialog}
-        fullWidth
-        maxWidth="xs"
-        aria-labelledby="archive-connection-title"
-      >
-        <DialogTitle id="archive-connection-title">Archivar conexión</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2}>
-            <Typography>
-              ¿Quieres archivar <strong>{selectedConnection?.name}</strong>? Dejará de aparecer en el explorador y se quitarán sus credenciales guardadas.
-            </Typography>
-            <Typography variant="body2" color="text.secondary">
-              <span className="dialog-provider"><ProviderLogo provider={selectedConnection?.provider_type ?? ''} />Proveedor: {selectedConnection ? providerLabel(selectedConnection.provider_type) : ''}</span>
-            </Typography>
-            <Typography color="text.secondary" variant="body2">
-              El historial de transferencias se conservará. No se puede archivar una conexión mientras tenga una transferencia activa.
-            </Typography>
-            {archiveError && <Alert severity="error">{archiveError}</Alert>}
-          </Stack>
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2.5 }}>
-          <Button onClick={closeArchiveDialog} disabled={archiving}>Cancelar</Button>
-          <Button color="error" variant="contained" aria-label="Confirmar archivado" onClick={() => void confirmArchive()} disabled={archiving}>
-            {archiving ? <CircularProgress size={20} color="inherit" /> : 'Confirmar archivado'}
-          </Button>
-        </DialogActions>
-      </Dialog>
+        onArchive={onArchive}
+      />
     </Box>
+  );
+}
+
+function ConnectionArchiveDialog({
+  connection,
+  onClose,
+  onArchive,
+}: {
+  connection: Connection | null;
+  onClose: () => void;
+  onArchive: (connection: Connection) => Promise<void>;
+}) {
+  const [archiveError, setArchiveError] = useState('');
+  const [archiving, setArchiving] = useState(false);
+
+  const closeArchiveDialog = () => {
+    if (archiving) return;
+    setArchiveError('');
+    onClose();
+  };
+
+  const confirmArchive = async () => {
+    if (!connection || archiving) return;
+    setArchiving(true);
+    setArchiveError('');
+    try {
+      await onArchive(connection);
+      onClose();
+    } catch (caught) {
+      setArchiveError(caught instanceof Error ? caught.message : 'No se pudo archivar la conexión.');
+    } finally {
+      setArchiving(false);
+    }
+  };
+
+  return (
+    <Dialog
+      open={Boolean(connection)}
+      onClose={closeArchiveDialog}
+      fullWidth
+      maxWidth="xs"
+      aria-labelledby="archive-connection-title"
+    >
+      <DialogTitle id="archive-connection-title">Archivar conexión</DialogTitle>
+      <DialogContent>
+        <Stack spacing={2}>
+          <Typography>
+            ¿Quieres archivar <strong>{connection?.name}</strong>? Dejará de aparecer en el explorador y se quitarán sus credenciales guardadas.
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            <span className="dialog-provider"><ProviderLogo provider={connection?.provider_type ?? ''} />Proveedor: {connection ? providerLabel(connection.provider_type) : ''}</span>
+          </Typography>
+          <Typography color="text.secondary" variant="body2">
+            El historial de transferencias se conservará. No se puede archivar una conexión mientras tenga una transferencia activa.
+          </Typography>
+          {archiveError && <Alert severity="error">{archiveError}</Alert>}
+        </Stack>
+      </DialogContent>
+      <DialogActions sx={{ px: 3, pb: 2.5 }}>
+        <Button onClick={closeArchiveDialog} disabled={archiving}>Cancelar</Button>
+        <Button color="error" variant="contained" aria-label="Confirmar archivado" onClick={() => void confirmArchive()} disabled={archiving}>
+          {archiving ? <CircularProgress size={20} color="inherit" /> : 'Confirmar archivado'}
+        </Button>
+      </DialogActions>
+    </Dialog>
   );
 }
 
@@ -1380,13 +1402,17 @@ function PrivateServicesSection({
   isAdmin,
   onAdd,
   onExplore,
+  onArchive,
 }: {
   connections: Connection[];
   loading: boolean;
   isAdmin: boolean;
   onAdd: () => void;
   onExplore: (connection: Connection) => void;
+  onArchive: (connection: Connection) => Promise<void>;
 }) {
+  const [selectedConnection, setSelectedConnection] = useState<Connection | null>(null);
+
   return (
     <Box component="section" aria-labelledby="private-services-title">
       <Box className="connection-management-heading">
@@ -1410,24 +1436,42 @@ function PrivateServicesSection({
       <Stack spacing={1.5}>
         {connections.map((connection) => (
           <Paper key={connection.id} className="connection-inventory" elevation={0}>
-            <Box className="connection-row">
+            <Box className="connection-row private-service-row">
               <Box className="connection-name-field">
                 <Typography fontWeight={700}>{connection.name}</Typography>
                 <Typography variant="caption" color="text.secondary">NAS · SMB</Typography>
               </Box>
               <Chip size="small" color={connectionStatusColor(connection.status)} label={connectionStatusLabel(connection.status)} />
-              <Button
-                variant="outlined"
-                disabled={connection.status !== 'ACTIVE'}
-                onClick={() => onExplore(connection)}
-                aria-label={`Explorar ${connection.name}`}
-              >
-                Explorar NAS
-              </Button>
+              <Stack className="private-service-actions" direction="row" spacing={1}>
+                <Button
+                  variant="outlined"
+                  disabled={connection.status !== 'ACTIVE'}
+                  onClick={() => onExplore(connection)}
+                  aria-label={`Explorar ${connection.name}`}
+                >
+                  Explorar NAS
+                </Button>
+                {isAdmin && (
+                  <Button
+                    color="error"
+                    variant="text"
+                    startIcon={<InterfaceIcon name="archive" />}
+                    aria-label={`Archivar ${connection.name}`}
+                    onClick={() => setSelectedConnection(connection)}
+                  >
+                    Archivar
+                  </Button>
+                )}
+              </Stack>
             </Box>
           </Paper>
         ))}
       </Stack>
+      <ConnectionArchiveDialog
+        connection={selectedConnection}
+        onClose={() => setSelectedConnection(null)}
+        onArchive={onArchive}
+      />
     </Box>
   );
 }
@@ -2407,6 +2451,7 @@ function TransferWorkspace({
               setSelectedPaths([]);
               setWorkspaceSection('explorer');
             }}
+            onArchive={archiveConnection}
           />
         ) : workspaceSection === 'scheduled' ? (
           <Paper className="scheduled-transfer-list" elevation={0}>
