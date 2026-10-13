@@ -1,5 +1,6 @@
 import smtplib
 import uuid
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -19,6 +20,52 @@ def test_transfer_and_notification_tasks_use_worker_queue():
     assert routes["app.worker.run_transfer"]["queue"] == "transfers"
     assert routes["app.worker.send_transfer_notification"]["queue"] == "transfers"
     assert celery_app.conf.task_default_queue == "transfers"
+
+    assert celery_app.conf.broker_transport_options["visibility_timeout"] >= 24 * 60 * 60
+
+
+@pytest.mark.asyncio
+async def test_redelivered_transfer_does_not_run_or_clear_active_cancellation(monkeypatch):
+    transfer_id = uuid.uuid4()
+    calls: list[str] = []
+
+    class LockedStore:
+        @asynccontextmanager
+        async def transfer_execution_lock(self, supplied_id):
+            calls.append(f"lock:{supplied_id}")
+            yield False
+
+        async def aclose(self):
+            calls.append("store_closed")
+
+    class EventBus:
+        def __init__(self, _client):
+            pass
+
+        async def clear_cancel(self, _transfer_id):
+            calls.append("cancel_cleared")
+
+        async def aclose(self):
+            calls.append("event_bus_closed")
+
+    monkeypatch.setattr(worker, "get_settings", lambda: Settings())
+    monkeypatch.setattr(worker, "DatabaseStore", lambda _settings: LockedStore())
+    monkeypatch.setattr(worker.Redis, "from_url", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(worker, "RedisEventBus", EventBus)
+    monkeypatch.setattr(
+        worker,
+        "TransferExecutor",
+        lambda *_args, **_kwargs: pytest.fail("a duplicate delivery must not execute the transfer"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "enqueue_transfer_notification",
+        lambda *_args, **_kwargs: pytest.fail("a duplicate delivery must not notify"),
+    )
+
+    await worker._execute_transfer(transfer_id)
+
+    assert calls == [f"lock:{transfer_id}", "event_bus_closed", "store_closed"]
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ import asyncio
 import os
 import uuid
 from dataclasses import replace
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -19,6 +20,55 @@ from app.services.memory_store import (
     SMTPSettingsRecord,
 )
 from app.settings import Settings
+
+
+@pytest.mark.asyncio
+async def test_transfer_execution_lock_is_exclusive_and_released_after_use():
+    class FakeEngine:
+        def __init__(self):
+            self.held_keys: set[int] = set()
+
+        def connect(self):
+            return FakeConnection(self)
+
+    class FakeConnection:
+        dialect = SimpleNamespace(name="postgresql")
+
+        def __init__(self, engine):
+            self.engine = engine
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def scalar(self, _statement, parameters):
+            lock_key = parameters["lock_key"]
+            if lock_key in self.engine.held_keys:
+                return False
+            self.engine.held_keys.add(lock_key)
+            return True
+
+        async def execute(self, _statement, parameters):
+            self.engine.held_keys.discard(parameters["lock_key"])
+
+        async def commit(self):
+            return None
+
+    store = object.__new__(DatabaseStore)
+    store.engine = FakeEngine()
+    transfer_id = uuid.uuid4()
+
+    async with store.transfer_execution_lock(transfer_id) as acquired:
+        assert acquired is True
+        async with store.transfer_execution_lock(transfer_id) as duplicate_acquired:
+            assert duplicate_acquired is False
+        assert len(store.engine.held_keys) == 1
+
+    assert store.engine.held_keys == set()
+    async with store.transfer_execution_lock(transfer_id) as acquired_after_release:
+        assert acquired_after_release is True
 
 
 def test_transfer_counter_year_is_not_database_generated():

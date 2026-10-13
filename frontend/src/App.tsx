@@ -93,6 +93,7 @@ type Transfer = {
   completed_at?: string | null;
 };
 const terminalTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED'];
+const successfulTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS'];
 const terminalProgressDisplayMs = 3_000;
 type LoginForm = { username_or_email: string; password: string };
 type ConnectionForm = {
@@ -1446,6 +1447,7 @@ function TransferWorkspace({
   const [mobileStep, setMobileStep] = useState(0);
   const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections'>('explorer');
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
+  const [transferFailure, setTransferFailure] = useState<{ transferId: string; message: string } | null>(null);
   const [notice, setNotice] = useState('');
   const [noticeSeverity, setNoticeSeverity] = useState<'error' | 'info' | 'success' | 'warning'>('error');
   const [busy, setBusy] = useState(false);
@@ -1465,6 +1467,26 @@ function TransferWorkspace({
       setActiveTransfer(latestTransfer);
     }
   }, [activeTransfer, latestTransfer]);
+
+  useEffect(() => {
+    if (!activeTransfer || activeTransfer.status !== 'FAILED') return;
+    const refreshed = transfersQuery.data?.items.find((transfer) => transfer.id === activeTransfer.id);
+    if (refreshed && successfulTransferStatuses.includes(refreshed.status)) {
+      setActiveTransfer(refreshed);
+    }
+  }, [activeTransfer?.id, activeTransfer?.status, transfersQuery.data]);
+
+  useEffect(() => {
+    if (!transferFailure) return;
+    const refreshed = transfersQuery.data?.items.find(
+      (transfer) => transfer.id === transferFailure.transferId,
+    );
+    if (refreshed && successfulTransferStatuses.includes(refreshed.status)) {
+      setTransferFailure((current) => (
+        current?.transferId === transferFailure.transferId ? null : current
+      ));
+    }
+  }, [transferFailure?.transferId, transfersQuery.data]);
 
   useEffect(() => {
     if (!activeTransfer || !terminalTransferStatuses.includes(activeTransfer.status)) return;
@@ -1564,8 +1586,7 @@ function TransferWorkspace({
           ).then(({ items }) => {
             const failure = [...items].reverse().find((item) => item.event_type === 'FAILURE_DIAGNOSTIC');
             if (failure) {
-              setNotice(failure.message);
-              setNoticeSeverity('error');
+              setTransferFailure({ transferId: update.id, message: failure.message });
             }
           }).catch(() => undefined);
         }
@@ -1583,6 +1604,7 @@ function TransferWorkspace({
   const startTransfer = async () => {
     setBusy(true);
     setNotice('');
+    setTransferFailure(null);
     try {
       const transfer = await apiRequest<Transfer>('/api/v1/transfers', {
         method: 'POST',
@@ -1731,6 +1753,7 @@ function TransferWorkspace({
         </Box>
 
         {notice && <Alert severity={noticeSeverity} sx={{ mb: 2 }}>{notice}</Alert>}
+        {transferFailure && <Alert severity="error" sx={{ mb: 2 }}>{transferFailure.message}</Alert>}
         {workspaceSection === 'connections' && user.role === 'ADMIN' ? (
           <ConnectionManagementSection
             connections={connections}

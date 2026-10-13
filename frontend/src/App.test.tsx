@@ -657,6 +657,84 @@ describe('Cloud Transfer Manager', () => {
     10_000,
   );
 
+  it('clears a transfer failure notice when polling confirms that the same transfer completed', async () => {
+    const transfer = {
+      id: 'transfer-1',
+      public_id: 'TRF-2026-000001',
+      status: 'QUEUED',
+      progress_percent: 0,
+      files_total: 1,
+      files_completed: 0,
+      bytes_total: 4,
+      bytes_transferred: 0,
+      current_item: null,
+      average_speed_bps: null,
+      current_speed_bps: null,
+      estimated_remaining_seconds: null,
+      source_connection_id: 'source',
+      destination_connection_id: 'destination',
+      source_paths: ['/origen.txt'],
+      destination_path: '/',
+      conflict_policy: 'OVERWRITE_IF_DIFFERENT',
+      send_email_notification: false,
+    };
+    let latestTransfer: typeof transfer | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [
+        { id: 'source', name: 'Origen', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
+        { id: 'destination', name: 'Destino', provider_type: 'MOCK', status: 'ACTIVE', credentials_configured: false },
+      ] });
+      if (path.endsWith('/transfers') && init?.method === 'POST') return jsonResponse(transfer, 201);
+      if (path.endsWith('/events')) return jsonResponse({ items: [
+        { event_type: 'FAILURE_DIAGNOSTIC', message: 'No se pudo completar la transferencia.' },
+      ] });
+      if (path.endsWith('/transfers')) {
+        return jsonResponse({ items: latestTransfer ? [latestTransfer] : [] });
+      }
+      if (path.includes('/connections/source/items')) return jsonResponse({ items: [
+        { name: 'origen.txt', path: '/origen.txt', is_dir: false, size_bytes: 4, modified_at: null, mime_type: 'text/plain', provider_type: 'MOCK' },
+      ], next_cursor: null, total_count: 1 });
+      if (path.includes('/connections/destination/items')) return jsonResponse({ items: [], next_cursor: null, total_count: 0 });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('EventSource', TestEventSource);
+
+    render(<App />);
+    fireEvent.change(await screen.findByLabelText(/Usuario o correo/i), { target: { value: 'user' } });
+    fireEvent.change(screen.getByLabelText(/Contraseña/i), { target: { value: 'CorrectHorseBatteryStaple123!' } });
+    fireEvent.click(screen.getByRole('button', { name: /Iniciar sesión/i }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Seleccionar origen.txt' }));
+    fireEvent.click(screen.getByRole('button', { name: /Iniciar transferencia/i }));
+    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1));
+
+    const eventSource = TestEventSource.instances[0];
+    eventSource.emit({ ...transfer, status: 'RUNNING', progress_percent: 50 });
+    eventSource.emit({ ...transfer, status: 'FAILED', progress_percent: 50 });
+    expect(await screen.findByText('No se pudo completar la transferencia.')).toBeVisible();
+
+    latestTransfer = {
+      ...transfer,
+      status: 'COMPLETED',
+      progress_percent: 100,
+      files_completed: 1,
+      bytes_transferred: 4,
+    };
+    await waitFor(
+      () => expect(screen.queryByText('No se pudo completar la transferencia.')).not.toBeInTheDocument(),
+      { timeout: 6_000 },
+    );
+  }, 10_000);
+
   it('requires the user to change an initial password before normal use', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);

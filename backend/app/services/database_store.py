@@ -1,4 +1,7 @@
+import hashlib
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -53,6 +56,38 @@ class DatabaseStore:
         async with self.engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
         return True
+
+    @asynccontextmanager
+    async def transfer_execution_lock(
+        self, transfer_id: uuid.UUID
+    ) -> AsyncIterator[bool]:
+        """Hold a PostgreSQL session lock for the full lifetime of one worker task."""
+        async with self.engine.connect() as connection:
+            if connection.dialect.name != "postgresql":
+                yield True
+                return
+
+            lock_key = int.from_bytes(
+                hashlib.sha256(transfer_id.bytes).digest()[:8], "big", signed=True
+            )
+            lock_parameters = {"lock_key": lock_key}
+            acquired = bool(
+                await connection.scalar(
+                    text("SELECT pg_try_advisory_lock(:lock_key)"), lock_parameters
+                )
+            )
+            await connection.commit()
+            if not acquired:
+                yield False
+                return
+
+            try:
+                yield True
+            finally:
+                await connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_key)"), lock_parameters
+                )
+                await connection.commit()
 
     @staticmethod
     def _smtp_settings(row: SMTPSettings) -> SMTPSettingsRecord:

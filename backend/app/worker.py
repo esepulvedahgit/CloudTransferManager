@@ -18,6 +18,7 @@ from app.services.transfer_executor import TransferExecutor
 from app.settings import get_settings
 
 settings = get_settings()
+TRANSFER_VISIBILITY_TIMEOUT_SECONDS = 24 * 60 * 60
 celery_app = Celery("cloud_transfer_manager", broker=settings.redis_url)
 celery_app.conf.update(
     accept_content=["json"],
@@ -27,6 +28,7 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     broker_connection_retry_on_startup=True,
+    broker_transport_options={"visibility_timeout": TRANSFER_VISIBILITY_TIMEOUT_SECONDS},
     task_ignore_result=True,
     task_default_queue="transfers",
     task_routes={
@@ -80,10 +82,19 @@ async def _execute_transfer(transfer_id: uuid.UUID) -> None:
         return await event_bus.cancellation_requested(str(transfer_id))
 
     try:
-        await TransferExecutor(current_settings, store, publish, should_cancel).execute(transfer_id)
-        await enqueue_transfer_notification(store, transfer_id, send_transfer_notification)
+        async with store.transfer_execution_lock(transfer_id) as acquired:
+            if not acquired:
+                return
+            try:
+                await TransferExecutor(
+                    current_settings, store, publish, should_cancel
+                ).execute(transfer_id)
+                await enqueue_transfer_notification(
+                    store, transfer_id, send_transfer_notification
+                )
+            finally:
+                await event_bus.clear_cancel(str(transfer_id))
     finally:
-        await event_bus.clear_cancel(str(transfer_id))
         await event_bus.aclose()
         await store.aclose()
 
