@@ -427,13 +427,11 @@ function ConnectionDialog({
   onClose,
   onCreated,
   initialProvider = 'MEGA',
-  nextcloudEnabled,
 }: {
   open: boolean;
   onClose: () => void;
   onCreated: (connection: Connection) => void;
   initialProvider?: ConnectionForm['provider_type'];
-  nextcloudEnabled: boolean;
 }) {
   const formDefaults = { ...emptyConnectionForm, provider_type: initialProvider };
   const [error, setError] = useState('');
@@ -551,7 +549,7 @@ function ConnectionDialog({
                     <MenuItem value="MEGA"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MEGA" />MEGA</Stack></MenuItem>
                     <MenuItem value="GOOGLE_DRIVE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="GOOGLE_DRIVE" />Google Drive</Stack></MenuItem>
                     <MenuItem value="SEAFILE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="SEAFILE" />Seafile</Stack></MenuItem>
-                    {nextcloudEnabled && <MenuItem value="NEXTCLOUD"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="NEXTCLOUD" />Nextcloud</Stack></MenuItem>}
+                    <MenuItem value="NEXTCLOUD"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="NEXTCLOUD" />Nextcloud</Stack></MenuItem>
                     <MenuItem value="SMB">NAS privado (SMB)</MenuItem>
                     <MenuItem value="MOCK"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MOCK" />Simulado (pruebas)</Stack></MenuItem>
                   </Select>
@@ -631,14 +629,14 @@ function ConnectionDialog({
             {provider === 'NEXTCLOUD' && (
               <>
                 <Alert severity="info">
-                  Usa el endpoint WebDAV de archivos y una contraseña de aplicación. La prueba inicial verifica lectura; para usar Nextcloud como destino, la cuenta también necesita permiso de escritura.
+                  Ingresa la URL del servidor y una contraseña de aplicación. La ruta WebDAV se configura automáticamente. La prueba verifica lectura; para usar Nextcloud como destino, la cuenta también necesita permiso de escritura.
                 </Alert>
                 <TextField
-                  label="URL WebDAV de Nextcloud"
-                  placeholder="https://cloud.example.com/remote.php/dav/files/usuario/"
+                  label="URL base de Nextcloud"
+                  placeholder="https://cloud.example.com"
                   autoComplete="url"
                   error={Boolean(errors.nextcloud_url)}
-                  helperText={errors.nextcloud_url?.message ?? 'Usa HTTPS y conserva el prefijo de instalación, si existe.'}
+                  helperText={errors.nextcloud_url?.message ?? 'Usa HTTPS; si está instalado en un subdirectorio, incluye ese prefijo.'}
                   {...register('nextcloud_url')}
                 />
                 <TextField
@@ -1723,11 +1721,6 @@ function TransferWorkspace({
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
     queryFn: () => apiRequest<{ items: Connection[] }>('/api/v1/connections'),
-  });
-  const providerCapabilitiesQuery = useQuery({
-    queryKey: ['provider-capabilities'],
-    queryFn: () => apiRequest<{ enabled_providers: string[] }>('/api/v1/system/capabilities'),
-    retry: false,
   });
   const transfersQuery = useQuery({
     queryKey: ['transfers'],
@@ -2977,7 +2970,6 @@ function TransferWorkspace({
       <ConnectionDialog
         open={connectionDialogOpen}
         initialProvider={connectionDialogProvider}
-        nextcloudEnabled={providerCapabilitiesQuery.data?.enabled_providers.includes('NEXTCLOUD') ?? false}
         onClose={() => setConnectionDialogOpen(false)}
         onCreated={(created) => {
           setNotice(created.status === 'ACTIVE'

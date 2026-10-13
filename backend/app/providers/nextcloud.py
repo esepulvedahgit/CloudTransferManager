@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import re
 import uuid
 from collections import OrderedDict
 from threading import RLock
 from typing import Any
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from app.providers.base import StorageItem
 from app.providers.rclone import RcloneStorageProvider, _config_value
@@ -82,16 +81,14 @@ class NextcloudRcloneProvider(RcloneStorageProvider):
         credentials: dict[str, Any],
         runner: RcloneRunner,
         *,
-        allowed_origins: set[str] | frozenset[str],
         credential_version: int = 1,
         chunk_size: str = "10Mi",
     ) -> None:
-        self.allowed_origins = allowed_origins
         self.credential_version = credential_version
         if chunk_size not in self._supported_chunk_sizes:
             raise ValueError("Unsupported Nextcloud upload chunk size")
         self.chunk_size = chunk_size
-        validated = self.validate_credentials(credentials, allowed_origins)
+        validated = self.validate_credentials(credentials)
         super().__init__(
             connection_id,
             validated,
@@ -105,56 +102,61 @@ class NextcloudRcloneProvider(RcloneStorageProvider):
     def validate_credentials(
         cls,
         credentials: dict[str, Any],
-        allowed_origins: set[str] | frozenset[str],
     ) -> dict[str, str]:
         if set(credentials) != cls._required_credentials:
-            raise ValueError("Nextcloud requires a WebDAV URL, username, and app password")
+            raise ValueError("Nextcloud requires a server URL, username, and app password")
         url = credentials.get("url")
         username = credentials.get("username")
         password = credentials.get("password")
         if not all(isinstance(value, str) and value.strip() for value in (url, username, password)):
-            raise ValueError("Nextcloud requires a WebDAV URL, username, and app password")
+            raise ValueError("Nextcloud requires a server URL, username, and app password")
         assert isinstance(url, str)
         assert isinstance(username, str)
         assert isinstance(password, str)
         if any(char in value for value in (url, username, password) for char in "\r\n\x00"):
             raise ValueError("Invalid Nextcloud credential value")
         normalized_username = username.strip()
-        parsed = urlsplit(url.strip())
-        path_segments = [
-            unquote(segment)
-            for segment in parsed.path.rstrip("/").split("/")
-            if segment
-        ]
+        if (
+            not normalized_username
+            or normalized_username in {".", ".."}
+            or any(char in normalized_username for char in "/\\")
+        ):
+            raise ValueError("Invalid Nextcloud username")
+        try:
+            parsed = urlsplit(url.strip())
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("Invalid Nextcloud server URL") from exc
+        path_segments = [unquote(segment) for segment in parsed.path.split("/") if segment]
         if (
             parsed.scheme.casefold() != "https"
-            or not parsed.hostname
+            or not hostname
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
-            or "/" in normalized_username
             or any(segment in {".", ".."} for segment in path_segments)
-            or len(path_segments) < 4
-            or path_segments[-4:] != ["remote.php", "dav", "files", normalized_username]
+            or any("/" in segment or "\\" in segment for segment in path_segments)
         ):
-            raise ValueError("Nextcloud URL must be the HTTPS DAV files endpoint for this user")
-        try:
-            port = parsed.port or 443
-        except ValueError as exc:
-            raise ValueError("Invalid Nextcloud server URL") from exc
-        origin = f"https://{parsed.hostname.casefold()}"
-        if port != 443:
-            origin += f":{port}"
-        if origin not in allowed_origins:
-            raise ValueError("Nextcloud server is not in NEXTCLOUD_ALLOWED_ORIGINS")
-        normalized_url = urlunsplit(
-            ("https", parsed.netloc, parsed.path.rstrip("/") + "/", "", "")
-        )
+            raise ValueError("Nextcloud URL must be a valid HTTPS server URL")
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("Invalid Nextcloud server URL")
+
+        legacy_dav_suffix = ["remote.php", "dav", "files", normalized_username]
+        if "remote.php" in path_segments:
+            if path_segments[-4:] != legacy_dav_suffix:
+                raise ValueError("Nextcloud DAV URL does not match the configured user")
+            dav_path = parsed.path.rstrip("/") + "/"
+        else:
+            base_path = parsed.path.rstrip("/")
+            encoded_username = quote(normalized_username, safe="")
+            dav_path = f"{base_path}/remote.php/dav/files/{encoded_username}/"
+        normalized_url = urlunsplit(("https", parsed.netloc, dav_path, "", ""))
         return {"url": normalized_url, "username": normalized_username, "password": password}
 
     def config_content(self) -> str:
-        credentials = self.validate_credentials(self.credentials, self.allowed_origins)
+        credentials = self.validate_credentials(self.credentials)
         return "\n".join(
             (
                 f"[{self.remote_name}]",
@@ -213,32 +215,3 @@ class NextcloudRcloneProvider(RcloneStorageProvider):
             mime_type=entry.get("MimeType") if isinstance(entry.get("MimeType"), str) else None,
             provider_type=self.provider_type,
         )
-
-
-def parse_allowed_origins(value: str) -> frozenset[str]:
-    origins: set[str] = set()
-    for raw_origin in value.split(","):
-        raw_origin = raw_origin.strip()
-        if not raw_origin:
-            continue
-        parsed = urlsplit(raw_origin)
-        if (
-            parsed.scheme.casefold() != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("NEXTCLOUD_ALLOWED_ORIGINS contains an invalid HTTPS origin")
-        try:
-            port = parsed.port or 443
-        except ValueError as exc:
-            raise ValueError("NEXTCLOUD_ALLOWED_ORIGINS contains an invalid port") from exc
-        hostname = parsed.hostname.casefold()
-        if not re.fullmatch(r"[a-z0-9.-]+", hostname):
-            raise ValueError("NEXTCLOUD_ALLOWED_ORIGINS contains an invalid host")
-        origin = f"https://{hostname}" + (f":{port}" if port != 443 else "")
-        origins.add(origin)
-    return frozenset(origins)

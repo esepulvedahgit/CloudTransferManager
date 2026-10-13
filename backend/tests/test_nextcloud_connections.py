@@ -36,7 +36,7 @@ def _payload() -> dict[str, object]:
         "name": "Nextcloud de prueba",
         "provider_type": "NEXTCLOUD",
         "credentials": {
-            "url": "https://cloud.example.test/remote.php/dav/files/alice/",
+            "url": "https://cloud.example.test",
             "username": "alice",
             "password": "application-secret",
         },
@@ -44,9 +44,15 @@ def _payload() -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_nextcloud_connections_are_disabled_by_default(tmp_path: Path):
+async def test_nextcloud_is_advertised_and_creatable_without_environment_flags(tmp_path: Path):
+    key_file = tmp_path / "master_key"
+    key_file.write_bytes(b"m" * 32)
     app = create_app(
-        Settings(app_secret_key="test-secret", session_cookie_secure=False),
+        Settings(
+            app_secret_key="test-secret",
+            session_cookie_secure=False,
+            master_encryption_key_file=str(key_file),
+        ),
         store=_store(),
     )
     async with httpx.AsyncClient(
@@ -56,18 +62,17 @@ async def test_nextcloud_connections_are_disabled_by_default(tmp_path: Path):
         capabilities = await client.get("/api/v1/system/capabilities")
         response = await client.post("/api/v1/connections", json=_payload(), headers=headers)
 
-    assert "NEXTCLOUD" not in capabilities.json()["enabled_providers"]
-    assert response.status_code == 409
+    assert "NEXTCLOUD" in capabilities.json()["enabled_providers"]
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "INACTIVE"
 
 
 @pytest.mark.asyncio
-async def test_nextcloud_is_not_advertised_without_an_origin_allowlist():
+async def test_nextcloud_is_advertised_without_environment_origin_allowlist():
     app = create_app(
         Settings(
             app_secret_key="test-secret",
             session_cookie_secure=False,
-            nextcloud_enabled=True,
-            nextcloud_allowed_origins="",
         ),
         store=_store(),
     )
@@ -77,7 +82,7 @@ async def test_nextcloud_is_not_advertised_without_an_origin_allowlist():
         await _login(client)
         response = await client.get("/api/v1/system/capabilities")
 
-    assert "NEXTCLOUD" not in response.json()["enabled_providers"]
+    assert "NEXTCLOUD" in response.json()["enabled_providers"]
 
 
 @pytest.mark.asyncio
@@ -92,8 +97,6 @@ async def test_nextcloud_connection_secrets_are_encrypted_and_not_returned(
             app_secret_key="test-secret",
             session_cookie_secure=False,
             master_encryption_key_file=str(key_file),
-            nextcloud_enabled=True,
-            nextcloud_allowed_origins="https://cloud.example.test",
         ),
         store=store,
     )
@@ -117,7 +120,7 @@ async def test_nextcloud_connection_secrets_are_encrypted_and_not_returned(
 
 
 @pytest.mark.asyncio
-async def test_nextcloud_connection_rejects_origin_outside_admin_allowlist(
+async def test_nextcloud_connection_accepts_admin_supplied_domain_without_allowlist(
     tmp_path: Path,
 ):
     key_file = tmp_path / "master_key"
@@ -127,8 +130,6 @@ async def test_nextcloud_connection_rejects_origin_outside_admin_allowlist(
             app_secret_key="test-secret",
             session_cookie_secure=False,
             master_encryption_key_file=str(key_file),
-            nextcloud_enabled=True,
-            nextcloud_allowed_origins="https://other.example.test",
         ),
         store=_store(),
     )
@@ -138,5 +139,5 @@ async def test_nextcloud_connection_rejects_origin_outside_admin_allowlist(
         headers = await _login(client)
         response = await client.post("/api/v1/connections", json=_payload(), headers=headers)
 
-    assert response.status_code == 422
+    assert response.status_code == 201, response.text
     assert "application-secret" not in response.text

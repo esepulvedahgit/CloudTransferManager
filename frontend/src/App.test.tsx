@@ -745,7 +745,7 @@ describe('Cloud Transfer Manager', () => {
     expect(screen.getByLabelText(/Contraseña de MEGA/i)).toBeVisible();
   });
 
-  it('creates a Nextcloud connection with a WebDAV app password only when enabled', async () => {
+  it('creates a Nextcloud connection from its server URL and app password', async () => {
     let createRequest: Record<string, unknown> | undefined;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
@@ -758,7 +758,7 @@ describe('Cloud Transfer Manager', () => {
         return jsonResponse({ id: 'admin-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
       }
       if (path.endsWith('/system/capabilities')) {
-        return jsonResponse({ enabled_providers: ['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB', 'NEXTCLOUD'] });
+        return jsonResponse({ enabled_providers: ['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB'] });
       }
       if (path.endsWith('/connections') && init?.method === 'POST') {
         createRequest = JSON.parse(String(init.body)) as Record<string, unknown>;
@@ -782,8 +782,8 @@ describe('Cloud Transfer Manager', () => {
     fireEvent.mouseDown(screen.getByRole('combobox', { name: /Proveedor/i }));
     fireEvent.click(await screen.findByRole('option', { name: /Nextcloud/i }));
     fireEvent.change(screen.getByLabelText(/Nombre de conexión/i), { target: { value: 'Nube equipo' } });
-    fireEvent.change(screen.getByLabelText(/URL WebDAV de Nextcloud/i), {
-      target: { value: 'https://cloud.example.test/remote.php/dav/files/alice/' },
+    fireEvent.change(screen.getByLabelText(/URL base de Nextcloud/i), {
+      target: { value: 'https://cloud.example.test/nextcloud' },
     });
     fireEvent.change(screen.getByLabelText(/Usuario de Nextcloud/i), { target: { value: 'alice' } });
     fireEvent.change(screen.getByLabelText(/Contraseña de aplicación/i), { target: { value: 'application-secret' } });
@@ -793,7 +793,7 @@ describe('Cloud Transfer Manager', () => {
     expect(createRequest).toMatchObject({
       provider_type: 'NEXTCLOUD',
       credentials: {
-        url: 'https://cloud.example.test/remote.php/dav/files/alice/',
+        url: 'https://cloud.example.test/nextcloud',
         username: 'alice',
         password: 'application-secret',
       },

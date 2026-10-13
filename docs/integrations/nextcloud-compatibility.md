@@ -2,9 +2,9 @@
 
 ## Alcance
 
-Nextcloud se conecta mediante el backend WebDAV de Rclone (`type = webdav`, `vendor = nextcloud`). El usuario debe proporcionar la URL DAV completa de su cuenta, su nombre de usuario y una contraseña de aplicación. La integración permite explorar, consultar cuota y copiar archivos; no implementa sincronización, eliminación ni modificación del origen.
+Nextcloud se conecta mediante el backend WebDAV de Rclone (`type = webdav`, `vendor = nextcloud`). Un administrador agrega desde la interfaz la URL base de la instancia, el nombre de usuario y una contraseña de aplicación. La aplicación construye la ruta DAV de archivos; se puede incluir un prefijo de instalación, por ejemplo `https://cloud.example.com/nextcloud`. La integración permite explorar, consultar cuota y copiar archivos; no implementa sincronización, eliminación ni modificación del origen.
 
-La integración está desactivada por defecto. El equipo que administra el despliegue debe habilitarla explícitamente y enumerar los orígenes HTTPS permitidos. Una URL de conexión se acepta solo si coincide exactamente con un origen configurado y su ruta termina en `/remote.php/dav/files/{usuario}/`.
+La integración está disponible en el selector de proveedores sin configuración de despliegue. Solo los administradores pueden registrar conexiones. El servidor debe usar HTTPS; la URL no puede incluir credenciales, consultas, fragmentos ni segmentos de ruta relativos. La confianza del host sigue el mismo modelo que Seafile: el administrador decide qué servidor conectar, incluidos servidores autohospedados.
 
 ## Configuración del despliegue
 
@@ -12,8 +12,6 @@ Configura estas variables en `.env` (el archivo no debe incluirse en Git):
 
 | Variable | Predeterminado | Descripción |
 |---|---:|---|
-| `NEXTCLOUD_ENABLED` | `false` | Habilita la creación, prueba, navegación y uso en transferencias. |
-| `NEXTCLOUD_ALLOWED_ORIGINS` | vacío | Lista separada por comas de orígenes HTTPS exactos, sin ruta, por ejemplo `https://cloud.example.com,https://cloud-backup.example.net:8443`. Vacío deniega todas las conexiones. |
 | `NEXTCLOUD_MAX_CONCURRENT` | `1` | Máximo de transferencias activas que incluyen Nextcloud en el clúster. |
 | `NEXTCLOUD_BANDWIDTH_LIMIT` | `8M` | Límite Rclone por trabajo Nextcloud; sintaxis entera seguida opcionalmente de `K`, `M` o `G`. |
 | `NEXTCLOUD_CHUNK_SIZE` | `10Mi` | Tamaño de fragmentos de carga WebDAV. Valores permitidos: `10Mi`, `32Mi`, `64Mi`, `128Mi`, `256Mi`, `512Mi` o `1Gi`. |
@@ -24,7 +22,7 @@ Los límites Rclone de Nextcloud fijan `--transfers 1`, `--checkers 2`, conexió
 ## Crear y probar una conexión
 
 1. En Nextcloud, crea una contraseña de aplicación para el usuario técnico. No reutilices la contraseña interactiva.
-2. En la aplicación, agrega una conexión Nextcloud e introduce el endpoint DAV HTTPS del usuario, por ejemplo `https://cloud.example.com/remote.php/dav/files/alice/`.
+2. En la aplicación, agrega una conexión Nextcloud e introduce la URL base HTTPS, el usuario y la contraseña de aplicación. Para un servidor publicado en un subdirectorio, incluye ese prefijo en la URL base.
 3. La contraseña de aplicación se cifra con el mecanismo de credenciales existente. Nunca se devuelve al frontend ni se escribe en logs; Rclone recibe únicamente configuración temporal con permisos `0600`.
 4. Ejecuta **Probar conexión**. Una conexión solo debe activarse después de que el test liste la raíz en la instancia real.
 
@@ -32,7 +30,7 @@ La validación real de extremo a extremo debe usar un usuario y datos de prueba 
 
 ## Compatibilidad y límites conocidos
 
-- El acceso a la red queda restringido por la allowlist de orígenes HTTPS; configura proxy, DNS y certificados del sistema para que backend y worker resuelvan el mismo host permitido.
+- Configura proxy, DNS y certificados del sistema para que backend y worker alcancen el mismo host guardado en la conexión.
 - Los listados se almacenan en una caché en memoria de cada proceso durante un máximo de 30 segundos. La caché está limitada por tamaño, entradas y volumen total, y las actualizaciones de credenciales cambian su clave.
 - Rclone proporciona listado, metadatos y consulta de cuota sobre WebDAV. La cuota depende de que el servidor Nextcloud exponga valores DAV válidos; si no los informa, la aplicación deja esos valores vacíos.
 - WebDAV y proxies inversos pueden limitar el tamaño de carga, tiempo de petición o tamaño de chunk. Ajusta esos límites en Nextcloud/proxy y valida con los tamaños operativos esperados antes de producción.

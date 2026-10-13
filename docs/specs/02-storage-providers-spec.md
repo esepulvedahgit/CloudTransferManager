@@ -117,8 +117,8 @@ class StorageProvider(ABC):
 - La guía operativa y sus límites están en [`docs/integrations/smb-nas-setup.md`](../integrations/smb-nas-setup.md).
 
 ### F. Nextcloud (`NextcloudRcloneProvider`)
-- Nextcloud usa Rclone WebDAV (`type = webdav`, `vendor = nextcloud`) y una contraseña de aplicación. La URL debe apuntar a `https://{host}/remote.php/dav/files/{usuario}/`; el origen HTTPS debe estar en `NEXTCLOUD_ALLOWED_ORIGINS`.
-- `NEXTCLOUD_ENABLED` es `false` por defecto. Con la integración apagada no se pueden crear ni operar conexiones Nextcloud. La allowlist vacía deniega cualquier conexión aunque esté habilitada.
+- Nextcloud usa Rclone WebDAV (`type = webdav`, `vendor = nextcloud`) y una contraseña de aplicación. Un administrador introduce la URL HTTPS base, el usuario y la contraseña desde la UI; el backend genera `https://{host}/{prefijo-opcional}/remote.php/dav/files/{usuario}/`. Se aceptan servidores configurados por conexión, sin allowlist de despliegue.
+- La UI muestra Nextcloud como proveedor sin flags de habilitación. La conexión queda inactiva hasta pasar la prueba; solo los administradores pueden registrar el servidor y sus credenciales.
 - Las credenciales se almacenan cifradas con el mecanismo común y nunca se devuelven al frontend. Rclone se ejecuta como subproceso con argumentos separados y configuración temporal `0600`; la lista blanca de comandos y la semántica exclusivamente `COPY` no cambian.
 - El listado usa la abstracción común y una caché local, acotada por tiempo y memoria. Las actualizaciones de credenciales usan otra clave de caché.
 - Para trabajo Nextcloud se limita Rclone a un transfer, dos checkers, `NEXTCLOUD_BANDWIDTH_LIMIT` (predeterminado `8M`), `NEXTCLOUD_CHUNK_SIZE` (predeterminado `10Mi`), conexión de 10 s, inactividad de 60 s y `NEXTCLOUD_JOB_TIMEOUT_SECONDS` (predeterminado 12 h). La admisión permite por defecto un trabajo Nextcloud activo por clúster.

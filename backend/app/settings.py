@@ -22,8 +22,6 @@ class Settings(BaseSettings):
     rclone_binary: str = "/usr/bin/rclone"
     smb_allowed_targets: str = ""
     smb_interactive_timeout_seconds: int = Field(default=30, ge=1, le=300)
-    nextcloud_enabled: bool = False
-    nextcloud_allowed_origins: str = ""
     nextcloud_max_concurrent: int = Field(default=1, ge=1, le=8)
     nextcloud_bandwidth_limit: str = Field(default="8M", pattern=r"^[1-9][0-9]{0,3}(?:K|M|G)?$")
     nextcloud_chunk_size: str = Field(

@@ -114,10 +114,10 @@ Todas las rutas requieren una sesión de administrador. `PUT` y `POST .../test` 
 ## 4. Conexiones (`/connections`) [Creación y administración solo ADMIN]
 
 `GET /api/v1/connections` devuelve únicamente las conexiones globales o asignadas al usuario. Los campos de credenciales nunca forman parte de las respuestas.
-Las conexiones MEGA, Google Drive, Seafile, SMB y Nextcloud nuevas quedan `INACTIVE` hasta superar la prueba; las simuladas quedan activas. Un administrador puede ejecutar la prueba desde el explorador o mediante el endpoint siguiente. Nextcloud solo aparece como opción cuando `NEXTCLOUD_ENABLED=true` y hay al menos un origen válido en `NEXTCLOUD_ALLOWED_ORIGINS`; la URL debe coincidir con uno de esos orígenes.
+Las conexiones MEGA, Google Drive, Seafile, SMB y Nextcloud nuevas quedan `INACTIVE` hasta superar la prueba; las simuladas quedan activas. Un administrador puede ejecutar la prueba desde el explorador o mediante el endpoint siguiente. Nextcloud aparece en el selector de proveedores y cada administrador define la URL del servidor en la conexión.
 
 ### `GET /api/v1/system/capabilities`
-- Requiere sesión autenticada. Devuelve `enabled_providers`, la lista de proveedores habilitados en este despliegue; Nextcloud se incluye solo si la integración está habilitada y tiene una allowlist válida. El frontend usa esta lista para ocultar integraciones desactivadas.
+- Requiere sesión autenticada. Devuelve `enabled_providers`, la lista de proveedores disponibles en este despliegue, incluido Nextcloud.
 
 ### `DELETE /api/v1/connections/{connection_id}` [Solo ADMIN]
 - Requiere CSRF y archiva la conexión de forma lógica; no elimina la fila ni las referencias de transferencias históricas.
@@ -197,13 +197,13 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
   "provider_type": "NEXTCLOUD",
   "is_global": true,
   "credentials": {
-    "url": "https://cloud.example.com/remote.php/dav/files/alice/",
+    "url": "https://cloud.example.com",
     "username": "alice",
     "password": "contraseña-de-aplicación"
   }
 }
 ```
-- El origen HTTPS debe coincidir exactamente con una entrada de `NEXTCLOUD_ALLOWED_ORIGINS`. Las credenciales nunca se incluyen en la respuesta. La conexión se guarda inactiva hasta superar el test de raíz.
+- `url` es la URL base HTTPS y puede incluir un prefijo de instalación. El backend genera `/remote.php/dav/files/{usuario}/`. Las credenciales nunca se incluyen en la respuesta. La conexión se guarda inactiva hasta superar el test de raíz.
 
 ### `POST /api/v1/connections/{connection_id}/google-oauth/start` [Solo ADMIN]
 - **Response `200 OK`:** `{ "authorization_url": "https://accounts.google.com/..." }`. El estado anti-CSRF queda vinculado a la sesión del administrador; el navegador no recibe el secreto del cliente ni tokens.

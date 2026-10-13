@@ -7,15 +7,12 @@ from app.providers.nextcloud import NextcloudRcloneProvider
 from app.services.rclone import RcloneRunner
 from app.settings import Settings
 
-ALLOWED_ORIGINS = {"https://cloud.example.test"}
-
 
 def _provider(runner=None, *, url="https://cloud.example.test/remote.php/dav/files/alice/"):
     return NextcloudRcloneProvider(
         uuid.uuid4(),
         {"url": url, "username": "alice", "password": "application password"},
         runner or RcloneRunner("/usr/bin/rclone", "/tmp"),
-        allowed_origins=ALLOWED_ORIGINS,
     )
 
 
@@ -32,6 +29,33 @@ def test_nextcloud_config_uses_webdav_vendor_and_obscures_app_password():
     assert "pass = application password" not in config
 
 
+def test_nextcloud_builds_webdav_endpoint_from_base_url_and_username():
+    provider = NextcloudRcloneProvider(
+        uuid.uuid4(),
+        {
+            "url": "https://cloud.example.test/nextcloud/",
+            "username": "alice@example.test",
+            "password": "application password",
+        },
+        RcloneRunner("/usr/bin/rclone", "/tmp"),
+    )
+
+    assert (
+        "url = https://cloud.example.test/nextcloud/remote.php/dav/files/"
+        "alice%40example.test/"
+    ) in provider.config_content()
+
+
+def test_nextcloud_accepts_a_server_origin_entered_by_the_admin():
+    provider = _provider(
+        url="https://storage.example.test/remote.php/dav/files/alice/"
+    )
+
+    assert "url = https://storage.example.test/remote.php/dav/files/alice/" in (
+        provider.config_content()
+    )
+
+
 def test_nextcloud_config_sets_a_bounded_webdav_upload_chunk_size():
     provider = NextcloudRcloneProvider(
         uuid.uuid4(),
@@ -41,7 +65,6 @@ def test_nextcloud_config_sets_a_bounded_webdav_upload_chunk_size():
             "password": "application password",
         },
         RcloneRunner("/usr/bin/rclone", "/tmp"),
-        allowed_origins=ALLOWED_ORIGINS,
         chunk_size="128Mi",
     )
 
@@ -59,7 +82,6 @@ def test_nextcloud_rejects_unbounded_or_invalid_chunk_sizes():
                     "password": "application password",
                 },
                 RcloneRunner("/usr/bin/rclone", "/tmp"),
-                allowed_origins=ALLOWED_ORIGINS,
                 chunk_size=chunk_size,
             )
 
@@ -75,14 +97,13 @@ def test_settings_expose_nextcloud_chunk_size_with_a_safe_default():
     "url",
     [
         "http://cloud.example.test/remote.php/dav/files/alice/",
-        "https://other.example.test/remote.php/dav/files/alice/",
         "https://cloud.example.test/remote.php/webdav/",
         "https://cloud.example.test/../remote.php/dav/files/alice/",
         "https://alice:secret@cloud.example.test/remote.php/dav/files/alice/",
         "https://cloud.example.test/remote.php/dav/files/alice/?token=secret",
     ],
 )
-def test_nextcloud_rejects_insecure_or_unapproved_server_urls(url):
+def test_nextcloud_rejects_invalid_server_urls(url):
     with pytest.raises(ValueError):
         _provider(url=url).config_content()
 
@@ -93,8 +114,7 @@ def test_nextcloud_accepts_percent_encoded_username_in_dav_path():
             "url": "https://cloud.example.test/remote.php/dav/files/alice%40example.test/",
             "username": "alice@example.test",
             "password": "application password",
-        },
-        ALLOWED_ORIGINS,
+        }
     )
 
     assert credentials["username"] == "alice@example.test"

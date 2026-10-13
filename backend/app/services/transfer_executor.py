@@ -13,7 +13,7 @@ from typing import Any
 from app.providers.base import StorageItem
 from app.providers.megacmd import MegaCmdProvider
 from app.providers.mock import MockStorageProvider
-from app.providers.nextcloud import NextcloudRcloneProvider, parse_allowed_origins
+from app.providers.nextcloud import NextcloudRcloneProvider
 from app.providers.rclone import RcloneGoogleDriveProvider
 from app.providers.seafile import SeafileRcloneProvider
 from app.providers.seafile_api import (
@@ -106,13 +106,6 @@ class TransferExecutor:
             return
 
         uses_nextcloud = "NEXTCLOUD" in {source.provider_type, destination.provider_type}
-        if uses_nextcloud and not self.settings.nextcloud_enabled:
-            await self._fail(
-                record,
-                error_code="NEXTCLOUD_DISABLED",
-                message="La integración Nextcloud está desactivada.",
-            )
-            return
         original_runner = self.runner
         if uses_nextcloud and isinstance(self.runner, RcloneRunner):
             self.runner = RcloneRunner(
@@ -245,7 +238,6 @@ class TransferExecutor:
                 connection.id,
                 credentials,
                 self.runner,
-                allowed_origins=parse_allowed_origins(self.settings.nextcloud_allowed_origins),
                 credential_version=connection.credential_version,
                 chunk_size=self.settings.nextcloud_chunk_size,
             )

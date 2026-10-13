@@ -8,7 +8,7 @@
 |---|---|---|
 | Autenticación y usuarios | Implementado | Sesiones HttpOnly/SameSite con CSRF, Argon2id, bloqueo tras cinco intentos fallidos, roles `ADMIN`/`USER`, cambio obligatorio de contraseña y CLI inicial. Véanse `backend/app/main.py`, `backend/app/security/` y `backend/tests/test_api_security.py`, `test_user_management.py`, `test_cli.py`. |
 | Conexiones y credenciales | Implementado | Administración, asignación privada, OAuth de Google, cifrado AES-GCM y respuestas públicas sin credenciales. El archivado es lógico y rechaza conexiones con trabajos activos. Véanse `backend/app/main.py`, `backend/app/security/credentials.py` y las migraciones. |
-| Proveedores | Implementado con validación externa | MEGA usa MEGAcmd; Google Drive usa Rclone/OAuth; Seafile ofrece adaptadores Rclone o API explícito; la UI usa SMB/NAS como origen; Nextcloud usa Rclone WebDAV tras habilitación y allowlist de origen HTTPS. Cada instalación necesita sus credenciales, permisos y rutas de red. La compatibilidad de Seafile API se acota inicialmente a CE 13.x. Nextcloud requiere prueba real por instalación antes de activarlo. |
+| Proveedores | Implementado con validación externa | MEGA usa MEGAcmd; Google Drive usa Rclone/OAuth; Seafile ofrece adaptadores Rclone o API explícito; la UI usa SMB/NAS como origen; Nextcloud usa Rclone WebDAV con URL y credenciales administradas por conexión. Cada instalación necesita sus credenciales, permisos y rutas de red. La compatibilidad de Seafile API se acota inicialmente a CE 13.x. Nextcloud requiere prueba real por instalación antes de activarlo. |
 | Explorador | Implementado | Navegación, búsqueda, selección múltiple y destino por carpeta existente; paneles coordinados en escritorio y pasos separados en pantallas estrechas. No hay creación manual de carpetas desde la UI. Véanse `frontend/src/App.tsx` y `docs/specs/03-file-explorer-spec.md`. |
 | Transferencias | Implementado | Operación `COPY`, ejecución de fondo, límites, cancelación, reintentos clasificados, staging por archivo, verificación y diagnóstico sanitizado. La reanudación por manifiesto está disponible para transferencias SMB fallidas o canceladas; no es una capacidad general de todos los adaptadores. |
 | Programaciones | Implementado | Ejecuciones futuras de una sola vez, zonas IANA, modos `AUTO`/`EXCLUSIVE`, dependencias y despacho durable vía PostgreSQL, Celery Beat y `control-worker`. No hay recurrencia. Detalle en `docs/integrations/transfer-scheduling.md`. |
@@ -20,7 +20,7 @@
 
 - Migración de carpetas desde SMB/NAS a MEGA, Google Drive o Seafile, con manifiesto por archivo y reanudación controlada.
 - Seafile mediante Rclone o API directa seleccionada por conexión; no hay fallback silencioso entre adaptadores.
-- Nextcloud mediante WebDAV/Rclone con límites conservadores de concurrencia, ancho de banda y timeout; deshabilitado por defecto. Véase `docs/integrations/nextcloud-compatibility.md`.
+- Nextcloud mediante WebDAV/Rclone con registro desde la UI y límites conservadores de concurrencia, ancho de banda y timeout. Véase `docs/integrations/nextcloud-compatibility.md`.
 - Programación única, modos de admisión, dependencias y vista de trabajos en segundo plano.
 - Administración de conexiones privadas y archivado lógico sin borrar referencias históricas.
 - Configuración SMTP desde Administración y menú de cuenta que agrupa administración, cambio de contraseña y cierre de sesión.

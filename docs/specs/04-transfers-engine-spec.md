@@ -1,7 +1,7 @@
 # Especificación 04: Motor de Transferencias con MEGAcmd, Rclone, Seafile API y Nextcloud
 
 ## 1. Contexto y Objetivos
-El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Coordina copias asíncronas entre proveedores: **MEGAcmd** opera MEGA; **Rclone** opera Google Drive, Nextcloud WebDAV y Seafile con `adapter_type=RCLONE`; el adaptador HTTPX de Seafile opera únicamente las conexiones marcadas explícitamente `adapter_type=SEAFILE_API`. Administra la cola, progreso, cancelaciones y reintentos. Nextcloud requiere habilitación y allowlist HTTPS por despliegue; su perfil está descrito en `docs/integrations/nextcloud-compatibility.md`.
+El motor de transferencias es el núcleo operativo de Cloud Transfer Manager. Coordina copias asíncronas entre proveedores: **MEGAcmd** opera MEGA; **Rclone** opera Google Drive, Nextcloud WebDAV y Seafile con `adapter_type=RCLONE`; el adaptador HTTPX de Seafile opera únicamente las conexiones marcadas explícitamente `adapter_type=SEAFILE_API`. Administra la cola, progreso, cancelaciones y reintentos. Los servidores Nextcloud se registran desde la UI como conexiones; su perfil está descrito en `docs/integrations/nextcloud-compatibility.md`.
 
 ---
 

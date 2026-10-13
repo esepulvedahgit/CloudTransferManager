@@ -336,8 +336,6 @@ async def test_nextcloud_transfer_uses_a_scoped_rclone_profile(tmp_path, monkeyp
         runner=runner,
     )
     executor.settings = Settings(
-        nextcloud_enabled=True,
-        nextcloud_allowed_origins="https://cloud.example.test",
         nextcloud_bandwidth_limit="4M",
     )
     original_runner = executor.runner
@@ -360,21 +358,25 @@ async def test_nextcloud_transfer_uses_a_scoped_rclone_profile(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_worker_rejects_preexisting_nextcloud_transfer_when_disabled(tmp_path):
+async def test_worker_runs_nextcloud_transfer_without_environment_configuration(tmp_path):
+    runner = ProgressRunner()
     executor, transfer, _providers, runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
         source_type="NEXTCLOUD",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/source.txt", size=4, provider="NEXTCLOUD")],
+        source_paths=["/source.txt"],
+        runner=runner,
     )
 
     await executor.execute(transfer.id)
 
-    assert transfer.status == "FAILED"
     events = await _store.alist_transfer_events(transfer.id)
-    assert _failure_diagnostic(events, "NEXTCLOUD_DISABLED")
-    assert runner.downloaded == []
-    assert runner.uploaded == []
+    assert transfer.status == "COMPLETED", [
+        (event.get("provider_error_code"), event.get("technical_details"), event.get("message"))
+        for event in events
+    ]
+    assert runner.calls[0][0] == "copy"
 
 
 @pytest.mark.asyncio
@@ -384,10 +386,6 @@ async def test_nextcloud_timeout_has_a_specific_sanitized_failure_code(tmp_path,
         source_type="NEXTCLOUD",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/source.txt", size=4, provider="NEXTCLOUD")],
-    )
-    executor.settings = Settings(
-        nextcloud_enabled=True,
-        nextcloud_allowed_origins="https://cloud.example.test",
     )
 
     async def timed_out(_record, _source, _destination):
