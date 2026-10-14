@@ -33,6 +33,19 @@ def test_google_drive_config_contains_oauth_refresh_data_and_shared_drive():
 
 
 @pytest.mark.asyncio
+async def test_google_export_negative_size_is_unknown():
+    class Runner:
+        async def run(self, *args, **kwargs):
+            return b'[{"Name":"document.docx","IsDir":false,"Size":-1}]', b""
+
+    provider = RcloneGoogleDriveProvider(uuid.uuid4(), {
+        "client_id": "id", "client_secret": "secret", "refresh_token": "token"
+    }, Runner())
+    page = await provider.list_items("/")
+    assert page.items[0].size_bytes is None
+
+
+@pytest.mark.asyncio
 async def test_modified_time_sort_handles_provider_items_without_timestamps():
     class ListingRunner:
         async def run(self, *args, **kwargs):

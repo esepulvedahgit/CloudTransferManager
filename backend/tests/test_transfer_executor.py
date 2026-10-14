@@ -913,6 +913,168 @@ async def test_real_transfer_uses_combined_ephemeral_provider_config_and_copy_on
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corrupt,existing,max_bytes,cancel",
+    [
+        (False, False, 0, False),
+        (True, False, 0, False),
+        (False, True, 0, False),
+        (False, False, 6, False),
+        (False, False, 0, True),
+    ],
+)
+async def test_google_native_export_is_staged_once_and_verified_by_content(
+    tmp_path, corrupt, existing, max_bytes, cancel
+):
+    class ExportRunner(LocalCopyRunner):
+        def __init__(self, root):
+            super().__init__(root)
+            self.exports = 0
+            self.stored = b""
+
+        async def copy_remote_to_local(self, remote, folder, config, job_id, **kwargs):
+            if remote.startswith(f"ctm_{self.source_provider.connection_id.hex}:"):
+                self.exports += 1
+                payload = b"exported-docx"
+            else:
+                payload = b"X" * len(self.stored) if corrupt else self.stored
+            (folder / "document.docx").write_bytes(payload)
+
+        async def copy_local_to_remote(self, local, remote, config, job_id, **kwargs):
+            self.stored = local.read_bytes()
+            await super().copy_local_to_remote(local, remote, config, job_id, **kwargs)
+
+    runner = ExportRunner(tmp_path / "staging")
+    executor, transfer, _providers, _runner, snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="NEXTCLOUD",
+        source_items=[_item("/document.docx", size=None, provider="GOOGLE_DRIVE")],
+        source_paths=["/document.docx"],
+        runner=runner,
+    )
+    executor.settings.transfer_max_file_bytes = max_bytes
+    if existing:
+        runner.stored = b"exported-docx"
+        runner.destination_provider.items["/backup/document.docx"] = _item(
+            "/backup/document.docx", size=len(runner.stored), provider="NEXTCLOUD"
+        )
+    if cancel:
+
+        async def cancel_after_export():
+            return runner.exports > 0
+
+        executor.should_cancel = cancel_after_export
+    await executor.execute(transfer.id)
+    assert runner.exports == 1
+    assert list((tmp_path / "staging").iterdir()) == []
+    if cancel:
+        assert transfer.status == "CANCELLED"
+        assert runner.upload_attempts == 0
+    elif max_bytes:
+        assert transfer.status == "FAILED"
+        assert runner.upload_attempts == 0
+        _failure_diagnostic(
+            await store.alist_transfer_events(transfer.id), "GOOGLE_DRIVE_EXPORT_LIMIT_EXCEEDED"
+        )
+    elif corrupt:
+        assert transfer.status == "FAILED"
+        assert transfer.files_completed == 0
+        _failure_diagnostic(
+            await store.alist_transfer_events(transfer.id), "DESTINATION_VERIFICATION_FAILED"
+        )
+    else:
+        assert transfer.status == "COMPLETED"
+        assert transfer.files_completed == 1
+        assert transfer.bytes_transferred == transfer.bytes_total == len(b"exported-docx")
+        assert any(s["files_completed"] == 1 for s in snapshots)
+        if existing:
+            assert runner.upload_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_copy_reports_nextcloud_filename_rejection(tmp_path):
+    runner = ProgressRunner()
+    executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="NEXTCLOUD",
+        source_items=[_item("/source", size=383, provider="GOOGLE_DRIVE")],
+        runner=runner,
+    )
+
+    async def reject_name(*args, **kwargs):
+        raise RcloneCommandError(1, b"El nombre del archivo es demasiado largo: 400 Bad Request")
+
+    runner.run = reject_name
+    await executor.execute(transfer.id)
+    diagnostic = _failure_diagnostic(
+        await store.alist_transfer_events(transfer.id), "NEXTCLOUD_FILENAME_TOO_LONG"
+    )
+    assert diagnostic["technical_details"]["rclone_http_statuses"] == [400]
+    assert "nombre" in diagnostic["message"]
+    assert transfer.status == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_folder_progress_uses_preflight_bytes_when_rclone_total_grows(tmp_path):
+    import json
+
+    executor, transfer, _providers, runner, snapshots, _store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="NEXTCLOUD",
+        source_items=[
+            _item("/source", is_dir=True, provider="GOOGLE_DRIVE"),
+            _item("/source/one.bin", size=1000, provider="GOOGLE_DRIVE"),
+            _item("/source/two.bin", size=1000, provider="GOOGLE_DRIVE"),
+        ],
+        runner=ProgressRunner(),
+    )
+    original_run = runner.run
+
+    async def growing_total(command, paths, config, job_id, **kwargs):
+        if command == "copy":
+            for done, discovered, percent in [(10, 10, 100), (500, 2000, 25)]:
+                await kwargs["line_callback"](
+                    json.dumps(
+                        {
+                            "level": "notice",
+                            "msg": f"Transferred: {done} B / {discovered} B, {percent}%, "
+                            "10 B/s, ETA 0s",
+                        }
+                    )
+                )
+        return await original_run(command, paths, config, job_id, **kwargs)
+
+    runner.run = growing_total
+    await executor.execute(transfer.id)
+    live = [s for s in snapshots if s["current_speed_bps"] is not None]
+    assert [s["progress_percent"] for s in live[:2]] == [0.5, 25.0]
+    assert all(s["bytes_total"] == 2000 for s in live)
+    assert any(s["files_completed"] == 1 and s["status"] == "RUNNING" for s in snapshots)
+
+
+@pytest.mark.asyncio
+async def test_google_nextcloud_rejects_long_names_before_copy(tmp_path):
+    name = "é" * 128 + ".txt"
+    executor, transfer, _providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="NEXTCLOUD",
+        source_items=[_item("/" + name, size=383, provider="GOOGLE_DRIVE")],
+        source_paths=["/" + name],
+        runner=ProgressRunner(),
+    )
+    await executor.execute(transfer.id)
+    assert transfer.status == "FAILED"
+    assert not runner.calls
+    _failure_diagnostic(
+        await store.alist_transfer_events(transfer.id), "NEXTCLOUD_FILENAME_TOO_LONG"
+    )
+
+
+@pytest.mark.asyncio
 async def test_multi_path_progress_aggregates_each_path_without_regressing(tmp_path):
     key_file = tmp_path / "master-key"
     key_file.write_bytes(b"m" * 32)

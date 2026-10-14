@@ -1154,6 +1154,12 @@ function formatProgressPercent(value: number, fractionDigits = 0): string {
   return displayValue.toFixed(fractionDigits);
 }
 
+function formatTransferBytes(transferred: number, total: number): string {
+  return total > 0
+    ? `${formatBytes(transferred)} de ${formatBytes(total)}`
+    : `${formatBytes(transferred)} transferidos`;
+}
+
 function formatRequestedAt(value?: string | null): string | null {
   if (!value) return null;
   const date = new Date(value);
@@ -2407,7 +2413,7 @@ function TransferWorkspace({
                   <>
                     <Box className="background-transfer-progress-meta">
                       <Typography variant="caption" color="text.secondary">
-                        {formatBytes(transfer.bytes_transferred)} de {formatBytes(transfer.bytes_total)}
+                        {formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}
                       </Typography>
                       <Typography variant="caption" color="text.secondary">{formatProgressPercent(transfer.progress_percent)}%</Typography>
                     </Box>
@@ -2745,7 +2751,7 @@ function TransferWorkspace({
               )}
               <LinearProgress variant={transfer.bytes_total ? 'determinate' : 'indeterminate'} value={transfer.progress_percent} sx={{ mt: 2, mb: 1 }} />
               <Typography variant="caption" color="text.secondary">
-                {formatBytes(transfer.bytes_transferred)} de {formatBytes(transfer.bytes_total)} · {transfer.files_completed}/{transfer.files_total} archivos
+                {formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)} · {transfer.files_completed}/{transfer.files_total} archivos
               </Typography>
               <Typography variant="caption" color="text.secondary" display="block">
                 {transfer.current_speed_bps === null ? 'Velocidad calculándose' : `${formatBytes(transfer.current_speed_bps)}/s`}
@@ -2837,8 +2843,8 @@ function TransferWorkspace({
                 </Box>
                 <Typography variant="caption" color="text.secondary" className="history-counts">
                   {sourceConnection?.provider_type === 'SMB'
-                    ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${transfer.manifest_summary?.failed ?? 0} con error · ${transfer.manifest_summary?.skipped ?? 0} omitidos · ${formatBytes(transfer.bytes_transferred)} de ${formatBytes(transfer.bytes_total)}`
-                    : `${transfer.files_completed} de ${transfer.files_total} archivos · ${formatBytes(transfer.bytes_transferred)} de ${formatBytes(transfer.bytes_total)}`}
+                    ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${transfer.manifest_summary?.failed ?? 0} con error · ${transfer.manifest_summary?.skipped ?? 0} omitidos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
+                    : `${transfer.files_completed} de ${transfer.files_total} archivos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`}
                 </Typography>
                 <Box className="history-meta">
                   {formatRequestedAt(transfer.created_at) && (

@@ -51,6 +51,41 @@ class RcloneCommandError(RuntimeError):
             return False
         return any(marker in message for marker in self._retryable_markers)
 
+    @property
+    def diagnostic_details(self) -> dict[str, list[int] | list[str]]:
+        """Fixed diagnostic values only: never provider messages, URLs or credentials."""
+        message = self._stderr.decode("utf-8", errors="ignore").casefold()
+        status_patterns = (
+            r"\b(?:http(?:/[12](?:\.\d)?)?\s+|status(?: code)?[\s:=]+)([45]\d\d)\b",
+            r"\b([45]\d\d)\s+(?:bad request|forbidden|unauthorized|not found|locked|"
+            r"too many requests|service unavailable|bad gateway|gateway timeout|"
+            r"insufficient storage|request entity too large)\b",
+        )
+        statuses = {
+            int(match.group(1)) for pattern in status_patterns
+            for match in re.finditer(pattern, message)
+        }
+        operations = {
+            "UPLOAD_CHUNK": ("uploading chunk",),
+            "FINALIZE_UPLOAD": ("assembling chunks", "merging chunks", "move failed"),
+            "SET_MODIFICATION_TIME": ("modification time", "modtime", "proppatch"),
+            "CHECKSUM_VERIFICATION": ("corrupted on transfer", "hash differ", "checksum mismatch"),
+            "DOWNLOAD": ("failed to open source", "download failed"),
+        }
+        return {
+            "rclone_http_statuses": sorted(statuses),
+            "rclone_error_categories": ["FILENAME_TOO_LONG"] if any(
+                marker in message for marker in (
+                    "file name too long", "filename too long", "name is too long",
+                    "nombre del archivo es demasiado largo",
+                )
+            ) else [],
+            "rclone_operations": [
+                operation for operation, markers in operations.items()
+                if any(marker in message for marker in markers)
+            ],
+        }
+
 
 class RcloneCancelledError(RuntimeError):
     pass
@@ -212,6 +247,7 @@ class RcloneRunner:
         line_callback: Callable[[str], Awaitable[None]] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        max_transfer_bytes: int | None = None,
     ) -> None:
         safe_remote_source = self._validate_remote_path(remote_source)
         safe_local_directory = self._validate_local_staging_path(local_directory, is_directory=True)
@@ -220,7 +256,8 @@ class RcloneRunner:
             config_content,
             job_id,
             lambda config_path: self._copy_command(
-                safe_remote_source, safe_local_directory, config_path, conflict_policy
+                safe_remote_source, safe_local_directory, config_path, conflict_policy,
+                max_transfer_bytes=max_transfer_bytes,
             ),
             line_callback=line_callback,
             should_cancel=should_cancel,
@@ -236,6 +273,7 @@ class RcloneRunner:
         line_callback: Callable[[str], Awaitable[None]] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        force_transfer: bool = False,
     ) -> None:
         safe_local_file = self._validate_local_staging_path(local_file, is_directory=False)
         safe_remote_destination = self._validate_remote_path(remote_destination)
@@ -244,7 +282,8 @@ class RcloneRunner:
             config_content,
             job_id,
             lambda config_path: self._copy_command(
-                safe_local_file, safe_remote_destination, config_path, conflict_policy
+                safe_local_file, safe_remote_destination, config_path, conflict_policy,
+                force_transfer=force_transfer,
             ),
             line_callback=line_callback,
             should_cancel=should_cancel,
@@ -326,6 +365,8 @@ class RcloneRunner:
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
         *,
         create_empty_src_dirs: bool = False,
+        max_transfer_bytes: int | None = None,
+        force_transfer: bool = False,
     ) -> list[str]:
         if conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT"}:
             raise ValueError("Unsupported copy conflict policy")
@@ -346,6 +387,12 @@ class RcloneRunner:
             command.append("--ignore-existing")
         if create_empty_src_dirs:
             command.append("--create-empty-src-dirs")
+        if max_transfer_bytes is not None:
+            if not isinstance(max_transfer_bytes, int) or max_transfer_bytes <= 0:
+                raise ValueError("Invalid transfer byte limit")
+            command.extend(["--max-transfer", str(max_transfer_bytes), "--cutoff-mode", "HARD"])
+        if force_transfer and conflict_policy != "SKIP":
+            command.append("--ignore-times")
         if self.transfer_profile is not None:
             command.extend(self.transfer_profile.argv())
         return command
@@ -405,6 +452,7 @@ class RcloneRunner:
                 callback: Callable[[str], Awaitable[None]] | None = None,
             ) -> tuple[bytes, bool]:
                 chunks: list[bytes] = []
+                tail = bytearray()
                 captured = 0
                 truncated = False
                 pending = bytearray()
@@ -413,13 +461,19 @@ class RcloneRunner:
                     self._copy_output_limit if command == "copy" else self._json_output_limit
                 )
                 while chunk := await stream.read(64 * 1024):
-                    remaining = output_limit - captured
-                    if remaining > 0:
-                        retained = chunk[:remaining]
-                        chunks.append(retained)
-                        captured += len(retained)
-                    if len(chunk) > remaining:
-                        truncated = True
+                    if command == "copy":
+                        tail.extend(chunk)
+                        if len(tail) > output_limit:
+                            del tail[:-output_limit]
+                            truncated = True
+                    else:
+                        remaining = output_limit - captured
+                        if remaining > 0:
+                            retained = chunk[:remaining]
+                            chunks.append(retained)
+                            captured += len(retained)
+                        if len(chunk) > remaining:
+                            truncated = True
                     if callback is None:
                         continue
                     pending.extend(chunk)
@@ -443,7 +497,7 @@ class RcloneRunner:
                             await callback(line.decode("utf-8", errors="replace").rstrip("\r\n"))
                 if pending and callback is not None and not discarding_long_line:
                     await callback(pending.decode("utf-8", errors="replace").rstrip("\r\n"))
-                return b"".join(chunks), truncated
+                return (bytes(tail) if command == "copy" else b"".join(chunks)), truncated
 
             reader_tasks = [
                 asyncio.create_task(read_stream(process.stdout)),

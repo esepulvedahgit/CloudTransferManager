@@ -157,17 +157,20 @@ class NextcloudRcloneProvider(RcloneStorageProvider):
 
     def config_content(self) -> str:
         credentials = self.validate_credentials(self.credentials)
-        return "\n".join(
-            (
-                f"[{self.remote_name}]",
-                "type = webdav",
-                f"url = {_config_value(credentials['url'], 'url')}",
-                "vendor = nextcloud",
-                f"nextcloud_chunk_size = {self.chunk_size}",
-                f"user = {_config_value(credentials['username'], 'username')}",
-                f"pass = {_obscure_for_rclone(credentials['password'])}",
+        return (
+            "\n".join(
+                (
+                    f"[{self.remote_name}]",
+                    "type = webdav",
+                    f"url = {_config_value(credentials['url'], 'url')}",
+                    "vendor = nextcloud",
+                    f"nextcloud_chunk_size = {self.chunk_size}",
+                    f"user = {_config_value(credentials['username'], 'username')}",
+                    f"pass = {_obscure_for_rclone(credentials['password'])}",
+                )
             )
-        ) + "\n"
+            + "\n"
+        )
 
     async def get_item(self, path: str) -> StorageItem | None:
         from app.providers.mock import MockStorageProvider
@@ -186,7 +189,9 @@ class NextcloudRcloneProvider(RcloneStorageProvider):
             )
         except RcloneCommandError as exc:
             diagnostic = exc._stderr.decode("utf-8", errors="ignore").casefold()
-            if "404" in diagnostic or "object not found" in diagnostic:
+            if any(marker in diagnostic for marker in (
+                "404", "object not found", "directory not found", "file not found"
+            )):
                 return None
             raise
         import json

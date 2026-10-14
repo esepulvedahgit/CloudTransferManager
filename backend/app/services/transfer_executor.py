@@ -781,6 +781,11 @@ class TransferExecutor:
     ) -> None:
         source = self._provider(source_connection)
         destination = self._provider(destination_connection)
+        if (source_connection.provider_type, destination_connection.provider_type) == (
+            "GOOGLE_DRIVE", "NEXTCLOUD"
+        ):
+            await self._run_drive_nextcloud(record, source, destination)
+            return
         if self._uses_seafile_api(source_connection) or self._uses_seafile_api(
             destination_connection
         ):
@@ -981,6 +986,16 @@ class TransferExecutor:
                             # whole-job estimate, so omit it for the multi-path transfer.
                             record.estimated_remaining_seconds = None
                         local_progress = progress.get("progress_percent")
+                        if manifest_sizes_known and record.bytes_total > 0:
+                            # Rclone discovers folder totals incrementally; its first
+                            # 100% can describe only the first tiny file it discovered.
+                            record.progress_percent = min(
+                                round(record.bytes_transferred * 100 / record.bytes_total, 2),
+                                99.99,
+                            )
+                            record.current_item = progress.get("current_item")
+                            await self.publish(record)
+                            return
                         if not isinstance(local_progress, (int, float)):
                             current_bytes = progress.get("bytes_transferred")
                             total_bytes = progress.get("bytes_total")
@@ -1046,16 +1061,31 @@ class TransferExecutor:
                 raise
             except RcloneCommandError as exc:
                 if not exc.retryable or attempt > self.settings.transfer_max_retries:
+                    details = exc.diagnostic_details
+                    nextcloud_long_name = (
+                        "NEXTCLOUD" in {
+                            source_connection.provider_type, destination_connection.provider_type
+                        }
+                        and "FILENAME_TOO_LONG" in details["rclone_error_categories"]
+                    )
                     await self._fail(
                         record,
                         error_code=(
-                            "RCLONE_RETRIES_EXHAUSTED" if exc.retryable else "RCLONE_COMMAND_FAILED"
+                            "NEXTCLOUD_FILENAME_TOO_LONG" if nextcloud_long_name
+                            else "RCLONE_RETRIES_EXHAUSTED" if exc.retryable
+                            else "RCLONE_COMMAND_FAILED"
                         ),
-                        message="No se pudo completar la copia con el proveedor.",
+                        message=(
+                            "Nextcloud rechazó un archivo porque su nombre es demasiado largo. "
+                            "Acorte el nombre y vuelva a intentar la copia."
+                            if nextcloud_long_name
+                            else "No se pudo completar la copia con el proveedor."
+                        ),
                         technical_details={
                             "return_code": exc.return_code,
                             "retryable": exc.retryable,
                             "attempt": attempt,
+                            **details,
                         },
                     )
                     return
@@ -1131,6 +1161,345 @@ class TransferExecutor:
         record.status = "COMPLETED_WITH_WARNINGS" if record.warning_count else "COMPLETED"
         record.completed_at = datetime.now(UTC)
         await self.publish(record)
+
+    async def _run_drive_nextcloud(
+        self, record: TransferRecord, source: Any, destination: Any
+    ) -> None:
+        """Verify each file; export unknown-size Drive documents exactly once to staging."""
+        export_limit = min(self.settings.transfer_max_file_bytes or 64 * 1024**2, 64 * 1024**2)
+        try:
+            files, directories = await self._collect_files(
+                source, record.source_paths, include_selected_folder=True, allow_unknown_size=True
+            )
+            for directory in directories:
+                if any(len(part.encode("utf-8")) > 255 for part in PurePosixPath(directory).parts):
+                    raise self._PreflightError(
+                        "NEXTCLOUD_FILENAME_TOO_LONG",
+                        "Nextcloud no admite uno de los nombres de carpeta. Acorte el nombre.",
+                    )
+            for item, relative in files:
+                record.current_item = item.path
+                if any(len(part.encode("utf-8")) > 255 for part in PurePosixPath(relative).parts):
+                    raise self._PreflightError(
+                        "NEXTCLOUD_FILENAME_TOO_LONG",
+                        "Nextcloud no admite uno de los nombres de la selección. "
+                        "Acorte el nombre del archivo o carpeta antes de copiar.",
+                        {
+                            "name_utf8_bytes": max(
+                                len(p.encode("utf-8")) for p in PurePosixPath(relative).parts
+                            )
+                        },
+                    )
+            exports = [
+                (item.model_copy(update={"size_bytes": export_limit * 2}), path)
+                for item, path in files
+                if item.size_bytes is None
+            ]
+            if exports and not await self._preflight_staging(record, exports):
+                return
+        except (FileNotFoundError, self._PreflightError) as exc:
+            await self._fail(
+                record,
+                error_code=exc.error_code
+                if isinstance(exc, self._PreflightError)
+                else "SOURCE_ITEM_NOT_FOUND",
+                message=exc.message
+                if isinstance(exc, self._PreflightError)
+                else "No se encontró un archivo del origen.",
+                technical_details=exc.technical_details
+                if isinstance(exc, self._PreflightError)
+                else None,
+            )
+            return
+
+        unknown_sizes = any(item.size_bytes is None for item, _ in files)
+        record.files_total = len(files)
+        record.files_completed = 0
+        record.bytes_transferred = 0
+        record.bytes_total = 0 if unknown_sizes else sum(item.size_bytes or 0 for item, _ in files)
+        record.current_item = None
+        record.status = "RUNNING"
+        await self.publish(record)
+        destination_root = MockStorageProvider.normalize_path(record.destination_path)
+        empty_dirs = {
+            directory
+            for directory in directories
+            if not any(path.startswith(directory.rstrip("/") + "/") for _, path in files)
+        }
+        if empty_dirs:
+            async with temporary_staging_area(
+                Path(self.settings.transfer_staging_path), transfer_id=record.id, expected_size=0
+            ) as area:
+                for directory in empty_dirs:
+                    area.joinpath(*PurePosixPath(self._safe_relative_path(directory)).parts).mkdir(
+                        parents=True, exist_ok=True
+                    )
+                await self.runner.copy_local_directory_to_remote(
+                    area,
+                    destination.remote_path(destination_root),
+                    destination.config_content(),
+                    record.id,
+                    conflict_policy=record.conflict_policy,
+                    should_cancel=self.should_cancel,
+                )
+
+        resolved_bytes = 0
+        for item, relative in files:
+            if await self.should_cancel():
+                raise RcloneCancelledError("Transfer cancelled")
+            target = MockStorageProvider.normalize_path(
+                f"{destination_root.rstrip('/')}/{self._safe_relative_path(relative)}"
+            )
+            folder = str(PurePosixPath(target).parent)
+            record.current_item = item.path
+            record.current_speed_bps = None
+            record.estimated_remaining_seconds = None
+            byte_base = record.bytes_transferred
+
+            async def on_progress(
+                line: str,
+                item_for_file: StorageItem = item,
+                byte_base_for_file: int = byte_base,
+                resolved_base: int = resolved_bytes,
+            ) -> None:
+                metrics = parse_rclone_stats_line(line)
+                if metrics is None:
+                    return
+                done = min(
+                    max(metrics.get("bytes_transferred", 0), 0), item_for_file.size_bytes or 0
+                )
+                record.bytes_transferred = byte_base_for_file + done
+                record.current_speed_bps = metrics.get("current_speed_bps")
+                elapsed = (
+                    max((datetime.now(UTC) - record.started_at).total_seconds(), 1)
+                    if record.started_at
+                    else 1
+                )
+                record.average_speed_bps = int(record.bytes_transferred / elapsed)
+                fraction = done / item_for_file.size_bytes if item_for_file.size_bytes else 0
+                percent = (
+                    (record.files_completed + fraction) * 100 / max(record.files_total, 1)
+                    if unknown_sizes or not record.bytes_total
+                    else (resolved_base + done) * 100 / record.bytes_total
+                )
+                record.progress_percent = min(round(percent, 2), 99.99)
+                await self.publish(record)
+
+            existing = await destination.get_item(target)
+            if existing is not None and existing.is_dir:
+                await self._fail(record, error_code="DESTINATION_PATH_IS_DIRECTORY")
+                return
+            if existing is not None and record.conflict_policy == "SKIP":
+                # Preservation is explicit; unknown exports cannot be certified by size.
+                if item.size_bytes is None or existing.size_bytes != item.size_bytes:
+                    record.warning_count += 1
+            else:
+                try:
+                    if item.size_bytes is None:
+                        async with temporary_staging_area(
+                            Path(self.settings.transfer_staging_path),
+                            transfer_id=record.id,
+                            expected_size=export_limit * 2,
+                            reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+                            margin_percent=self.settings.transfer_staging_margin_percent,
+                        ) as area:
+
+                            async def download_export(
+                                source_item: StorageItem = item, export_area: Path = area
+                            ) -> bool:
+                                # A failed export may leave a partial local file.
+                                (export_area / source_item.name).unlink(missing_ok=True)
+                                await self.runner.copy_remote_to_local(
+                                    source.remote_path(source_item.path),
+                                    export_area,
+                                    source.config_content(),
+                                    record.id,
+                                    should_cancel=self.should_cancel,
+                                    max_transfer_bytes=export_limit,
+                                )
+                                return True
+
+                            await self._copy_drive_file_with_retry(record, download_export)
+                            local = area / item.name
+                            if not local.is_file() or local.is_symlink():
+                                raise self._PreflightError(
+                                    "GOOGLE_DRIVE_EXPORT_FAILED",
+                                    "Drive no confirmó el archivo exportado.",
+                                )
+                            actual_size = local.stat().st_size
+                            if actual_size > export_limit:
+                                raise self._PreflightError(
+                                    "GOOGLE_DRIVE_EXPORT_LIMIT_EXCEEDED",
+                                    "La exportación supera el límite temporal permitido.",
+                                )
+                            item.size_bytes = actual_size
+                            if all(i.size_bytes is not None for i, _ in files):
+                                record.bytes_total = sum(i.size_bytes or 0 for i, _ in files)
+                            digest = await _sha256_file(local, self.should_cancel)
+
+                            async def copy_export(
+                                target_path: str = target,
+                                file_digest: str = digest,
+                                file_size: int = actual_size,
+                                local_file: Path = local,
+                                remote_folder: str = folder,
+                                progress_callback: Callable[[str], Awaitable[None]] = on_progress,
+                            ) -> bool:
+                                if await destination.get_item(
+                                    target_path
+                                ) is not None and await self._verify_drive_export(
+                                    destination, target_path, file_digest, file_size
+                                ):
+                                    return True
+                                await self.runner.copy_local_to_remote(
+                                    local_file,
+                                    destination.remote_path(remote_folder),
+                                    destination.config_content(),
+                                    record.id,
+                                    should_cancel=self.should_cancel,
+                                    line_callback=progress_callback,
+                                    conflict_policy=record.conflict_policy,
+                                    force_transfer=True,
+                                )
+                                return await self._verify_drive_export(
+                                    destination, target_path, file_digest, file_size
+                                )
+
+                            verified = await self._copy_drive_file_with_retry(record, copy_export)
+                    else:
+
+                        async def copy_binary(
+                            source_item: StorageItem = item,
+                            remote_folder: str = folder,
+                            target_path: str = target,
+                            progress_callback: Callable[[str], Awaitable[None]] = on_progress,
+                        ) -> bool:
+                            await self.runner.run(
+                                "copy",
+                                [
+                                    source.remote_path(source_item.path),
+                                    destination.remote_path(remote_folder),
+                                ],
+                                source.config_content().rstrip()
+                                + "\n"
+                                + destination.config_content(),
+                                record.id,
+                                should_cancel=self.should_cancel,
+                                line_callback=progress_callback,
+                                conflict_policy=record.conflict_policy,
+                            )
+                            assert source_item.size_bytes is not None
+                            return await self._verify_rclone_destination(
+                                destination, target_path, source_item.size_bytes
+                            )
+
+                        verified = await self._copy_drive_file_with_retry(record, copy_binary)
+                    if not verified:
+                        await self._fail(
+                            record,
+                            error_code="DESTINATION_VERIFICATION_FAILED",
+                            message="Nextcloud no confirmó el contenido del archivo copiado.",
+                        )
+                        return
+                except self._PreflightError as exc:
+                    await self._fail(record, error_code=exc.error_code, message=exc.message)
+                    return
+                except StagingSpaceError:
+                    await self._fail(record, error_code="TRANSFER_STAGING_SPACE_INSUFFICIENT")
+                    return
+                except RcloneCommandError as exc:
+                    details = exc.diagnostic_details
+                    long_name = "FILENAME_TOO_LONG" in details["rclone_error_categories"]
+                    await self._fail(
+                        record,
+                        error_code="NEXTCLOUD_FILENAME_TOO_LONG"
+                        if long_name
+                        else "GOOGLE_DRIVE_EXPORT_LIMIT_EXCEEDED"
+                        if exc.return_code == 8
+                        else "RCLONE_RETRIES_EXHAUSTED"
+                        if exc.retryable
+                        else "RCLONE_COMMAND_FAILED",
+                        message="Nextcloud rechazó un nombre demasiado largo."
+                        if long_name
+                        else "No se pudo completar la copia con el proveedor.",
+                        technical_details={
+                            "return_code": exc.return_code,
+                            "retryable": exc.retryable,
+                            **details,
+                        },
+                    )
+                    return
+            resolved_bytes += item.size_bytes or 0
+            record.bytes_transferred = byte_base + (item.size_bytes or 0)
+            record.files_completed += 1
+            record.progress_percent = min(
+                round(
+                    record.files_completed * 100 / max(record.files_total, 1)
+                    if unknown_sizes or not record.bytes_total
+                    else resolved_bytes * 100 / record.bytes_total,
+                    2,
+                ),
+                99.99,
+            )
+            record.current_speed_bps = None
+            await self.publish(record)
+
+        record.current_item = None
+        record.current_speed_bps = None
+        record.estimated_remaining_seconds = None
+        record.progress_percent = 100
+        record.status = "COMPLETED_WITH_WARNINGS" if record.warning_count else "COMPLETED"
+        record.completed_at = datetime.now(UTC)
+        await self.publish(record)
+
+    async def _copy_drive_file_with_retry(
+        self, record: TransferRecord, operation: Callable[[], Awaitable[bool]]
+    ) -> bool:
+        for attempt in range(1, self.settings.transfer_max_retries + 2):
+            if await self.should_cancel():
+                raise RcloneCancelledError("Transfer cancelled")
+            record.attempt_count = max(record.attempt_count, attempt)
+            try:
+                return await operation()
+            except RcloneCommandError as exc:
+                if not exc.retryable or attempt > self.settings.transfer_max_retries:
+                    raise
+                record.status = "RETRYING"
+                record.error_count += 1
+                await self.publish(record)
+                if not await self._wait_for_retry(
+                    record, min(5 * 2 ** (attempt - 1), 300), next_attempt=attempt + 1
+                ):
+                    raise RcloneCancelledError("Transfer cancelled") from None
+                record.status = "RUNNING"
+        return False
+
+    async def _verify_drive_export(
+        self, destination: Any, path: str, digest: str, size: int
+    ) -> bool:
+        if not await self._verify_rclone_destination(destination, path, size):
+            return False
+        async with temporary_staging_area(
+            Path(self.settings.transfer_staging_path),
+            transfer_id=uuid.uuid4(),
+            expected_size=size,
+            reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+        ) as area:
+            await self.runner.copy_remote_to_local(
+                destination.remote_path(path),
+                area,
+                destination.config_content(),
+                uuid.uuid4(),
+                should_cancel=self.should_cancel,
+                max_transfer_bytes=size + 1,
+            )
+            downloaded = area / PurePosixPath(path).name
+            return (
+                downloaded.is_file()
+                and not downloaded.is_symlink()
+                and downloaded.stat().st_size == size
+                and await _sha256_file(downloaded, self.should_cancel) == digest
+            )
 
     @staticmethod
     def _uses_seafile_api(connection: ConnectionRecord) -> bool:
@@ -2087,13 +2456,16 @@ class TransferExecutor:
         selected_paths: list[str],
         *,
         include_selected_folder: bool = False,
+        allow_unknown_size: bool = False,
     ) -> tuple[list[tuple[StorageItem, str]], set[str]]:
         files: dict[str, tuple[StorageItem, str]] = {}
         directories: set[str] = set()
         visited_directories: set[str] = set()
 
         def add_file(item_path: str, item: StorageItem, relative_path: str) -> None:
-            self._add_file_to_manifest(files, item_path, item, relative_path)
+            self._add_file_to_manifest(
+                files, item_path, item, relative_path, allow_unknown_size=allow_unknown_size
+            )
 
         async def walk_directory(path: str, relative_directory: PurePosixPath) -> None:
             if await self.should_cancel():
@@ -2181,6 +2553,8 @@ class TransferExecutor:
         item_path: str,
         item: StorageItem,
         relative_path: str,
+        *,
+        allow_unknown_size: bool = False,
     ) -> None:
         if item_path in files:
             return
@@ -2195,7 +2569,7 @@ class TransferExecutor:
                 {"maximum_files": self.settings.transfer_max_files},
             )
         maximum_file_bytes = self.settings.transfer_max_file_bytes
-        if maximum_file_bytes > 0 and item.size_bytes is None:
+        if maximum_file_bytes > 0 and item.size_bytes is None and not allow_unknown_size:
             raise self._PreflightError(
                 "TRANSFER_FILE_SIZE_UNKNOWN",
                 (

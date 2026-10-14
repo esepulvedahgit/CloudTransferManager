@@ -4,7 +4,7 @@ import uuid
 import pytest
 
 from app.providers.nextcloud import NextcloudRcloneProvider
-from app.services.rclone import RcloneRunner
+from app.services.rclone import RcloneCommandError, RcloneRunner
 from app.settings import Settings
 
 
@@ -169,6 +169,26 @@ async def test_nextcloud_connection_test_bypasses_the_directory_cache():
 
     assert result.success is True
     assert runner.calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stderr", [b"directory not found", b"HTTP 404 Not Found"])
+async def test_nextcloud_stat_returns_none_for_missing_destination(stderr):
+    class Runner:
+        async def run(self, *args, **kwargs):
+            raise RcloneCommandError(3, stderr)
+
+    assert await _provider(Runner()).get_item("/new-folder/file.docx") is None
+
+
+@pytest.mark.asyncio
+async def test_nextcloud_stat_does_not_hide_permission_errors():
+    class Runner:
+        async def run(self, *args, **kwargs):
+            raise RcloneCommandError(1, b"HTTP 403 Forbidden")
+
+    with pytest.raises(RcloneCommandError):
+        await _provider(Runner()).get_item("/new-folder/file.docx")
 
 
 @pytest.mark.asyncio

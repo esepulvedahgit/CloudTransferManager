@@ -1217,6 +1217,8 @@ describe('Cloud Transfer Manager', () => {
       await waitFor(() => expect(destinationItemsRequests).toBe(1));
 
       const eventSource = TestEventSource.instances[0];
+      eventSource.emit({ ...transfer, status: 'RUNNING', progress_percent: 50, bytes_total: 0, bytes_transferred: 4 });
+      expect(await screen.findByText(/4 B transferidos · 0\/1 archivos/)).toBeVisible();
       eventSource.emit({ ...transfer, status: 'RUNNING', progress_percent: 99.99, current_item: null });
       await waitFor(() => expect(screen.getAllByText('En curso').length).toBeGreaterThan(0));
       expect(screen.getByText('99.9%')).toBeVisible();

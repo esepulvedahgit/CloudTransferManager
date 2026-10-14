@@ -99,6 +99,34 @@ def test_rclone_copy_command_applies_only_supported_conflict_policy():
         )
 
 
+def test_bounded_export_download_and_forced_verified_upload_flags():
+    runner = RcloneRunner("/usr/bin/rclone", "/tmp")
+    command = runner._copy_command(
+        "remote:/doc",
+        "/tmp/export",
+        "/tmp/config",
+        "OVERWRITE_IF_DIFFERENT",
+        max_transfer_bytes=1024,
+    )
+    assert command[-4:] == ["--max-transfer", "1024", "--cutoff-mode", "HARD"]
+    with pytest.raises(ValueError):
+        runner._copy_command(
+            "remote:/doc",
+            "/tmp/export",
+            "/tmp/config",
+            "OVERWRITE_IF_DIFFERENT",
+            max_transfer_bytes=-1,
+        )
+    command = runner._copy_command(
+        "/tmp/doc", "remote:/dest", "/tmp/config", "OVERWRITE_IF_DIFFERENT", force_transfer=True
+    )
+    assert "--ignore-times" in command
+    command = runner._copy_command(
+        "/tmp/doc", "remote:/dest", "/tmp/config", "SKIP", force_transfer=True
+    )
+    assert "--ignore-existing" in command and "--ignore-times" not in command
+
+
 def test_rclone_copy_command_can_preserve_empty_selected_folder_structure():
     runner = RcloneRunner(binary="/usr/bin/rclone", temp_path="/tmp")
 
@@ -138,6 +166,16 @@ def test_rclone_error_retryability_is_classified_without_raw_message_exposure():
     assert transient.retryable is True
     assert fatal.retryable is False
     assert "password" not in str(fatal).lower()
+
+
+def test_nextcloud_long_name_diagnostic_exposes_only_fixed_categories():
+    error = RcloneCommandError(
+        1,
+        b"El nombre del archivo es demasiado largo: "
+        b"OCA\\DAV\\Connector\\Sabre\\Exception\\InvalidPath: 400 Bad Request",
+    )
+    assert error.diagnostic_details["rclone_http_statuses"] == [400]
+    assert error.diagnostic_details["rclone_error_categories"] == ["FILENAME_TOO_LONG"]
 
 
 @pytest.mark.parametrize(
@@ -306,6 +344,45 @@ async def test_interactive_timeout_terminates_subprocess_and_removes_config(
         )
 
     assert process.terminated
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_copy_preserves_terminal_error_after_large_stats_output(monkeypatch, tmp_path):
+    class FailedProcess:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr.feed_data(b"stats\n" * 20000)
+            self.stderr.feed_data(
+                b'{"level":"error","msg":"uploading chunk failed: HTTP 503 '
+                b'Service Unavailable https://private.example/path?token=secret"}\n'
+            )
+            self.stderr.feed_eof()
+            self.returncode = 1
+
+        async def wait(self):
+            return 1
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *args, **kwargs: _resolved(FailedProcess())
+    )
+    runner = RcloneRunner("/usr/bin/rclone", str(tmp_path))
+    with pytest.raises(RcloneCommandError) as caught:
+        await runner.run(
+            "copy",
+            ["ctm_0123456789abcdef0123456789abcdef:/source",
+             "ctm_fedcba9876543210fedcba9876543210:/destination"],
+            "[mock]\ntype = webdav\n", uuid.uuid4(),
+        )
+    error = caught.value
+    assert error.retryable is True
+    assert len(error._stderr) <= 64 * 1024
+    assert error.diagnostic_details["rclone_http_statuses"] == [503]
+    assert error.diagnostic_details["rclone_operations"] == ["UPLOAD_CHUNK"]
+    assert "secret" not in str(error.diagnostic_details)
+    assert "private.example" not in str(error.diagnostic_details)
     assert list(tmp_path.iterdir()) == []
 
 

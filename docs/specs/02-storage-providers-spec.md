@@ -87,6 +87,7 @@ class StorageProvider(ABC):
 
 ### B. Adaptador Google Drive (`RcloneGoogleDriveProvider`)
 - **Motor:** Rclone CLI aislado, exclusivamente para Google Drive.
+- Los tamaños negativos de Rclone (`-1` en documentos nativos exportados) se presentan como `None`. La ruta Drive → Nextcloud exporta esos archivos a staging privado y verifica la exportación materializada mediante SHA-256 del destino, sin comparar tamaños desconocidos ni generar una segunda exportación para verificar.
 - **Flujo de Autorización:** OAuth 2.0 (Client ID, Client Secret, Refresh Token y Access Token).
 - **Soporte de Unidades:**
   - Mi Unidad (`root`).

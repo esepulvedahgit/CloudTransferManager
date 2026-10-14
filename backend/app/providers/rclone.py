@@ -118,7 +118,8 @@ class RcloneStorageProvider(StorageProvider):
                     name=name,
                     path=item_path,
                     is_dir=bool(entry.get("IsDir", False)),
-                    size_bytes=entry.get("Size") if isinstance(entry.get("Size"), int) else None,
+                    size_bytes=entry.get("Size")
+                    if isinstance(entry.get("Size"), int) and entry["Size"] >= 0 else None,
                     modified_at=modified_at,
                     mime_type=entry.get("MimeType")
                     if isinstance(entry.get("MimeType"), str)
