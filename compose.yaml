@@ -23,9 +23,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     expose:
-      - "80"
+      - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
       interval: 20s
       timeout: 3s
       retries: 3
@@ -47,6 +47,9 @@ services:
       SMTP_PASSWORD_FILE: /run/ctm-secrets/smtp_password
       MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
       TRANSFER_STAGING_PATH: ${TRANSFER_STAGING_PATH:-/var/lib/cloud-transfer/staging}
+      SMB_ALLOWED_TARGETS: ${SMB_ALLOWED_TARGETS:-}
+      SMB_INTERACTIVE_TIMEOUT_SECONDS: ${SMB_INTERACTIVE_TIMEOUT_SECONDS:-30}
+      SMB_TRANSFER_MAX_FILES: ${SMB_TRANSFER_MAX_FILES:-100000}
     secrets:
       - app_secret_key
       - postgres_password
@@ -79,6 +82,8 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    healthcheck:
+      disable: true
     command:
       [
         "celery",
@@ -86,7 +91,7 @@ services:
         "app.worker.celery_app",
         "worker",
         "--loglevel=INFO",
-        "--concurrency=${TRANSFER_MAX_CONCURRENT:-2}",
+        "--concurrency=${TRANSFER_MAX_CONCURRENT:-1}",
         "--queues=transfers",
       ]
     env_file:
@@ -97,6 +102,9 @@ services:
       SMTP_PASSWORD_FILE: /run/ctm-secrets/smtp_password
       MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
       TRANSFER_STAGING_PATH: ${TRANSFER_STAGING_PATH:-/var/lib/cloud-transfer/staging}
+      SMB_ALLOWED_TARGETS: ${SMB_ALLOWED_TARGETS:-}
+      SMB_INTERACTIVE_TIMEOUT_SECONDS: ${SMB_INTERACTIVE_TIMEOUT_SECONDS:-30}
+      SMB_TRANSFER_MAX_FILES: ${SMB_TRANSFER_MAX_FILES:-100000}
     secrets:
       - postgres_password
       - master_key
@@ -114,6 +122,63 @@ services:
     networks:
       - ctm_internal
       - provider_egress
+
+  control-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+        "--queues=control",
+      ]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/ctm-secrets/postgres_password
+    secrets:
+      - postgres_password
+    tmpfs:
+      - /run/ctm-secrets:mode=0700,size=1m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "beat",
+        "--loglevel=INFO",
+        "--pidfile=/tmp/celerybeat.pid",
+      ]
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
 
   postgres:
     image: postgres:16-alpine

@@ -1,5 +1,8 @@
 FROM python:3.12-slim-bookworm
 
+ARG RCLONE_RELEASE=1.75.2
+ARG TARGETARCH=amd64
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
@@ -7,7 +10,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg gosu rclone; \
+        ca-certificates curl gnupg gosu unzip; \
+    rclone_archive_name="rclone-v${RCLONE_RELEASE}-linux-${TARGETARCH}.zip"; \
+    curl -fsSLo "/tmp/${rclone_archive_name}" \
+        "https://downloads.rclone.org/v${RCLONE_RELEASE}/rclone-v${RCLONE_RELEASE}-linux-${TARGETARCH}.zip"; \
+    curl -fsSLo /tmp/rclone-SHA256SUMS \
+        "https://downloads.rclone.org/v${RCLONE_RELEASE}/SHA256SUMS"; \
+    cd /tmp; \
+    grep -F "  ${rclone_archive_name}" rclone-SHA256SUMS > /tmp/rclone-checksum; \
+    test -s /tmp/rclone-checksum; \
+    sha256sum --check --status /tmp/rclone-checksum; \
+    unzip -q "/tmp/${rclone_archive_name}" -d /tmp/rclone; \
+    install -m 0755 "/tmp/rclone/rclone-v${RCLONE_RELEASE}-linux-${TARGETARCH}/rclone" /usr/bin/rclone; \
+    test "$(/usr/bin/rclone version | head -n 1)" = "rclone v${RCLONE_RELEASE}"; \
+    rm -rf /tmp/rclone "/tmp/${rclone_archive_name}" /tmp/rclone-SHA256SUMS /tmp/rclone-checksum; \
     curl -fsSL https://mega.nz/linux/repo/Debian_12/Release.key -o /tmp/mega-release.key; \
     gpg --dearmor --yes -o /usr/share/keyrings/meganz-archive-keyring.gpg /tmp/mega-release.key; \
     rm /tmp/mega-release.key; \
@@ -33,7 +49,12 @@ RUN mkdir -p /var/lib/cloud-transfer/tmp /var/lib/cloud-transfer/staging /var/lo
     && chown -R ctm:ctm /app /var/lib/cloud-transfer /var/log/cloud-transfer \
     && chmod 0700 /var/lib/cloud-transfer/staging
 
+# The entrypoint needs root only to stage file-backed Docker Secrets (0600), then it
+# immediately drops privileges to ctm before starting the application or worker.
+#trivy:ignore:DS-0002
 USER root
 ENTRYPOINT ["/usr/local/bin/ctm-entrypoint"]
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+HEALTHCHECK --interval=20s --timeout=5s --retries=5 --start-period=30s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"

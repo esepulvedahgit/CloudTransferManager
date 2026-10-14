@@ -28,6 +28,9 @@ CREATE INDEX idx_audit_events_action ON audit_events(action);
 CREATE INDEX idx_audit_events_created_at ON audit_events(created_at);
 ```
 
+### Estado de implementación
+La aplicación agrega eventos y expone solo una consulta administrativa; no tiene rutas para editarlos o borrarlos. El esquema actual no define un trigger ni permisos SQL que impidan modificar/borrar filas directamente. Por lo tanto, el registro es append-only en el flujo de aplicación, pero la inmutabilidad frente a una cuenta con acceso de escritura a PostgreSQL sigue pendiente si se exige como garantía de seguridad.
+
 ### Eventos Auditados Obligatoriamente:
 - Inicio de sesión (exitoso y fallido) y cierre de sesión.
 - Cambio y restablecimiento de contraseña.
@@ -69,6 +72,15 @@ CREATE TABLE transfer_events (
 ---
 
 ## 5. Notificaciones por Correo Electrónico (SMTP)
+
+### Configuración de Administración
+- Los administradores gestionan la configuración global desde una subpestaña SMTP del diálogo Administración.
+- `GET /api/v1/settings/smtp` devuelve host, puerto, STARTTLS, remitente e indicador `credentials_configured`; nunca devuelve usuario ni contraseña. `PUT` actualiza esos valores y `POST /api/v1/settings/smtp/test` prueba el borrador sin guardarlo ni enviar un mensaje.
+- Solo el rol `ADMIN` puede leer, probar o modificar la configuración. Las mutaciones requieren protección CSRF.
+- Si no existe un registro guardado, la configuración y la contraseña montada como Docker Secret siguen tomando sus valores del entorno actual. Después de guardar, los workers usan el registro de PostgreSQL para los siguientes correos.
+- Usuario y contraseña se cifran juntos mediante AES-256-GCM envelope con la clave maestra del sistema. Los campos de host, puerto, TLS y remitente no son secretos.
+- Credenciales omitidas o vacías conservan las credenciales vigentes. La prueba autentica solo cuando existen credenciales y devuelve un resultado genérico ante fallos SMTP, TLS, autenticación o timeout.
+- Cada actualización registra `SMTP_SETTINGS_UPDATED`. Sus metadatos contienen nombres de campos cambiados, nunca valores SMTP ni credenciales.
 
 ### Triggers de Envío:
 - Transferencia Completada (`COMPLETED`).

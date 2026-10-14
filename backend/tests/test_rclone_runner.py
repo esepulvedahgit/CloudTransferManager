@@ -4,7 +4,48 @@ import uuid
 
 import pytest
 
-from app.services.rclone import RcloneCancelledError, RcloneCommandError, RcloneRunner
+from app.services.rclone import (
+    RcloneCancelledError,
+    RcloneCommandError,
+    RcloneExecutionProfile,
+    RcloneRunner,
+)
+
+
+def test_nextcloud_profile_adds_bounded_resource_flags_to_all_rclone_commands():
+    runner = RcloneRunner(
+        binary="/usr/bin/rclone",
+        temp_path="/tmp",
+        transfer_profile=RcloneExecutionProfile(),
+    )
+
+    command = runner.build_command(
+        "copy",
+        [
+            "ctm_0123456789abcdef0123456789abcdef:/source",
+            "ctm_fedcba9876543210fedcba9876543210:/dest",
+        ],
+        "/tmp/job.conf",
+    )
+
+    assert command[-10:] == [
+        "--transfers",
+        "1",
+        "--checkers",
+        "2",
+        "--bwlimit",
+        "8M",
+        "--contimeout",
+        "10s",
+        "--timeout",
+        "60s",
+    ]
+
+
+def test_rclone_retries_nextcloud_webdav_locks():
+    error = RcloneCommandError(1, b"HTTP 423 Locked")
+
+    assert error.retryable is True
 
 
 def test_rclone_command_builder_uses_argv_and_closed_allowlist():
@@ -58,6 +99,50 @@ def test_rclone_copy_command_applies_only_supported_conflict_policy():
         )
 
 
+def test_bounded_export_download_and_forced_verified_upload_flags():
+    runner = RcloneRunner("/usr/bin/rclone", "/tmp")
+    command = runner._copy_command(
+        "remote:/doc",
+        "/tmp/export",
+        "/tmp/config",
+        "OVERWRITE_IF_DIFFERENT",
+        max_transfer_bytes=1024,
+    )
+    assert command[-4:] == ["--max-transfer", "1024", "--cutoff-mode", "HARD"]
+    with pytest.raises(ValueError):
+        runner._copy_command(
+            "remote:/doc",
+            "/tmp/export",
+            "/tmp/config",
+            "OVERWRITE_IF_DIFFERENT",
+            max_transfer_bytes=-1,
+        )
+    command = runner._copy_command(
+        "/tmp/doc", "remote:/dest", "/tmp/config", "OVERWRITE_IF_DIFFERENT", force_transfer=True
+    )
+    assert "--ignore-times" in command
+    command = runner._copy_command(
+        "/tmp/doc", "remote:/dest", "/tmp/config", "SKIP", force_transfer=True
+    )
+    assert "--ignore-existing" in command and "--ignore-times" not in command
+
+
+def test_rclone_copy_command_can_preserve_empty_selected_folder_structure():
+    runner = RcloneRunner(binary="/usr/bin/rclone", temp_path="/tmp")
+
+    command = runner.build_command(
+        "copy",
+        [
+            "ctm_0123456789abcdef0123456789abcdef:/source",
+            "ctm_fedcba9876543210fedcba9876543210:/destination/source",
+        ],
+        "/tmp/job.conf",
+        create_empty_src_dirs=True,
+    )
+
+    assert command[-1] == "--create-empty-src-dirs"
+
+
 @pytest.mark.parametrize("command", ["delete", "purge", "sync", "move", "serve", "config"])
 def test_rclone_command_builder_rejects_unapproved_commands(command: str):
     runner = RcloneRunner(binary="/usr/bin/rclone", temp_path="/tmp")
@@ -81,6 +166,16 @@ def test_rclone_error_retryability_is_classified_without_raw_message_exposure():
     assert transient.retryable is True
     assert fatal.retryable is False
     assert "password" not in str(fatal).lower()
+
+
+def test_nextcloud_long_name_diagnostic_exposes_only_fixed_categories():
+    error = RcloneCommandError(
+        1,
+        b"El nombre del archivo es demasiado largo: "
+        b"OCA\\DAV\\Connector\\Sabre\\Exception\\InvalidPath: 400 Bad Request",
+    )
+    assert error.diagnostic_details["rclone_http_statuses"] == [400]
+    assert error.diagnostic_details["rclone_error_categories"] == ["FILENAME_TOO_LONG"]
 
 
 @pytest.mark.parametrize(
@@ -207,6 +302,91 @@ async def test_cancellation_terminates_subprocess_and_removes_ephemeral_config(
 
 
 @pytest.mark.asyncio
+async def test_interactive_timeout_terminates_subprocess_and_removes_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    class SlowProcess:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.returncode = None
+            self._finished = asyncio.Event()
+            self.terminated = False
+
+        async def wait(self):
+            await self._finished.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+            self._finished.set()
+
+        def kill(self):
+            self.returncode = -9
+            self._finished.set()
+
+    process = SlowProcess()
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *args, **kwargs: _resolved(process)
+    )
+    runner = RcloneRunner("/usr/bin/rclone", str(tmp_path))
+
+    with pytest.raises(TimeoutError):
+        await runner.run(
+            "lsjson",
+            ["ctm_0123456789abcdef0123456789abcdef:/"],
+            "[mock]\ntype = smb\n",
+            uuid.uuid4(),
+            timeout_seconds=0.01,
+        )
+
+    assert process.terminated
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_copy_preserves_terminal_error_after_large_stats_output(monkeypatch, tmp_path):
+    class FailedProcess:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr.feed_data(b"stats\n" * 20000)
+            self.stderr.feed_data(
+                b'{"level":"error","msg":"uploading chunk failed: HTTP 503 '
+                b'Service Unavailable https://private.example/path?token=secret"}\n'
+            )
+            self.stderr.feed_eof()
+            self.returncode = 1
+
+        async def wait(self):
+            return 1
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *args, **kwargs: _resolved(FailedProcess())
+    )
+    runner = RcloneRunner("/usr/bin/rclone", str(tmp_path))
+    with pytest.raises(RcloneCommandError) as caught:
+        await runner.run(
+            "copy",
+            ["ctm_0123456789abcdef0123456789abcdef:/source",
+             "ctm_fedcba9876543210fedcba9876543210:/destination"],
+            "[mock]\ntype = webdav\n", uuid.uuid4(),
+        )
+    error = caught.value
+    assert error.retryable is True
+    assert len(error._stderr) <= 64 * 1024
+    assert error.diagnostic_details["rclone_http_statuses"] == [503]
+    assert error.diagnostic_details["rclone_operations"] == ["UPLOAD_CHUNK"]
+    assert "secret" not in str(error.diagnostic_details)
+    assert "private.example" not in str(error.diagnostic_details)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_copy_command_retains_only_bounded_process_output(monkeypatch, tmp_path):
     class NoisyProcess:
         def __init__(self):
@@ -295,9 +475,7 @@ async def test_local_copy_helpers_use_only_copy_and_accept_paths_inside_staging(
 
 
 @pytest.mark.asyncio
-async def test_local_directory_copy_creates_empty_folders_with_only_copy(
-    monkeypatch, tmp_path
-):
+async def test_local_directory_copy_creates_empty_folders_with_only_copy(monkeypatch, tmp_path):
     staging_root = tmp_path / "staging"
     source_directory = staging_root / "empty-folders" / "selected" / "nested"
     source_directory.mkdir(parents=True)
@@ -370,3 +548,29 @@ async def test_local_copy_helpers_reject_outside_and_symlink_paths(monkeypatch, 
 
 async def _resolved(value):
     return value
+
+
+def test_smb_remote_paths_use_a_share_relative_to_the_internal_remote():
+    runner = RcloneRunner("rclone", "/tmp/rclone")
+
+    command = runner.build_command(
+        "lsjson",
+        ["ctm_0123456789abcdef0123456789abcdef:Shared Data/Finance"],
+        "/tmp/job.conf",
+    )
+
+    assert command[1:3] == [
+        "lsjson",
+        "ctm_0123456789abcdef0123456789abcdef:Shared Data/Finance",
+    ]
+
+
+def test_smb_remote_path_rejects_share_relative_traversal():
+    runner = RcloneRunner("rclone", "/tmp/rclone")
+
+    with pytest.raises(ValueError, match="traversal"):
+        runner.build_command(
+            "lsjson",
+            ["ctm_0123456789abcdef0123456789abcdef:Share/../../etc"],
+            "/tmp/job.conf",
+        )

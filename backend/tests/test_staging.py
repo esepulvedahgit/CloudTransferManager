@@ -61,6 +61,24 @@ async def test_insufficient_free_space_fails_before_yielding(tmp_path: Path, mon
 
 
 @pytest.mark.asyncio
+async def test_staging_checks_file_size_plus_configured_reserve(tmp_path: Path, monkeypatch):
+    usage = SimpleNamespace(total=200, used=91, free=109)
+    monkeypatch.setattr("app.services.staging.shutil.disk_usage", lambda _path: usage)
+
+    with pytest.raises(OSError, match="espacio disponible"):
+        async with temporary_staging_area(
+            tmp_path,
+            transfer_id=uuid.uuid4(),
+            expected_size=10,
+            reserve_bytes=100,
+            margin_percent=50,
+        ):
+            pytest.fail("staging should keep the configured free-space reserve")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_staging_rejects_symlink_before_creating_directory_outside_root(tmp_path: Path):
     actual_root = tmp_path / "actual"
     actual_root.mkdir()

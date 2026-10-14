@@ -2,7 +2,13 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 
+
+@pytest.mark.skipif(
+    os.getuid() != 0,
+    reason="Copying file-backed Docker Secrets requires the root bootstrap user.",
+)
 def test_entrypoint_copies_docker_secrets_to_private_runtime_files(tmp_path):
     backend_dir = Path(__file__).resolve().parents[1]
     entrypoint = backend_dir / "docker-entrypoint.sh"
@@ -40,3 +46,21 @@ def test_entrypoint_copies_docker_secrets_to_private_runtime_files(tmp_path):
     assert staging_dir.stat().st_mode & 0o777 == 0o700
     assert staging_dir.stat().st_uid == os.getuid()
     assert staging_dir.stat().st_gid == os.getgid()
+
+
+@pytest.mark.skipif(
+    os.getuid() == 0,
+    reason="This test verifies the entrypoint's non-root rejection.",
+)
+def test_entrypoint_rejects_non_root_start():
+    entrypoint = Path(__file__).resolve().parents[1] / "docker-entrypoint.sh"
+
+    result = subprocess.run(
+        ["/bin/sh", str(entrypoint), "/bin/true"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "Container entrypoint must start as root" in result.stderr

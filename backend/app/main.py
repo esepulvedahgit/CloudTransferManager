@@ -9,13 +9,16 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlencode, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.responses import RedirectResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.sessions import SessionMiddleware
@@ -23,12 +26,14 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.providers.base import ConnectionTestResult
 from app.providers.megacmd import MegaCmdProvider
 from app.providers.mock import MockStorageProvider
+from app.providers.nextcloud import NextcloudRcloneProvider
 from app.providers.rclone import RcloneGoogleDriveProvider
 from app.providers.seafile_auth import (
     SeafileAuthClient,
     SeafileAuthenticationError,
     normalize_seafile_base_url,
 )
+from app.providers.smb import RcloneSmbProvider
 from app.security.credentials import CredentialCipher
 from app.security.passwords import PasswordService
 from app.services.audit import AuditLogger
@@ -40,10 +45,21 @@ from app.services.memory_store import (
     ConnectionRecord,
     ConnectionUnavailableError,
     MemoryStore,
+    SMTPSettingsRecord,
     TransferRecord,
     UserAccount,
 )
 from app.services.rclone import RcloneRunner
+from app.services.smtp_config import (
+    SMTPConnectionError,
+    SMTPServerConfig,
+    decrypt_smtp_credentials,
+    encrypt_smtp_credentials,
+    environment_smtp_config,
+    test_smtp_connection,
+    validate_smtp_host,
+    validate_smtp_sender,
+)
 from app.services.transfer_executor import TransferExecutor
 from app.settings import Settings, get_settings
 
@@ -91,7 +107,7 @@ class PasswordReset(BaseModel):
 
 class ConnectionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    provider_type: str = Field(pattern="^(MOCK|MEGA|GOOGLE_DRIVE|SEAFILE)$")
+    provider_type: str = Field(pattern="^(MOCK|MEGA|GOOGLE_DRIVE|SEAFILE|SMB|NEXTCLOUD)$")
     adapter_type: str = Field(default="RCLONE", pattern="^(RCLONE|SEAFILE_API)$")
     credentials: dict[str, str] | None = None
     is_global: bool = True
@@ -106,6 +122,36 @@ class ConnectionUpdate(BaseModel):
 
 class ConnectionTestRequest(BaseModel):
     otp: str | None = Field(default=None, min_length=1, max_length=32)
+
+
+class SMTPSettingsRequest(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    use_tls: bool
+    from_address: str = Field(min_length=3, max_length=255)
+    username: SecretStr | None = Field(default=None, max_length=255)
+    password: SecretStr | None = Field(default=None, max_length=1024)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        return validate_smtp_host(value)
+
+    @field_validator("from_address")
+    @classmethod
+    def validate_from_address(cls, value: str) -> str:
+        return validate_smtp_sender(value)
+
+    @model_validator(mode="after")
+    def validate_credential_pair(self) -> "SMTPSettingsRequest":
+        username = self.username.get_secret_value().strip() if self.username else ""
+        password = self.password.get_secret_value() if self.password else ""
+        if bool(username) != bool(password):
+            raise ValueError("SMTP username and password must be supplied together")
+        for value in (username, password):
+            if any(character in value for character in "\r\n\x00"):
+                raise ValueError("Invalid SMTP credential")
+        return self
 
 
 _GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -131,11 +177,71 @@ def _google_callback_url(app_base_url: str, app_env: str) -> str | None:
 class TransferCreate(BaseModel):
     source_connection_id: uuid.UUID
     destination_connection_id: uuid.UUID
-    source_paths: list[str] = Field(min_length=1, max_length=100)
+    source_paths: list[str] = Field(min_length=1)
     destination_path: str = Field(min_length=1, max_length=1024)
     operation: str = "COPY"
     conflict_policy: str = "OVERWRITE_IF_DIFFERENT"
     send_email_notification: bool = False
+    scheduled_at: datetime | None = None
+    schedule_timezone: str = "UTC"
+    execution_mode: Literal["AUTO", "EXCLUSIVE"] = "AUTO"
+    depends_on_transfer_id: uuid.UUID | None = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_scheduled_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.utcoffset() is None:
+            raise ValueError("La fecha programada debe incluir una zona horaria.")
+        normalized = value.astimezone(UTC)
+        if normalized <= datetime.now(UTC):
+            raise ValueError("La fecha programada debe ser futura.")
+        return normalized
+
+    @field_validator("schedule_timezone")
+    @classmethod
+    def validate_schedule_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("Selecciona una zona horaria válida.") from exc
+        return value
+
+    @field_validator("source_paths")
+    @classmethod
+    def validate_source_path_limit(cls, value: list[str]) -> list[str]:
+        if len(value) > 100:
+            raise ValueError("Selecciona como máximo 100 rutas por transferencia.")
+        return value
+
+
+class TransferScheduleUpdate(BaseModel):
+    scheduled_at: datetime | None
+    schedule_timezone: str
+    execution_mode: Literal["AUTO", "EXCLUSIVE"]
+    depends_on_transfer_id: uuid.UUID | None = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_scheduled_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.utcoffset() is None:
+            raise ValueError("La fecha programada debe incluir una zona horaria.")
+        normalized = value.astimezone(UTC)
+        if normalized <= datetime.now(UTC):
+            raise ValueError("La fecha programada debe ser futura.")
+        return normalized
+
+    @field_validator("schedule_timezone")
+    @classmethod
+    def validate_schedule_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("Selecciona una zona horaria válida.") from exc
+        return value
 
 
 class EventHub:
@@ -162,6 +268,21 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         raise RuntimeError("APP_SECRET_KEY must be configured in production")
     session_secret = configured_secret or secrets.token_urlsafe(48)
     app = FastAPI(title="Cloud Transfer Manager", version="0.1.0")
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> Response:
+        if request.url.path in {
+            "/api/v1/settings/smtp",
+            "/api/v1/settings/smtp/test",
+        }:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "Configuración SMTP inválida"},
+            )
+        return await request_validation_exception_handler(request, exc)
+
     app.add_middleware(
         SessionMiddleware,
         secret_key=session_secret,
@@ -278,6 +399,31 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 credentials,
                 RcloneRunner(config.rclone_binary, config.transfer_temp_path),
             )
+        if provider_type == "NEXTCLOUD":
+            return NextcloudRcloneProvider(
+                connection.id,
+                credentials,
+                RcloneRunner(
+                    config.rclone_binary,
+                    config.transfer_temp_path,
+                    config.transfer_staging_path,
+                ),
+                credential_version=connection.credential_version,
+                chunk_size=config.nextcloud_chunk_size,
+            )
+        if provider_type == "SMB":
+            allowed_targets = {
+                target.strip().casefold().rstrip(".")
+                for target in config.smb_allowed_targets.split(",")
+                if target.strip()
+            }
+            return RcloneSmbProvider(
+                connection.id,
+                credentials,
+                RcloneRunner(config.rclone_binary, config.transfer_temp_path),
+                allowed_targets=allowed_targets,
+                interactive_timeout_seconds=config.smb_interactive_timeout_seconds,
+            )
         if provider_type == "SEAFILE":
             runner = RcloneRunner(
                 config.rclone_binary,
@@ -347,7 +493,6 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 "error_count": record.error_count,
             },
             provider_error_code="TRANSFER_FAILED" if record.status == "FAILED" else None,
-            item_path=record.current_item,
         )
         if app.state.event_bus:
             await app.state.event_bus.publish_progress(str(record.id), event)
@@ -744,6 +889,152 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         )
         return {"message": "Contraseña restablecida"}
 
+    def smtp_credentials_for_record(record: SMTPSettingsRecord | None) -> tuple[str, str]:
+        if record is not None and record.encrypted_credentials:
+            try:
+                return decrypt_smtp_credentials(config, record)
+            except (OSError, ValueError):
+                raise HTTPException(
+                    status_code=503, detail="No se pudieron cargar las credenciales SMTP"
+                ) from None
+        environment = environment_smtp_config(config)
+        return environment.username, environment.password
+
+    def smtp_settings_response(record: SMTPSettingsRecord | None) -> dict[str, Any]:
+        if record is None:
+            environment = environment_smtp_config(config)
+            return {
+                "host": environment.host,
+                "port": environment.port,
+                "use_tls": environment.use_tls,
+                "from_address": environment.from_address,
+                "credentials_configured": bool(environment.username and environment.password),
+            }
+        return {
+            "host": record.host,
+            "port": record.port,
+            "use_tls": record.use_tls,
+            "from_address": record.from_address,
+            "credentials_configured": bool(record.encrypted_credentials),
+        }
+
+    def smtp_request_credentials(payload: SMTPSettingsRequest) -> tuple[str, str] | None:
+        username = payload.username.get_secret_value().strip() if payload.username else ""
+        password = payload.password.get_secret_value() if payload.password else ""
+        return (username, password) if username and password else None
+
+    def encrypt_smtp_values(settings_id: uuid.UUID, credentials: tuple[str, str]) -> bytes:
+        try:
+            return encrypt_smtp_credentials(config, settings_id, credentials[0], credentials[1])
+        except (OSError, ValueError):
+            raise HTTPException(
+                status_code=503, detail="No se pudieron guardar las credenciales SMTP"
+            ) from None
+
+    @app.get("/api/v1/settings/smtp")
+    async def get_smtp_settings(
+        _admin: UserAccount = Depends(admin_user),
+    ) -> dict[str, Any]:
+        record = await app.state.store.aget_smtp_settings()
+        return smtp_settings_response(record)
+
+    @app.put("/api/v1/settings/smtp")
+    async def update_smtp_settings(
+        payload: SMTPSettingsRequest,
+        request: Request,
+        admin: UserAccount = Depends(admin_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        previous = await app.state.store.aget_smtp_settings()
+        settings_id = previous.id if previous else uuid.uuid4()
+        credentials = smtp_request_credentials(payload)
+        if credentials is not None:
+            encrypted_credentials = encrypt_smtp_values(settings_id, credentials)
+        elif previous is not None:
+            encrypted_credentials = previous.encrypted_credentials
+        else:
+            environment = environment_smtp_config(config)
+            if environment.username and environment.password:
+                encrypted_credentials = encrypt_smtp_values(
+                    settings_id, (environment.username, environment.password)
+                )
+            else:
+                encrypted_credentials = b""
+
+        record = SMTPSettingsRecord(
+            id=settings_id,
+            host=payload.host,
+            port=payload.port,
+            use_tls=payload.use_tls,
+            from_address=payload.from_address,
+            encrypted_credentials=encrypted_credentials,
+        )
+        if previous is None:
+            canonical = await app.state.store.acreate_smtp_settings_if_absent(record)
+            if canonical.id != record.id:
+                if credentials is None:
+                    encrypted_credentials = canonical.encrypted_credentials
+                else:
+                    encrypted_credentials = encrypt_smtp_values(canonical.id, credentials)
+                record = SMTPSettingsRecord(
+                    id=canonical.id,
+                    host=payload.host,
+                    port=payload.port,
+                    use_tls=payload.use_tls,
+                    from_address=payload.from_address,
+                    encrypted_credentials=encrypted_credentials,
+                )
+                record = await app.state.store.asave_smtp_settings(record)
+            else:
+                record = canonical
+        else:
+            record = await app.state.store.asave_smtp_settings(record)
+        changed_fields = (
+            ["host", "port", "use_tls", "from_address"]
+            if previous is None
+            else [
+                name
+                for name in ("host", "port", "use_tls", "from_address")
+                if getattr(previous, name) != getattr(record, name)
+            ]
+        )
+        await audit_request(
+            request,
+            actor_user_id=admin.id,
+            action="SMTP_SETTINGS_UPDATED",
+            resource_type="settings",
+            resource_id=str(record.id),
+            result="SUCCESS",
+            metadata={"changed_fields": changed_fields},
+        )
+        return smtp_settings_response(record)
+
+    @app.post("/api/v1/settings/smtp/test")
+    async def test_smtp_settings(
+        payload: SMTPSettingsRequest,
+        _admin: UserAccount = Depends(admin_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        credentials = smtp_request_credentials(payload)
+        if credentials is None:
+            stored = await app.state.store.aget_smtp_settings()
+            credentials = smtp_credentials_for_record(stored)
+        server_config = SMTPServerConfig(
+            host=payload.host,
+            port=payload.port,
+            username=credentials[0],
+            password=credentials[1],
+            from_address=payload.from_address,
+            use_tls=payload.use_tls,
+        )
+        try:
+            await asyncio.to_thread(test_smtp_connection, server_config)
+        except SMTPConnectionError:
+            return {"success": False, "message": "No se pudo conectar con SMTP"}
+        return {"success": True, "message": "Conexión SMTP correcta"}
+
     @app.get("/api/v1/audit-events")
     async def list_audit_events(
         limit: int = Query(default=100, ge=1, le=500),
@@ -758,6 +1049,19 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             None if user.role == "ADMIN" else user.id
         )
         return {"items": [connection.public_dict() for connection in connections]}
+
+    @app.get("/api/v1/system/capabilities")
+    async def system_capabilities(_user: UserAccount = Depends(current_user)) -> dict[str, Any]:
+        return {
+            "enabled_providers": [
+                "MOCK",
+                "MEGA",
+                "GOOGLE_DRIVE",
+                "SEAFILE",
+                "SMB",
+                "NEXTCLOUD",
+            ]
+        }
 
     @app.delete("/api/v1/connections/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
     async def archive_connection(
@@ -806,16 +1110,41 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                     MegaCmdProvider.validate_credentials(validation_credentials)
                 elif payload.provider_type == "SEAFILE":
                     validation_credentials = validate_seafile_credentials(validation_credentials)
-                else:
+                elif payload.provider_type == "SMB":
+                    validation_credentials = RcloneSmbProvider.validate_credentials(
+                        validation_credentials
+                    )
+                    provider_for(
+                        ConnectionRecord(
+                            id=connection_id,
+                            name=payload.name,
+                            provider_type="SMB",
+                            created_by=user.id,
+                            encrypted_credentials=b"",
+                        ),
+                        validation_credentials,
+                    ).config_content()
+                elif payload.provider_type == "NEXTCLOUD":
+                    validation_credentials = NextcloudRcloneProvider.validate_credentials(
+                        validation_credentials
+                    )
+                    NextcloudRcloneProvider(
+                        connection_id,
+                        validation_credentials,
+                        RcloneRunner(config.rclone_binary, config.transfer_temp_path),
+                        chunk_size=config.nextcloud_chunk_size,
+                    ).config_content()
+                elif payload.provider_type == "GOOGLE_DRIVE":
                     validation_credentials.setdefault("refresh_token", "oauth-pending")
                     RcloneGoogleDriveProvider(
                         connection_id,
                         validation_credentials,
                         RcloneRunner(config.rclone_binary, config.transfer_temp_path),
                     ).config_content()
+                payload.credentials = validation_credentials
                 encrypted_credentials = CredentialCipher.from_secret_file(
                     config.master_encryption_key_file
-                ).encrypt(connection_id, payload.credentials)
+                ).encrypt(connection_id, validation_credentials)
             except (OSError, ValueError) as exc:
                 raise HTTPException(
                     status_code=422, detail="Credenciales inválidas o clave no disponible"
@@ -1020,7 +1349,22 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                     MegaCmdProvider.validate_credentials(payload.credentials)
                 elif connection.provider_type == "SEAFILE":
                     payload.credentials = validate_seafile_credentials(payload.credentials)
-                else:
+                elif connection.provider_type == "SMB":
+                    payload.credentials = RcloneSmbProvider.validate_credentials(
+                        payload.credentials
+                    )
+                    provider_for(connection, payload.credentials).config_content()
+                elif connection.provider_type == "NEXTCLOUD":
+                    payload.credentials = NextcloudRcloneProvider.validate_credentials(
+                        payload.credentials
+                    )
+                    NextcloudRcloneProvider(
+                        connection.id,
+                        payload.credentials,
+                        RcloneRunner(config.rclone_binary, config.transfer_temp_path),
+                        chunk_size=config.nextcloud_chunk_size,
+                    ).config_content()
+                elif connection.provider_type == "GOOGLE_DRIVE":
                     RcloneGoogleDriveProvider(
                         connection.id,
                         payload.credentials,
@@ -1260,12 +1604,13 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             safe_destination = MockStorageProvider.normalize_path(payload.destination_path)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Ruta no válida") from exc
-        for path in safe_paths:
-            if await provider_for(source).get_item(path) is None:
-                raise HTTPException(
-                    status_code=400, detail=f"No existe el elemento de origen: {path}"
-                )
         try:
+            if payload.depends_on_transfer_id is not None:
+                parent = await app.state.store.aget_transfer(payload.depends_on_transfer_id)
+                if parent is None or (
+                    parent.requested_by != user.id and user.role != "ADMIN"
+                ):
+                    raise HTTPException(status_code=404, detail="Transferencia padre no encontrada")
             record = await app.state.store.acreate_transfer(
                 user.id,
                 source.id,
@@ -1274,6 +1619,10 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 safe_destination,
                 payload.conflict_policy,
                 payload.send_email_notification,
+                payload.scheduled_at,
+                payload.schedule_timezone,
+                payload.execution_mode,
+                payload.depends_on_transfer_id,
             )
         except ConnectionUnavailableError as exc:
             if exc.reason == "inactive":
@@ -1287,22 +1636,28 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             resource_type="transfer",
             resource_id=str(record.id),
             result="SUCCESS",
-            metadata={"public_id": record.public_id, "operation": "COPY"},
+            metadata={
+                "public_id": record.public_id,
+                "operation": "COPY",
+                "execution_mode": record.execution_mode,
+                "scheduled_at": record.scheduled_at.isoformat() if record.scheduled_at else None,
+                "depends_on_transfer_id": (
+                    str(record.depends_on_transfer_id)
+                    if record.depends_on_transfer_id
+                    else None
+                ),
+            },
         )
         if config.app_env.lower() == "production":
             try:
-                from app.worker import run_transfer
+                from app.worker import dispatch_pending_transfers
 
-                run_transfer.delay(str(record.id))
-            except Exception as exc:
-                record.status = "FAILED"
-                record.error_count += 1
-                record.completed_at = datetime.now(UTC)
-                await publish_transfer(record)
-                raise HTTPException(
-                    status_code=503, detail="No se pudo agendar la transferencia"
-                ) from exc
-        else:
+                dispatch_pending_transfers.delay()
+            except Exception:
+                # The transfer is persisted first; Celery Beat retries dispatch
+                # after a broker outage without losing the scheduled request.
+                pass
+        elif payload.scheduled_at is None:
 
             async def should_cancel_transfer() -> bool:
                 return await cancel_requested(record.id)
@@ -1324,16 +1679,114 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=404, detail="Transferencia no encontrada")
         return cast(TransferRecord, record)
 
+    @app.get("/api/v1/transfers/capabilities")
+    async def transfer_capabilities(
+        _user: UserAccount = Depends(current_user),
+    ) -> dict[str, Any]:
+        return {
+            "scheduled_transfers": True,
+            "recurrence": False,
+            "execution_modes": ["AUTO", "EXCLUSIVE"],
+            "max_parallel_transfers": config.transfer_max_concurrent,
+            "schedule_timezone_format": "IANA",
+        }
+
+    @app.patch("/api/v1/transfers/{transfer_id}")
+    async def update_transfer_schedule(
+        transfer_id: uuid.UUID,
+        payload: TransferScheduleUpdate,
+        request: Request,
+        user: UserAccount = Depends(current_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        record = await visible_transfer(transfer_id, user)
+        if record.status not in {"SCHEDULED", "QUEUED"} or record.dispatch_token is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Solo se puede reprogramar una transferencia pendiente de ejecución.",
+            )
+        if payload.depends_on_transfer_id is not None:
+            parent = await app.state.store.aget_transfer(payload.depends_on_transfer_id)
+            if parent is None or (
+                parent.requested_by != user.id and user.role != "ADMIN"
+            ):
+                raise HTTPException(status_code=404, detail="Transferencia padre no encontrada")
+        try:
+            updated = await app.state.store.aupdate_transfer_schedule(
+                transfer_id,
+                scheduled_at=payload.scheduled_at,
+                schedule_timezone=payload.schedule_timezone,
+                execution_mode=payload.execution_mode,
+                depends_on_transfer_id=payload.depends_on_transfer_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if updated is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "La transferencia ya está admitida para ejecución "
+                    "y no se puede reprogramar."
+                ),
+            )
+        await publish_transfer(updated)
+        await audit_request(
+            request,
+            actor_user_id=user.id,
+            action="TRANSFER_RESCHEDULED",
+            resource_type="transfer",
+            resource_id=str(transfer_id),
+            result="SUCCESS",
+            metadata={
+                "scheduled_at": updated.scheduled_at.isoformat() if updated.scheduled_at else None,
+                "execution_mode": updated.execution_mode,
+                "depends_on_transfer_id": (
+                    str(updated.depends_on_transfer_id)
+                    if updated.depends_on_transfer_id
+                    else None
+                ),
+            },
+        )
+        if config.app_env.lower() == "production":
+            try:
+                from app.worker import dispatch_pending_transfers
+
+                dispatch_pending_transfers.delay()
+            except Exception:
+                pass
+        return cast(dict[str, Any], updated.public_dict())
+
     @app.get("/api/v1/transfers")
     async def list_transfers(
         offset: int = Query(default=0, ge=0),
         page_size: int = Query(default=50, ge=1, le=200),
+        pending_only: bool = Query(default=False),
+        background_only: bool = Query(default=False),
+        exclude_background: bool = Query(default=False),
         user: UserAccount = Depends(current_user),
     ) -> dict[str, Any]:
         user_filter = None if user.role == "ADMIN" else user.id
-        records = await app.state.store.alist_transfers(user_filter)
+        records = await app.state.store.alist_transfers(
+            user_filter,
+            pending_only,
+            background_only,
+            exclude_background,
+        )
+        page_records = records[offset : offset + page_size]
+        summaries = await app.state.store.alist_transfer_manifest_summaries(
+            [record.id for record in page_records]
+        )
+        items = []
+        for record in page_records:
+            item = record.public_dict()
+            item["manifest_summary"] = summaries.get(
+                record.id,
+                {"copied": 0, "failed": 0, "skipped": 0, "pending": 0},
+            )
+            items.append(item)
         return {
-            "items": [record.public_dict() for record in records[offset : offset + page_size]],
+            "items": items,
             "total_count": len(records),
         }
 
@@ -1351,6 +1804,111 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         record = await visible_transfer(transfer_id, user)
         return {"items": await app.state.store.alist_transfer_events(record.id)}
 
+    @app.get("/api/v1/transfers/{transfer_id}/items")
+    async def list_transfer_items(
+        transfer_id: uuid.UUID,
+        after_id: uuid.UUID | None = None,
+        limit: int = Query(default=200, ge=1, le=200),
+        user: UserAccount = Depends(current_user),
+    ) -> dict[str, Any]:
+        record = await visible_transfer(transfer_id, user)
+        items = await app.state.store.alist_transfer_manifest_items(
+            record.id,
+            statuses={"DIRECTORY", "PENDING", "COPIED", "SKIPPED", "FAILED"},
+            after_id=after_id,
+            limit=limit,
+            include_directories=True,
+        )
+        return {
+            "items": [item.public_dict() for item in items],
+            "next_cursor": str(items[-1].id) if len(items) == limit else None,
+            "counts": await app.state.store.aget_transfer_manifest_counts(record.id),
+        }
+
+    @app.post("/api/v1/transfers/{transfer_id}/resume", status_code=status.HTTP_202_ACCEPTED)
+    async def resume_transfer(
+        transfer_id: uuid.UUID,
+        request: Request,
+        user: UserAccount = Depends(current_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        record = await visible_transfer(transfer_id, user)
+        if record.status not in {"FAILED", "CANCELLED"}:
+            raise HTTPException(status_code=409, detail="La transferencia no se puede reanudar")
+        if record.source_credential_version < 1 or record.destination_credential_version < 1:
+            raise HTTPException(
+                status_code=409, detail="La transferencia no tiene una versión de origen válida"
+            )
+        source = await app.state.store.aget_connection(record.source_connection_id)
+        destination = await app.state.store.aget_connection(record.destination_connection_id)
+        if source is None or destination is None:
+            raise HTTPException(
+                status_code=409, detail="No se puede reanudar: una conexión ya no existe"
+            )
+        if source.provider_type != "SMB":
+            raise HTTPException(
+                status_code=409, detail="Solo se pueden reanudar transferencias SMB"
+            )
+        if (
+            source.credential_version != record.source_credential_version
+            or destination.credential_version != record.destination_credential_version
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Las credenciales o la raíz SMB cambiaron; cree una nueva transferencia.",
+            )
+        if source.status != "ACTIVE" or destination.status != "ACTIVE":
+            raise HTTPException(status_code=409, detail="Una conexión está inactiva")
+        if user.role != "ADMIN":
+            for connection_id in (source.id, destination.id):
+                if not await app.state.store.ahas_connection_access(user.id, connection_id):
+                    raise HTTPException(status_code=404, detail="Transferencia no encontrada")
+        counts = await app.state.store.aget_transfer_manifest_counts(record.id)
+        if counts["pending"] == 0 and counts["failed"] == 0:
+            raise HTTPException(status_code=409, detail="No hay elementos pendientes para reanudar")
+
+        resumed = await app.state.store.aresume_transfer(transfer_id)
+        if resumed is None:
+            raise HTTPException(status_code=409, detail="La transferencia ya no se puede reanudar")
+        record = cast(TransferRecord, resumed)
+        if app.state.event_bus:
+            await app.state.event_bus.clear_cancel(str(transfer_id))
+        app.state.cancel_requests.discard(transfer_id)
+        await publish_transfer(record)
+        await audit_request(
+            request,
+            actor_user_id=user.id,
+            action="TRANSFER_RESUMED",
+            resource_type="transfer",
+            resource_id=str(record.id),
+            result="SUCCESS",
+            metadata={"public_id": record.public_id, "attempt_count": record.attempt_count},
+        )
+        if config.app_env.lower() == "production":
+            try:
+                from app.worker import dispatch_pending_transfers
+
+                dispatch_pending_transfers.delay()
+            except Exception:
+                # The resumed job remains queued in PostgreSQL for the next Beat tick.
+                pass
+        else:
+
+            async def should_cancel_resumed_transfer() -> bool:
+                return await cancel_requested(record.id)
+
+            executor = TransferExecutor(
+                config,
+                app.state.store,
+                publish_transfer,
+                should_cancel_resumed_transfer,
+            )
+            task = asyncio.create_task(executor.execute(record.id))
+            app.state.tasks.add(task)
+            task.add_done_callback(app.state.tasks.discard)
+        return record.public_dict()
+
     @app.get("/api/v1/transfers/{transfer_id}/stream")
     async def stream_transfer(
         transfer_id: uuid.UUID, user: UserAccount = Depends(current_user)
@@ -1365,9 +1923,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 await pubsub.subscribe(channel)
                 deadline = asyncio.get_running_loop().time() + 5
                 while asyncio.get_running_loop().time() < deadline:
-                    message = await pubsub.get_message(
-                        ignore_subscribe_messages=False, timeout=1
-                    )
+                    message = await pubsub.get_message(ignore_subscribe_messages=False, timeout=1)
                     if (
                         message is not None
                         and message.get("type") == "subscribe"
@@ -1450,11 +2006,16 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         record = await visible_transfer(transfer_id, user)
         if record.status in {"COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "CANCELLED"}:
             raise HTTPException(status_code=409, detail="La transferencia ya terminó")
-        if app.state.event_bus:
-            await app.state.event_bus.request_cancel(str(transfer_id))
-        else:
-            app.state.cancel_requests.add(transfer_id)
-        record.status = "CANCELLING"
+        record, needs_worker_signal = await app.state.store.acancel_transfer(
+            transfer_id, datetime.now(UTC)
+        )
+        if record is None:
+            raise HTTPException(status_code=409, detail="La transferencia ya terminó")
+        if needs_worker_signal:
+            if app.state.event_bus:
+                await app.state.event_bus.request_cancel(str(transfer_id))
+            else:
+                app.state.cancel_requests.add(transfer_id)
         await publish_transfer(record)
         await audit_request(
             request,
@@ -1464,7 +2025,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             resource_id=str(transfer_id),
             result="SUCCESS",
         )
-        return record.public_dict()
+        return cast(dict[str, Any], record.public_dict())
 
     return app
 

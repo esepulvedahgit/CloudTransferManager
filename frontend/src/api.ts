@@ -33,12 +33,30 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
     ? await response.json()
     : await response.text();
   if (!response.ok) {
-    const message =
-      typeof payload === 'object' && payload !== null && 'detail' in payload
-        ? String(payload.detail)
-        : typeof payload === 'string' && payload
-          ? payload
-          : 'No fue posible completar la solicitud.';
+    const isHtmlError = contentType.includes('text/html');
+    let detail: unknown;
+    if (typeof payload === 'object' && payload !== null && 'detail' in payload) {
+      detail = payload.detail;
+    }
+    const validationMessage = Array.isArray(detail)
+      ? detail.find((entry) => (
+        typeof entry === 'object'
+        && entry !== null
+        && 'msg' in entry
+        && typeof entry.msg === 'string'
+      ))?.msg
+      : undefined;
+    const message = typeof detail === 'string'
+      ? detail
+      : typeof validationMessage === 'string'
+        ? validationMessage.replace(/^Value error,\s*/i, '')
+        : isHtmlError && response.status === 504
+          ? 'La solicitud tardó más de lo esperado. Revisa el historial antes de volver a intentarlo.'
+          : isHtmlError
+            ? 'No fue posible completar la solicitud. Inténtalo nuevamente más tarde.'
+            : typeof payload === 'string' && payload
+              ? payload
+              : 'No fue posible completar la solicitud.';
     throw new ApiError(message, response.status);
   }
   return payload as T;

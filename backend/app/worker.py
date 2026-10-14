@@ -13,10 +13,12 @@ from app.services.notifications import (
     enqueue_transfer_notification,
     send_transfer_email,
 )
+from app.services.smtp_config import load_smtp_server_config
 from app.services.transfer_executor import TransferExecutor
 from app.settings import get_settings
 
 settings = get_settings()
+TRANSFER_VISIBILITY_TIMEOUT_SECONDS = 24 * 60 * 60
 celery_app = Celery("cloud_transfer_manager", broker=settings.redis_url)
 celery_app.conf.update(
     accept_content=["json"],
@@ -26,11 +28,20 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     broker_connection_retry_on_startup=True,
+    broker_transport_options={"visibility_timeout": TRANSFER_VISIBILITY_TIMEOUT_SECONDS},
     task_ignore_result=True,
     task_default_queue="transfers",
     task_routes={
         "app.worker.run_transfer": {"queue": "transfers"},
         "app.worker.send_transfer_notification": {"queue": "transfers"},
+        "app.worker.dispatch_pending_transfers": {"queue": "control"},
+    },
+    beat_schedule={
+        "dispatch-pending-transfers": {
+            "task": "app.worker.dispatch_pending_transfers",
+            "schedule": 15.0,
+            "options": {"queue": "control"},
+        }
     },
 )
 
@@ -47,7 +58,7 @@ def _event_payload(record: Any) -> dict[str, Any]:
     return data
 
 
-async def _execute_transfer(transfer_id: uuid.UUID) -> None:
+async def _execute_transfer(transfer_id: uuid.UUID, dispatch_token: uuid.UUID) -> None:
     current_settings = get_settings()
     store = DatabaseStore(current_settings)
     redis_client = Redis.from_url(current_settings.redis_url, decode_responses=True)
@@ -72,26 +83,114 @@ async def _execute_transfer(transfer_id: uuid.UUID) -> None:
                 "error_count": record.error_count,
             },
             provider_error_code="TRANSFER_FAILED" if record.status == "FAILED" else None,
-            item_path=record.current_item,
         )
         await event_bus.publish_progress(str(record.id), _event_payload(record))
 
     async def should_cancel() -> bool:
         return await event_bus.cancellation_requested(str(transfer_id))
 
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(10)
+            if not await store.aheartbeat_transfer_dispatch(
+                transfer_id, dispatch_token, datetime.now(UTC)
+            ):
+                return
+
     try:
-        await TransferExecutor(current_settings, store, publish, should_cancel).execute(transfer_id)
-        await enqueue_transfer_notification(store, transfer_id, send_transfer_notification)
+        async with store.transfer_execution_lock(transfer_id) as acquired:
+            if not acquired:
+                # A resumed attempt can be reserved while the previous worker is
+                # still leaving its lock. Release only this unstarted token; the
+                # store ignores tokens whose execution has already begun.
+                await store.arelease_transfer_dispatch(transfer_id, dispatch_token)
+                return
+            if not await store.astart_transfer_dispatch(
+                transfer_id, dispatch_token, datetime.now(UTC)
+            ):
+                return
+            heartbeat_task = asyncio.create_task(heartbeat())
+            try:
+                await TransferExecutor(
+                    current_settings, store, publish, should_cancel
+                ).execute(transfer_id)
+                await enqueue_transfer_notification(
+                    store, transfer_id, send_transfer_notification
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await store.afail_transfer_dispatch(
+                    transfer_id,
+                    dispatch_token,
+                    event_type="WORKER_EXECUTION_ERROR",
+                    message=(
+                        "La ejecución falló de forma inesperada. Revisa el destino "
+                        "antes de reintentar."
+                    ),
+                )
+            finally:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+                await event_bus.clear_cancel(str(transfer_id))
+                await store.afinish_transfer_dispatch(transfer_id, dispatch_token)
     finally:
-        await event_bus.clear_cancel(str(transfer_id))
         await event_bus.aclose()
         await store.aclose()
 
 
 @celery_app.task(name="app.worker.run_transfer", bind=True)  # type: ignore[untyped-decorator]
-def run_transfer(self: Any, transfer_id: str) -> None:
+def run_transfer(self: Any, transfer_id: str, dispatch_token: str) -> None:
     del self
-    asyncio.run(_execute_transfer(uuid.UUID(transfer_id)))
+    asyncio.run(_execute_transfer(uuid.UUID(transfer_id), uuid.UUID(dispatch_token)))
+
+
+async def _dispatch_pending_transfers() -> int:
+    current_settings = get_settings()
+    store = DatabaseStore(current_settings)
+    redis_client = Redis.from_url(current_settings.redis_url, decode_responses=True)
+    event_bus = RedisEventBus(redis_client)
+    try:
+        batch = await store.adispatch_due_transfers(
+            datetime.now(UTC),
+            max_concurrent=current_settings.transfer_max_concurrent,
+            max_nextcloud_concurrent=current_settings.nextcloud_max_concurrent,
+        )
+        admitted_ids = {transfer.id for transfer in batch.admitted}
+        for transfer in batch.changed:
+            if transfer.id not in admitted_ids:
+                await store.aadd_transfer_event(
+                    transfer.id,
+                    level="INFO",
+                    event_type="SCHEDULER_UPDATE",
+                    message=(
+                        f"Transferencia pendiente: {transfer.wait_reason}"
+                        if transfer.wait_reason
+                        else f"Estado de transferencia: {transfer.status}"
+                    ),
+                    technical_details={"wait_reason": transfer.wait_reason},
+                )
+            await event_bus.publish_progress(str(transfer.id), _event_payload(transfer))
+
+        for transfer in batch.admitted:
+            token = transfer.dispatch_token
+            if token is None:
+                continue
+            try:
+                run_transfer.apply_async(
+                    args=[str(transfer.id), str(token)], queue="transfers"
+                )
+            except Exception:
+                await store.arelease_transfer_dispatch(transfer.id, token)
+        return len(batch.admitted)
+    finally:
+        await event_bus.aclose()
+        await store.aclose()
+
+
+@celery_app.task(name="app.worker.dispatch_pending_transfers")  # type: ignore[untyped-decorator]
+def dispatch_pending_transfers() -> int:
+    return asyncio.run(_dispatch_pending_transfers())
 
 
 async def _send_notification(transfer_id: uuid.UUID) -> None:
@@ -106,8 +205,10 @@ async def _send_notification(transfer_id: uuid.UUID) -> None:
         destination = await store.aget_connection(transfer.destination_connection_id)
         if user is None or source is None or destination is None:
             return
+        smtp = await load_smtp_server_config(store, current_settings)
         send_transfer_email(
             current_settings,
+            smtp,
             user.email,
             transfer,
             source.name,

@@ -23,11 +23,23 @@ def _config_value(value: str, field_name: str) -> str:
 class RcloneStorageProvider(StorageProvider):
     provider_type: str
 
-    def __init__(self, connection_id: uuid.UUID, credentials: dict[str, Any], runner: RcloneRunner):
+    def __init__(
+        self,
+        connection_id: uuid.UUID,
+        credentials: dict[str, Any],
+        runner: RcloneRunner,
+        *,
+        operation_timeout_seconds: float | None = None,
+        listing_cache: Any | None = None,
+        cache_version: int = 1,
+    ):
         self.connection_id = connection_id
         self.credentials = credentials
         self.runner = runner
         self.remote_name = f"ctm_{connection_id.hex}"
+        self.operation_timeout_seconds = operation_timeout_seconds
+        self.listing_cache = listing_cache
+        self.cache_version = cache_version
 
     def config_content(self) -> str:
         raise NotImplementedError
@@ -38,7 +50,7 @@ class RcloneStorageProvider(StorageProvider):
 
     async def test_connection(self) -> ConnectionTestResult:
         try:
-            await self.list_items("/", page_size=1)
+            await self.list_items("/", page_size=1, force_refresh=True)
             return ConnectionTestResult(success=True, message="Conexión verificada exitosamente")
         except Exception:
             return ConnectionTestResult(
@@ -55,6 +67,7 @@ class RcloneStorageProvider(StorageProvider):
         sort_by: str = "name",
         direction: str = "asc",
         search: str | None = None,
+        force_refresh: bool = False,
     ) -> PaginatedItems:
         if not 1 <= page_size <= 200:
             raise ValueError("page_size must be between 1 and 200")
@@ -65,9 +78,25 @@ class RcloneStorageProvider(StorageProvider):
         if direction not in {"asc", "desc"}:
             raise ValueError("Unsupported sort direction")
         safe_path = MockStorageProvider.normalize_path(path)
-        stdout, _stderr = await self.runner.run(
-            "lsjson", [self.remote_path(safe_path)], self.config_content(), uuid.uuid4()
+        cache_key = (self.connection_id, self.cache_version, safe_path)
+        stdout = (
+            self.listing_cache.get(cache_key)
+            if self.listing_cache is not None and not force_refresh
+            else None
         )
+        if stdout is None:
+            options: dict[str, Any] = {}
+            if self.operation_timeout_seconds is not None:
+                options["timeout_seconds"] = self.operation_timeout_seconds
+            stdout, _stderr = await self.runner.run(
+                "lsjson",
+                [self.remote_path(safe_path)],
+                self.config_content(),
+                uuid.uuid4(),
+                **options,
+            )
+            if self.listing_cache is not None:
+                self.listing_cache.put(cache_key, stdout)
         entries = json.loads(stdout)
         if not isinstance(entries, list):
             raise ValueError("Rclone returned an invalid item list")
@@ -89,7 +118,8 @@ class RcloneStorageProvider(StorageProvider):
                     name=name,
                     path=item_path,
                     is_dir=bool(entry.get("IsDir", False)),
-                    size_bytes=entry.get("Size") if isinstance(entry.get("Size"), int) else None,
+                    size_bytes=entry.get("Size")
+                    if isinstance(entry.get("Size"), int) and entry["Size"] >= 0 else None,
                     modified_at=modified_at,
                     mime_type=entry.get("MimeType")
                     if isinstance(entry.get("MimeType"), str)
@@ -132,13 +162,23 @@ class RcloneStorageProvider(StorageProvider):
         if normalized == "/":
             return StorageItem(name="/", path="/", is_dir=True, provider_type=self.provider_type)
         parent = normalized.rsplit("/", 1)[0] or "/"
-        page = await self.list_items(parent, page_size=200)
-        return next((item for item in page.items if item.path == normalized), None)
+        cursor: str | None = None
+        while True:
+            page = await self.list_items(parent, cursor=cursor, page_size=200)
+            match = next((item for item in page.items if item.path == normalized), None)
+            if match is not None:
+                return match
+            if page.next_cursor is None:
+                return None
+            cursor = page.next_cursor
 
     async def get_quota(self) -> StorageQuota | None:
         try:
+            options: dict[str, Any] = {}
+            if self.operation_timeout_seconds is not None:
+                options["timeout_seconds"] = self.operation_timeout_seconds
             stdout, _stderr = await self.runner.run(
-                "about", [self.remote_path("/")], self.config_content(), uuid.uuid4()
+                "about", [self.remote_path("/")], self.config_content(), uuid.uuid4(), **options
             )
         except Exception:
             return None

@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1200 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="transfer-sequence-title transfer-sequence-desc" id="transfer-sequence-root">
+        <title id="transfer-sequence-title">Secuencia de una transferencia COPY</title>
+        <desc id="transfer-sequence-desc">El navegador solicita una transferencia COPY. FastAPI guarda la solicitud en PostgreSQL y activa el despacho mediante Redis y Celery. El navegador abre el flujo SSE; el worker copia al proveedor y publica el progreso en Redis, que la API reenvía al navegador.</desc>
+        <defs>
+      <style>#transfer-sequence-root { color: #18283f; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      #transfer-sequence-root .diagram-container { width: 100%; overflow-x: auto; }
+      #transfer-sequence-root .diagram-container { overflow-x: visible; }</style>
+          <marker id="transfer-sequence-sequence-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#42546c"/>
+          </marker>
+          <marker id="transfer-sequence-sequence-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#0b746d"/>
+          </marker>
+          <marker id="transfer-sequence-sequence-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#2864dc"/>
+          </marker>
+          <marker id="transfer-sequence-sequence-arrow-open" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polyline points="0 0, 8 3, 0 6" fill="none" stroke="#42546c" stroke-width="1.2"/>
+          </marker>
+        </defs>
+
+        <rect width="1200" height="760" fill="#f4f7fb"/>
+
+        <text x="48" y="34" fill="#2864dc" font-size="8" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.14em">CLOUD TRANSFER MANAGER / SECUENCIA</text>
+        <text x="48" y="70" fill="#18283f" font-size="28" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">De la solicitud al progreso en vivo</text>
+        <text x="48" y="96" fill="#42546c" font-size="11" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">COPY · PostgreSQL · Celery/Redis · Rclone o MEGAcmd · Server-Sent Events</text>
+
+        <!-- Lifelines -->
+        <line x1="128" y1="168" x2="128" y2="680" stroke="#18283f" stroke-width="1" stroke-dasharray="3,3" stroke-opacity="0.20"/>
+        <line x1="360" y1="168" x2="360" y2="680" stroke="#18283f" stroke-width="1" stroke-dasharray="3,3" stroke-opacity="0.20"/>
+        <line x1="592" y1="168" x2="592" y2="680" stroke="#18283f" stroke-width="1" stroke-dasharray="3,3" stroke-opacity="0.20"/>
+        <line x1="824" y1="168" x2="824" y2="680" stroke="#18283f" stroke-width="1" stroke-dasharray="3,3" stroke-opacity="0.20"/>
+        <line x1="1056" y1="168" x2="1056" y2="680" stroke="#18283f" stroke-width="1" stroke-dasharray="3,3" stroke-opacity="0.20"/>
+
+        <!-- Activation bars -->
+        <rect x="356" y="220" width="8" height="120" fill="#18283f" stroke="#42546c" stroke-width="0.8" fill-opacity="0.06"/>
+        <rect x="356" y="380" width="8" height="280" fill="#18283f" stroke="#42546c" stroke-width="0.8" fill-opacity="0.06"/>
+        <rect x="588" y="260" width="8" height="20" fill="#18283f" stroke="#42546c" stroke-width="0.8" fill-opacity="0.06"/>
+        <rect x="588" y="540" width="8" height="20" fill="#18283f" stroke="#42546c" stroke-width="0.8" fill-opacity="0.06"/>
+        <rect x="820" y="300" width="8" height="16" fill="#18283f" stroke="#42546c" stroke-width="0.8" fill-opacity="0.06"/>
+        <rect x="820" y="420" width="8" height="16" fill="#18283f" stroke="#42546c" stroke-width="0.8" fill-opacity="0.06"/>
+        <rect x="820" y="580" width="8" height="40" fill="#18283f" stroke="#42546c" stroke-width="0.8" fill-opacity="0.06"/>
+        <rect x="1052" y="460" width="8" height="120" fill="#18283f" stroke="#42546c" stroke-width="0.8" fill-opacity="0.06"/>
+
+        <!-- Messages: time flows from top to bottom. -->
+        <line x1="128" y1="220" x2="356" y2="220" fill="none" stroke="#0b746d" stroke-width="1.2" marker-end="url(#transfer-sequence-sequence-arrow-link)"/>
+        <line x1="364" y1="260" x2="588" y2="260" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#transfer-sequence-sequence-arrow)"/>
+        <line x1="364" y1="300" x2="820" y2="300" fill="none" stroke="#42546c" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#transfer-sequence-sequence-arrow-open)"/>
+        <line x1="356" y1="340" x2="128" y2="340" fill="none" stroke="#2864dc" stroke-width="1.4" stroke-dasharray="5,4" marker-end="url(#transfer-sequence-sequence-arrow-accent)"/>
+        <line x1="128" y1="380" x2="356" y2="380" fill="none" stroke="#0b746d" stroke-width="1.2" marker-end="url(#transfer-sequence-sequence-arrow-link)"/>
+        <line x1="364" y1="420" x2="820" y2="420" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#transfer-sequence-sequence-arrow)"/>
+        <line x1="824" y1="460" x2="1052" y2="460" fill="none" stroke="#42546c" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#transfer-sequence-sequence-arrow-open)"/>
+        <path d="M 1056,500 H 1096 V 524 H 1056" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#transfer-sequence-sequence-arrow)"/>
+        <line x1="1052" y1="540" x2="596" y2="540" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#transfer-sequence-sequence-arrow)"/>
+        <line x1="1052" y1="580" x2="828" y2="580" fill="none" stroke="#42546c" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#transfer-sequence-sequence-arrow-open)"/>
+        <line x1="820" y1="620" x2="364" y2="620" fill="none" stroke="#42546c" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#transfer-sequence-sequence-arrow-open)"/>
+        <line x1="356" y1="660" x2="128" y2="660" fill="none" stroke="#42546c" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#transfer-sequence-sequence-arrow-open)"/>
+
+        <!-- Opaque masks keep labels clear of arrows and unrelated lifelines. -->
+        <rect x="164" y="204" width="156" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="242" y="216" fill="#0b746d" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">POST /TRANSFERS · COPY</text>
+        <rect x="400" y="244" width="152" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="476" y="256" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">CREAR SOLICITUD</text>
+        <rect x="392" y="284" width="176" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="480" y="296" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">ENCOLAR DISPATCH</text>
+        <rect x="172" y="324" width="144" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="244" y="336" fill="#2864dc" font-size="8" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">201 CREATED · ID</text>
+        <rect x="164" y="364" width="156" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="242" y="376" fill="#0b746d" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">GET /{ID}/STREAM · SSE</text>
+        <rect x="648" y="404" width="144" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="720" y="416" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">SUBSCRIBE PROGRESS</text>
+        <rect x="852" y="444" width="176" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="940" y="456" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">CONTROL → TRANSFERS</text>
+        <rect x="1100" y="504" width="88" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="1144" y="516" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">COPY · DESTINO</text>
+        <rect x="632" y="524" width="156" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="710" y="536" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">GUARDAR RESULTADO</text>
+        <rect x="852" y="564" width="176" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="940" y="576" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">PUBLICAR AVANCE</text>
+        <rect x="392" y="604" width="176" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="480" y="616" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">EVENTO REDIS PUB/SUB</text>
+        <rect x="164" y="644" width="156" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="242" y="656" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.04em">SSE · AVANCE / ESTADO</text>
+
+        <!-- Participants -->
+        <g aria-label="Navegador cliente">
+          <rect x="48" y="112" width="160" height="56" rx="6" fill="#e8edf4" stroke="#52637a" stroke-width="1"/>
+          <rect x="56" y="120" width="48" height="14" rx="2" fill="#f4f7fb"/>
+          <text x="80" y="130" fill="#52637a" font-size="7" font-weight="500" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.1em">CLIENTE</text>
+          <text x="128" y="148" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">Navegador</text>
+          <text x="128" y="162" fill="#42546c" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">UI · EventSource</text>
+        </g>
+        <g aria-label="API FastAPI">
+          <rect x="280" y="112" width="160" height="56" rx="6" fill="#edf3ff" stroke="#2864dc" stroke-width="1.2"/>
+          <rect x="288" y="120" width="36" height="14" rx="2" fill="#f4f7fb"/>
+          <text x="306" y="130" fill="#2864dc" font-size="7" font-weight="500" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.1em">CORE</text>
+          <text x="360" y="148" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">API FastAPI</text>
+          <text x="360" y="162" fill="#42546c" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">REST · SSE</text>
+        </g>
+        <g aria-label="PostgreSQL estado e historial">
+          <rect x="512" y="112" width="160" height="56" rx="6" fill="#ffffff" stroke="#d5e0ef" stroke-width="1"/>
+          <rect x="520" y="120" width="36" height="14" rx="2" fill="#f4f7fb"/>
+          <text x="538" y="130" fill="#52637a" font-size="7" font-weight="500" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.1em">DATA</text>
+          <text x="592" y="148" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">PostgreSQL</text>
+          <text x="592" y="162" fill="#42546c" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">estado · historial</text>
+        </g>
+        <g aria-label="Redis y colas Celery">
+          <rect x="744" y="112" width="160" height="56" rx="6" fill="#ffffff" stroke="#d5e0ef" stroke-width="1"/>
+          <rect x="752" y="120" width="40" height="14" rx="2" fill="#f4f7fb"/>
+          <text x="772" y="130" fill="#52637a" font-size="7" font-weight="500" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.1em">QUEUE</text>
+          <text x="824" y="148" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">Redis / Celery</text>
+          <text x="824" y="162" fill="#42546c" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">colas · Pub/Sub</text>
+        </g>
+        <g aria-label="Workers Celery con Rclone y MEGAcmd">
+          <rect x="976" y="112" width="160" height="56" rx="6" fill="#ffffff" stroke="#d5e0ef" stroke-width="1"/>
+          <rect x="984" y="120" width="36" height="14" rx="2" fill="#f4f7fb"/>
+          <text x="1002" y="130" fill="#52637a" font-size="7" font-weight="500" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.1em">EXEC</text>
+          <text x="1056" y="148" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">Workers</text>
+          <text x="1056" y="162" fill="#42546c" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">control · transfers</text>
+        </g>
+
+        <line x1="48" y1="700" x2="1152" y2="700" stroke="#e3eaf3" stroke-width="1"/>
+        <text x="48" y="724" fill="#52637a" font-size="9" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">El control-worker reserva en PostgreSQL antes de enviar la tarea a la cola transfers; aquí se resume ese despacho.</text>
+        <text x="48" y="744" fill="#52637a" font-size="9" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">El worker publica varios eventos durante la copia; el canal SSE entrega el avance y el estado final.</text>
+      </svg>
