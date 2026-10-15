@@ -53,6 +53,9 @@ Definir la topología de contenedores, la gestión de volúmenes persistentes, l
 - El frontend usa `nginxinc/nginx-unprivileged`, escucha en `8080` y ejecuta Nginx como UID `101`; el reverse proxy y el healthcheck apuntan a ese puerto.
 - La imagen del backend define un healthcheck HTTP predeterminado; Compose lo reemplaza para `backend` y lo desactiva en `worker`, que no expone HTTP.
 - Los trabajos programados requieren los servicios `beat` y `control-worker`; ambos son internos y no publican puertos.
+- El servicio opcional `backup` usa el perfil Compose `backup`; conecta a PostgreSQL por `ctm_internal` y a MEGA S4 por `provider_egress`, sin puertos publicados. Hace snapshots lógicos cifrados con AES-GCM cada 10 minutos. El volumen `backup_state` guarda solo el estado del último ciclo. Dumps, secretos temporales y paquetes residen en `/run/ctm-backup-work`, un `tmpfs` privado cuyo tamaño (`BACKUP_TMPFS_SIZE`) y límite de memoria (`BACKUP_MEMORY_LIMIT`) se dimensionan para el tamaño de PostgreSQL. La clave de cifrado del respaldo se mantiene aparte de `master_key` y requiere una copia fuera del host.
+- El servicio de backup no se inicia en `docker compose up` normal. Habilítalo solo tras provisionar bucket, endpoint, región y archivos locales de credenciales. La salud marca como atrasado un respaldo de más de 15 minutos; este umbral debe probarse con el tamaño real de PostgreSQL antes de afirmar el RPO.
+- La prueba de restauración usa el archivo aislado `compose.restore.yaml`, un proyecto Compose y un volumen PostgreSQL separados. Mantener workers detenidos hasta reconciliar trabajos cuyo estado quedó anterior al punto restaurado. El runbook está en `docs/backup-recovery.md`.
 
 ---
 
@@ -92,6 +95,7 @@ volumes:
   - Presencia y ejecutabilidad del binario Rclone (`rclone version`).
   - Presencia y ejecutabilidad de los clientes MEGAcmd requeridos para login, listado, cuota, descarga, subida y cierre de sesión.
   - Capacidad de agendar tareas en workers Celery.
+- `GET /health/notifications`: Supervisa de forma independiente el consumidor de correo. Su estado no retira la API de transferencias de servicio porque las notificaciones son opcionales.
 
 ---
 

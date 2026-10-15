@@ -510,6 +510,11 @@ class RcloneRunner:
                 else None
             )
             while not wait_task.done():
+                for task in reader_tasks:
+                    if task.done() and not task.cancelled():
+                        reader_error = task.exception()
+                        if reader_error is not None:
+                            raise reader_error
                 if should_cancel is not None and await should_cancel():
                     process.terminate()
                     try:
@@ -526,7 +531,18 @@ class RcloneRunner:
                     wait_timeout = min(0.25, remaining)
                 else:
                     wait_timeout = 0.25
-                await asyncio.wait({wait_task}, timeout=wait_timeout)
+                pending_tasks = {task for task in [wait_task, *reader_tasks] if not task.done()}
+                if pending_tasks:
+                    await asyncio.wait(
+                        pending_tasks,
+                        timeout=wait_timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+            for task in reader_tasks:
+                if task.done() and not task.cancelled():
+                    reader_error = task.exception()
+                    if reader_error is not None:
+                        raise reader_error
             (stdout, stdout_truncated), (stderr, stderr_truncated) = await asyncio.gather(
                 *reader_tasks
             )

@@ -1,6 +1,6 @@
 # Estado de implementación
 
-**Revisión del repositorio: 2026-10-13.** Este documento resume lo que existe en el código y separa esa evidencia de la validación que depende de CI, credenciales o redes de una instalación.
+**Revisión del repositorio: 2026-10-14.** Este documento resume lo que existe en el código y separa esa evidencia de la validación que depende de CI, credenciales o redes de una instalación.
 
 ## Estado por área
 
@@ -10,11 +10,11 @@
 | Conexiones y credenciales | Implementado | Administración, asignación privada, OAuth de Google, cifrado AES-GCM y respuestas públicas sin credenciales. El archivado es lógico y rechaza conexiones con trabajos activos. Véanse `backend/app/main.py`, `backend/app/security/credentials.py` y las migraciones. |
 | Proveedores | Implementado con validación externa | MEGA usa MEGAcmd; Google Drive usa Rclone/OAuth; Seafile ofrece adaptadores Rclone o API explícito; la UI usa SMB/NAS como origen; Nextcloud usa Rclone WebDAV con URL y credenciales administradas por conexión. Cada instalación necesita sus credenciales, permisos y rutas de red. La compatibilidad de Seafile API se acota inicialmente a CE 13.x. Nextcloud requiere prueba real por instalación antes de activarlo. |
 | Explorador | Implementado | Navegación, búsqueda, selección múltiple y destino por carpeta existente; paneles coordinados en escritorio y pasos separados en pantallas estrechas. No hay creación manual de carpetas desde la UI. Véanse `frontend/src/App.tsx` y `docs/specs/03-file-explorer-spec.md`. |
-| Transferencias | Implementado | Operación `COPY`, ejecución de fondo, límites, cancelación, reintentos clasificados, staging por archivo, verificación y diagnóstico sanitizado. Drive → Nextcloud verifica por archivo; las exportaciones Google con tamaño desconocido se materializan en staging acotado y se verifican por SHA-256 de una lectura del destino. La reanudación por manifiesto está disponible para transferencias SMB fallidas o canceladas; no es una capacidad general de todos los adaptadores. |
+| Transferencias | Implementado | Operación `COPY`, ejecución de fondo, límites, cancelación durable consultada desde PostgreSQL, reintentos clasificados, staging por archivo, verificación y diagnóstico sanitizado. La creación acepta `Idempotency-Key` por usuario; historial y conteo se paginan en SQL. Drive → Nextcloud verifica por archivo; SMB reconcilia resultados ambiguos mediante SHA-256 cuando puede leer ambos lados y deja el caso sin demostrar como pendiente de revisión. La reanudación por manifiesto está disponible para SMB; no es una capacidad general de todos los adaptadores. |
 | Programaciones | Implementado | Ejecuciones futuras de una sola vez, zonas IANA, modos `AUTO`/`EXCLUSIVE`, dependencias y despacho durable vía PostgreSQL, Celery Beat y `control-worker`. No hay recurrencia. Detalle en `docs/integrations/transfer-scheduling.md`. |
-| Progreso e historial | Implementado | SSE sobre Redis en despliegue, recuperación del estado en frontend, historial y resultados por archivo para manifiestos SMB. Véanse `docs/specs/05-realtime-telemetry-spec.md` y el contrato API. |
-| Auditoría y SMTP | Implementado con límite por confirmar | Registro de eventos, sanitización, configuración/prueba SMTP desde Administración, secretos SMTP cifrados y tareas de notificación. La aplicación escribe auditoría de forma append-only; no se encontró una protección de inmutabilidad impuesta por trigger o permisos de PostgreSQL. |
-| Despliegue y CI | Implementado | Compose incluye proxy, frontend, backend, workers, PostgreSQL y Redis; solo el proxy publica puertos. Hay Docker Secrets, `tmpfs` para secretos/configuración Rclone, staging temporal disk-backed y workflow de calidad/Trivy en `.github/workflows/ci-security.yml`. El resultado del workflow corresponde a cada commit y PR. |
+| Progreso e historial | Implementado | SSE sobre Redis en despliegue, reconciliación monotónica entre SSE, polling e historial, paginación SQL y resultados por archivo para manifiestos SMB. Véanse `docs/specs/05-realtime-telemetry-spec.md` y el contrato API. |
+| Auditoría y SMTP | Implementado con límite por confirmar | Registro de eventos, sanitización, configuración/prueba SMTP desde Administración, secretos SMTP cifrados y outbox transaccional por intento terminal. La creación de transferencias y su evento de auditoría comparten transacción; el envío usa worker/cola aislados, tokens de despacho y de intento, reintentos durables y vista ADMIN de estados sin correo del destinatario. `/health/notifications` vigila el worker sin degradar readiness de copias. SMTP no garantiza exactamente una entrega si el proceso cae tras la aceptación remota. La aplicación escribe auditoría append-only, pero su inmutabilidad no está impuesta por trigger/permisos de PostgreSQL. |
+| Despliegue y CI | Implementado | Compose incluye proxy, frontend, backend, workers separados para transferencias, control y notificaciones, PostgreSQL y Redis; solo el proxy publica puertos. Hay límites de recursos, logs rotativos, Docker Secrets, `tmpfs` para secretos/configuración Rclone y CI con PostgreSQL para pruebas de concurrencia y escaneo Trivy de las imágenes de backend, frontend y respaldo. El resultado del workflow corresponde a cada commit y PR. |
 
 ## Capacidades añadidas después del alcance inicial
 
@@ -25,6 +25,18 @@
 - Administración de conexiones privadas y archivado lógico sin borrar referencias históricas.
 - Configuración SMTP desde Administración y menú de cuenta que agrupa administración, cambio de contraseña y cierre de sesión.
 - CI de backend/frontend y análisis Trivy de repositorio, configuración e imágenes.
+
+## Remediación de resiliencia (2026-10-14)
+
+| Riesgos | Cambio aplicado | Estado / límite |
+|---|---|---|
+| R1–R2 | Las escrituras de transferencia rechazan intentos/estados atrasados; el login actualiza solo sus contadores y la protección del último ADMIN se serializa en PostgreSQL. | Tests unitarios y de concurrencia PostgreSQL. |
+| R3, R5, R7 | SSE/eventos son best-effort respecto al resultado de copia; lectores de subprocesos y heartbeat se supervisan; el worker consulta cancelación durable en PostgreSQL. | No se ensayó una partición real de PostgreSQL durante una escritura en proveedor. |
+| R4, R11 | Idempotencia de creación y outbox de correo con lease, retry, deduplicación local y worker dedicado. Los mensajes de correo antiguos se convierten de forma idempotente en filas del outbox antes de ser confirmados. | Migraciones 0010/0011 pendientes de aplicar; una caída tras aceptación SMTP puede duplicar correo. |
+| R6 | Reconciliación SMB compara SHA-256 y no declara verificado un resultado remoto ambiguo sin evidencia suficiente. | Depende de que origen y destino permitan lectura/checksum; no se habilitó borrado ni reintento ciego. |
+| R8–R9 | Ready verifica consumidores `transfers` y `control` y heartbeat de Beat; correo tiene salud separada. Compose limita CPU/memoria/PIDs, rota logs y configura Redis sin eviction. El historial transfiere páginas desde SQL. Un barrido cada 10 minutos recoge carpetas de staging antiguas si su transferencia no está activa. | No hay aún alertas externas ni detector de progreso por tarea. El barrido protege transferencias activas y homes `megacmd-*`; su ejecución puede esperar a que la cola de copias quede libre. |
+| R10 | Integración opcional de snapshot PostgreSQL cifrado a MEGA S4; RPO/RTO objetivo: 15 minutos / 2 horas. | Suite backend y pruebas con S3 simulado aprobadas; dump/restore PostgreSQL y conciliación se probaron en una instancia desechable. Aún falta endpoint/bucket/credenciales y medir una restauración con datos de la instalación; no se aplicaron migraciones ni reiniciaron servicios activos. El RPO depende de que el dump y la carga completen dentro del umbral de 15 minutos. |
+| R12 | El frontend combina SSE y polling sin permitir que una señal atrasada revierta un estado terminal. | Validado con pruebas de UI; falta recorrido visual/manual por viewport. |
 
 Las guías específicas están enlazadas desde [Documentación relacionada](../README.md#documentación-relacionada). Las restricciones de despliegue y los directorios temporales se describen en el [README](../README.md#temporales-secretos-y-datos-persistentes).
 
@@ -40,7 +52,7 @@ La siguiente agrupación ayuda a estimar el avance, pero separa implementación 
 | 10–14: exploración y selección | Implementados | Validación visual del recorrido en los tamaños de pantalla objetivo. |
 | 15–16: copia en ambos sentidos | Implementada con pruebas automatizadas de adaptadores/procesador | Copia real con cuentas de prueba no se verificó en esta revisión. |
 | 17–22: SSE, continuidad, cancelación y errores seguros | Implementados | Resultado del pipeline actual y comprobación operativa del worker/Redis. |
-| 23–24: notificaciones de correo | Implementadas y configurables | Entrega real requiere SMTP operativo y no se probó aquí. |
+| 23–24: notificaciones de correo | Implementadas y configurables | Entrega real requiere SMTP operativo y no se probó aquí; el estado del consumidor se expone aparte de la readiness de copias. |
 | 25–27: historial, auditoría de solicitud y Compose | Implementados en código/configuración | Inicio completo del stack y revisión de respaldos no se ejecutaron aquí. |
 | 28: interfaz responsive | Adaptaciones responsive presentes | Falta registrar una revisión visual/manual por viewport. |
 | 29: suite automatizada aprobada | Tests y gates CI configurados | Debe verificarse el resultado para el commit candidato. |

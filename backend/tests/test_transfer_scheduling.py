@@ -797,7 +797,7 @@ async def test_scheduled_transfer_can_be_reprogrammed_and_cancelled_from_the_api
                 "schedule_timezone": "America/Santiago",
                 "execution_mode": "EXCLUSIVE",
             },
-            headers=headers,
+            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
         )
         transfer_id = created.json()["id"]
         completed = store.create_transfer(

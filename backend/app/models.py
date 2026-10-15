@@ -129,11 +129,16 @@ class TransferJob(Base):
             "execution_mode IN ('AUTO', 'EXCLUSIVE')", name="ck_transfer_execution_mode"
         ),
         Index("ix_transfer_dispatch", "status", "scheduled_at", "created_at"),
+        UniqueConstraint(
+            "requested_by", "idempotency_key", name="uq_transfer_request_idempotency"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     public_id: Mapped[str] = mapped_column(String(32), unique=True)
     requested_by: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"))
+    idempotency_key: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    idempotency_request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_connection_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("storage_connections.id")
     )
@@ -253,6 +258,39 @@ class TransferEvent(Base):
     item_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     correlation_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), default=uuid.uuid4)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TransferNotificationOutbox(Base):
+    __tablename__ = "transfer_notification_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "transfer_job_id", "transfer_attempt", name="uq_transfer_notification_attempt"
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'QUEUED', 'SENDING', 'SENT', 'FAILED')",
+            name="ck_transfer_notification_status",
+        ),
+        Index("ix_notification_dispatch", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    transfer_job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("transfer_jobs.id", ondelete="CASCADE")
+    )
+    transfer_attempt: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE)
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class AuditEvent(Base):

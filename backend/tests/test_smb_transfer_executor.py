@@ -159,6 +159,21 @@ class FakeCopyRunner:
         )
 
 
+class RecoveryHashRunner:
+    def __init__(self, source_payload: bytes, destination_payload: bytes) -> None:
+        self.source_payload = source_payload
+        self.destination_payload = destination_payload
+        self.commands: list[tuple[str, list[str]]] = []
+
+    async def copy_remote_to_local(self, remote_source, local_directory, *_args, **_kwargs):
+        payload = (
+            self.source_payload
+            if remote_source.startswith(f"ctm_{'1' * 32}:")
+            else self.destination_payload
+        )
+        (local_directory / remote_source.rsplit("/", 1)[-1]).write_bytes(payload)
+
+
 class SelectiveFailureCopyRunner(FakeCopyRunner):
     async def run(self, command, remote_paths, config, job_id, **kwargs):
         if remote_paths[0].endswith("failed.bin"):
@@ -537,7 +552,7 @@ async def test_smb_resume_reconciles_file_uploaded_before_worker_restart(tmp_pat
         name="report.pdf", path="/Archive/NAS/report.pdf", is_dir=False,
         size_bytes=7, provider_type="GOOGLE_DRIVE",
     )
-    runner = FakeCopyRunner(cloud)
+    runner = RecoveryHashRunner(b"x" * 7, b"x" * 7)
     executor = TransferExecutor(
         Settings(transfer_temp_path=str(tmp_path), transfer_staging_path=str(tmp_path)),
         store, lambda _transfer: asyncio.sleep(0),
@@ -566,8 +581,57 @@ async def test_smb_resume_reconciles_file_uploaded_before_worker_restart(tmp_pat
         destination_is_mega=False, destination_is_api=False, mega_session=None,
     )
 
-    assert result == ("COPIED", "SIZE", None)
+    assert result == ("COPIED", "SHA256", None)
     assert runner.commands == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "destination_payload,expected",
+    [
+        (b"content", ("COPIED", "SHA256", None)),
+        (b"BBBBBBB", ("FAILED", None, "DESTINATION_RECONCILIATION_REQUIRED")),
+    ],
+)
+async def test_smb_resume_requires_content_match_for_interrupted_copy(
+    tmp_path, destination_payload, expected
+):
+    executor = TransferExecutor(
+        Settings(transfer_temp_path=str(tmp_path), transfer_staging_path=str(tmp_path)),
+        MemoryStore(), lambda _transfer: asyncio.sleep(0),
+        lambda: asyncio.sleep(0, result=False),
+        runner=RecoveryHashRunner(b"content", destination_payload),
+    )
+    source = SmallSmbTree()
+    destination = FakeCloudDestination()
+    destination.items["/Archive/NAS/report.pdf"] = StorageItem(
+        name="report.pdf", path="/Archive/NAS/report.pdf", is_dir=False,
+        size_bytes=7, provider_type="GOOGLE_DRIVE",
+    )
+    manifest_item = type(
+        "ManifestItem",
+        (),
+        {
+            "source_path": "/NAS/report.pdf",
+            "destination_path": "/Archive/NAS/report.pdf",
+            "size_bytes": 7,
+            "modified_at": None,
+            "copy_started": True,
+            "destination_existed_before": False,
+        },
+    )()
+    transfer = TransferRecord(
+        id=uuid.uuid4(), public_id="TRF-2026-000011", requested_by=uuid.uuid4(),
+        source_connection_id=uuid.uuid4(), destination_connection_id=uuid.uuid4(),
+        source_paths=["/NAS"], destination_path="/Archive",
+    )
+
+    result = await executor._copy_smb_manifest_file(
+        transfer, source, destination, manifest_item,
+        destination_is_mega=False, destination_is_api=False, mega_session=None,
+    )
+
+    assert result == expected
 
 
 @pytest.mark.asyncio
@@ -607,4 +671,4 @@ async def test_smb_resume_does_not_count_partial_mega_upload_as_skipped(tmp_path
         destination_is_mega=True, destination_is_api=False, mega_session=PartialMegaDestination(),
     )
 
-    assert result == ("FAILED", None, "DESTINATION_VERIFICATION_FAILED")
+    assert result == ("FAILED", None, "DESTINATION_RECONCILIATION_REQUIRED")

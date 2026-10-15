@@ -1,8 +1,14 @@
 import uuid
+from datetime import UTC, datetime
 
+import httpx
 import pytest
 
+from app.main import create_app
+from app.security.passwords import PasswordService
 from app.services.audit import AuditLogger
+from app.services.memory_store import MemoryStore
+from app.settings import Settings
 
 
 class CapturingStore:
@@ -57,29 +63,46 @@ def test_transfer_email_template_contains_safe_summary_without_source_paths():
 
 
 @pytest.mark.asyncio
-async def test_terminal_transfer_notification_is_enqueued_separately():
-    from types import SimpleNamespace
-
-    from app.services.notifications import enqueue_transfer_notification
-
-    transfer_id = uuid.uuid4()
-    transfer = SimpleNamespace(
-        id=transfer_id,
-        status="COMPLETED",
+async def test_admin_can_inspect_notification_outbox_without_recipient_data():
+    store = MemoryStore()
+    admin = store.add_user(
+        "mail-admin",
+        "mail-admin@example.test",
+        PasswordService().hash("Admin-password123!"),
+        role="ADMIN",
+    )
+    source = store.create_connection("Source", "MOCK", admin.id)
+    destination = store.create_connection("Destination", "MOCK", admin.id)
+    transfer = store.create_transfer(
+        admin.id,
+        source.id,
+        destination.id,
+        ["/private/report.pdf"],
+        "/archive",
         send_email_notification=True,
     )
+    transfer.status = "COMPLETED"
+    transfer.completed_at = datetime.now(UTC)
+    await store.asave_transfer(transfer)
 
-    class Store:
-        async def aget_transfer(self, requested_id):
-            return transfer if requested_id == transfer_id else None
+    app = create_app(Settings(app_secret_key="test-secret", session_cookie_secure=False), store)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (await client.get("/api/v1/notifications/outbox")).status_code == 401
+        csrf = (await client.get("/api/v1/auth/csrf")).json()["csrf_token"]
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={"username_or_email": "mail-admin", "password": "Admin-password123!"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert login.status_code == 200
+        response = await client.get("/api/v1/notifications/outbox")
 
-    class Task:
-        def __init__(self):
-            self.ids = []
-
-        def delay(self, requested_id):
-            self.ids.append(requested_id)
-
-    task = Task()
-    assert await enqueue_transfer_notification(Store(), transfer_id, task)
-    assert task.ids == [str(transfer_id)]
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert len(items) == 1
+    assert items[0]["transfer_public_id"] == transfer.public_id
+    assert items[0]["status"] == "PENDING"
+    assert "recipient" not in response.text
+    assert "private/report" not in response.text

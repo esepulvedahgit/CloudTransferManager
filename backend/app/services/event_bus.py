@@ -5,6 +5,8 @@ from app.security.sanitize import sanitize_data
 
 
 class RedisEventBus:
+    _BEAT_HEARTBEAT_KEY = "ctm:health:beat-heartbeat"
+
     def __init__(self, client: Any) -> None:
         self.client = client
 
@@ -34,6 +36,12 @@ class RedisEventBus:
 
     async def ping(self) -> bool:
         return bool(await self.client.ping())
+
+    async def record_beat_heartbeat(self) -> None:
+        await self.client.set(self._BEAT_HEARTBEAT_KEY, "1", ex=60)
+
+    async def beat_is_alive(self) -> bool:
+        return bool(await self.client.exists(self._BEAT_HEARTBEAT_KEY))
 
     async def aclose(self) -> None:
         close = getattr(self.client, "aclose", None)

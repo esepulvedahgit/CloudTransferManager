@@ -273,6 +273,7 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 ## 6. Transferencias (`/transfers`)
 
 ### `POST /api/v1/transfers`
+- Requiere `Idempotency-Key` con un UUID nuevo por intención de copia. Repetir la clave con el mismo usuario y los mismos datos devuelve la transferencia existente; usarla con datos distintos responde `409 Conflict`.
 - Acepta hasta 100 rutas de origen y responde `201 Created` al registrar y agendar el trabajo. La existencia de cada ruta se valida en el worker para que una consulta lenta del proveedor no bloquee la solicitud HTTP.
 - La interfaz solo ofrece conexiones SMB como origen y filtra SMB del selector de destino. El endpoint no impone actualmente esa restricción por tipo de proveedor.
 - `scheduled_at` opcional acepta una fecha futura con offset; el servidor la normaliza a UTC. `schedule_timezone` debe ser una zona IANA y conserva la zona mostrada en la interfaz. Si no se envía `scheduled_at`, el trabajo queda en la cola normal.
@@ -351,6 +352,11 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 ### `GET /api/v1/audit-events?limit=100`
 - Devuelve los eventos de auditoría más recientes, con secretos sanitizados.
 
+### `GET /api/v1/notifications/outbox?limit=100` [Solo ADMIN]
+- Muestra estado, intentos, próxima ejecución y código de error seguro de las notificaciones de transferencia.
+- No devuelve correo del destinatario ni la instantánea interna del mensaje.
+- SMTP se ejecuta en una cola y worker separados; los errores vuelven a PostgreSQL con reintentos crecientes, hasta cinco intentos. El despacho es al menos una vez: una caída justo después de que el servidor SMTP acepte el correo pero antes de guardar `SENT` puede producir un duplicado.
+
 ## 8. Salud del servicio
 
 ### `GET /health/live`
@@ -358,4 +364,8 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 
 ### `GET /health/ready`
 - `200 OK` cuando el almacenamiento, Redis y los componentes requeridos para el modo de despliegue están disponibles.
-- `503 Service Unavailable` cuando falta una dependencia o un worker Celery requerido.
+- `503 Service Unavailable` cuando falta una dependencia o un worker Celery requerido. En producción comprueba `transfers` y `control`; el worker de correo se supervisa por separado.
+
+### `GET /health/notifications`
+- `200 OK` cuando hay un consumidor activo de la cola `notifications`; en entornos no productivos devuelve `not_required`.
+- `503 Service Unavailable` cuando la cola de correo no tiene un consumidor activo.

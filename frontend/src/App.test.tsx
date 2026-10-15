@@ -1219,7 +1219,13 @@ describe('Cloud Transfer Manager', () => {
       const eventSource = TestEventSource.instances[0];
       eventSource.emit({ ...transfer, status: 'RUNNING', progress_percent: 50, bytes_total: 0, bytes_transferred: 4 });
       expect(await screen.findByText(/4 B transferidos · 0\/1 archivos/)).toBeVisible();
-      eventSource.emit({ ...transfer, status: 'RUNNING', progress_percent: 99.99, current_item: null });
+      eventSource.emit({
+        ...transfer,
+        status: 'RUNNING',
+        progress_percent: 99.99,
+        bytes_transferred: 4,
+        current_item: null,
+      });
       await waitFor(() => expect(screen.getAllByText('En curso').length).toBeGreaterThan(0));
       expect(screen.getByText('99.9%')).toBeVisible();
       expect(screen.queryByText('100.0%')).not.toBeInTheDocument();
@@ -1233,6 +1239,11 @@ describe('Cloud Transfer Manager', () => {
         bytes_transferred: 4,
       };
       eventSource.emit(completedTransfer);
+      if (terminalStatus === 'COMPLETED') {
+        eventSource.emit({ ...transfer, status: 'RUNNING', progress_percent: 55 });
+        await waitFor(() => expect(screen.getAllByText('Completada').length).toBeGreaterThan(0));
+        expect(screen.getByText('100.0%')).toBeVisible();
+      }
 
       if (terminalStatus === 'FAILED') {
         expect(await screen.findByText('No hay espacio temporal suficiente.')).toBeVisible();
@@ -1327,6 +1338,7 @@ describe('Cloud Transfer Manager', () => {
     };
     await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
     expect(screen.queryByText('No se pudo completar la transferencia.')).not.toBeInTheDocument();
+    expect(screen.getAllByText('Completada').length).toBeGreaterThan(0);
   }, 10_000);
 
   it('requires the user to change an initial password before normal use', async () => {

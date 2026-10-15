@@ -423,6 +423,61 @@ async def test_copy_command_retains_only_bounded_process_output(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+async def test_line_callback_failure_stops_rclone_without_waiting_for_timeout(
+    monkeypatch, tmp_path
+):
+    class HangingProcess:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr.feed_data(b"progress\n")
+            self.returncode = None
+            self.finished = asyncio.Event()
+            self.terminated = False
+
+        async def wait(self):
+            await self.finished.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+            self.finished.set()
+
+        def kill(self):
+            self.returncode = -9
+            self.finished.set()
+
+    process = HangingProcess()
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        lambda *_args, **_kwargs: _resolved(process),
+    )
+    runner = RcloneRunner("/usr/bin/rclone", str(tmp_path))
+
+    async def fail_callback(_line):
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        await runner.run(
+            "copy",
+            [
+                "ctm_0123456789abcdef0123456789abcdef:/source",
+                "ctm_fedcba9876543210fedcba9876543210:/destination",
+            ],
+            "[mock]\ntype = mega\n",
+            uuid.uuid4(),
+            line_callback=fail_callback,
+            timeout_seconds=0.1,
+        )
+
+    assert process.terminated
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_local_copy_helpers_use_only_copy_and_accept_paths_inside_staging(
     monkeypatch, tmp_path
 ):

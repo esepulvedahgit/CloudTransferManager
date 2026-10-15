@@ -1,13 +1,10 @@
 import smtplib
 import ssl
-import uuid
 from email.message import EmailMessage
 from typing import Any
 
 from app.services.smtp_config import SMTPServerConfig
 from app.settings import Settings
-
-_NOTIFIABLE = {"COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "CANCELLED"}
 
 
 def format_bytes(value: int) -> str:
@@ -42,18 +39,6 @@ def render_transfer_email(
     if app_base_url:
         body += f"\nConsulta el historial en: {app_base_url.rstrip('/')}\n"
     return subject, body
-
-
-async def enqueue_transfer_notification(store: Any, transfer_id: uuid.UUID, task: Any) -> bool:
-    transfer = await store.aget_transfer(transfer_id)
-    if (
-        transfer is None
-        or not transfer.send_email_notification
-        or transfer.status not in _NOTIFIABLE
-    ):
-        return False
-    task.delay(str(transfer_id))
-    return True
 
 
 def send_transfer_email(

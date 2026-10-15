@@ -1,6 +1,8 @@
+import asyncio
 import smtplib
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 import pytest
 
@@ -8,18 +10,19 @@ import app.services.notifications as notifications
 import app.worker as worker
 from app.security.credentials import CredentialCipher
 from app.services.memory_store import MemoryStore, SMTPSettingsRecord
-from app.services.notifications import NotificationDeliveryError
 from app.services.smtp_config import SMTPServerConfig
 from app.settings import Settings
 from app.worker import celery_app
 
 
-def test_transfer_and_notification_tasks_use_worker_queue():
+def test_transfer_tasks_and_notifications_use_separate_worker_queues():
     routes = celery_app.conf.task_routes
 
     assert routes["app.worker.run_transfer"]["queue"] == "transfers"
-    assert routes["app.worker.send_transfer_notification"]["queue"] == "transfers"
+    assert routes["app.worker.send_transfer_notification"]["queue"] == "notifications"
+    assert routes["app.worker.dispatch_pending_notifications"]["queue"] == "control"
     assert celery_app.conf.task_default_queue == "transfers"
+    assert worker.send_transfer_notification.max_retries is None
 
     assert celery_app.conf.broker_transport_options["visibility_timeout"] >= 24 * 60 * 60
 
@@ -32,6 +35,36 @@ def test_persistent_dispatcher_runs_on_a_separate_control_queue_every_15_seconds
     assert celery_app.conf.beat_schedule["dispatch-pending-transfers"]["schedule"] == 15.0
     assert (
         celery_app.conf.beat_schedule["dispatch-pending-transfers"]["options"]["queue"]
+        == "control"
+    )
+    assert celery_app.conf.task_routes["app.worker.record_beat_heartbeat"]["queue"] == "control"
+    assert celery_app.conf.beat_schedule["beat-health-heartbeat"]["schedule"] == 15.0
+    assert celery_app.conf.beat_schedule["dispatch-pending-notifications"]["schedule"] == 15.0
+    assert celery_app.conf.task_routes["app.worker.cleanup_orphaned_staging_areas"]["queue"] == (
+        "transfers"
+    )
+    assert celery_app.conf.beat_schedule["cleanup-orphaned-staging-areas"]["schedule"] == 600.0
+
+
+def test_legacy_notification_task_messages_remain_accepted_during_outbox_cutover(monkeypatch):
+    transfer_id = uuid.uuid4()
+    materialized = []
+
+    async def materialize_legacy_notification(legacy_transfer_id):
+        materialized.append(legacy_transfer_id)
+
+    monkeypatch.setattr(
+        worker,
+        "_materialize_legacy_notification",
+        materialize_legacy_notification,
+        raising=False,
+    )
+
+    worker.send_transfer_notification.run(str(transfer_id))
+
+    assert materialized == [transfer_id]
+    assert (
+        celery_app.conf.beat_schedule["dispatch-pending-notifications"]["options"]["queue"]
         == "control"
     )
 
@@ -73,12 +106,6 @@ async def test_redelivered_transfer_does_not_run_or_clear_active_cancellation(mo
         "TransferExecutor",
         lambda *_args, **_kwargs: pytest.fail("a duplicate delivery must not execute the transfer"),
     )
-    monkeypatch.setattr(
-        worker,
-        "enqueue_transfer_notification",
-        lambda *_args, **_kwargs: pytest.fail("a duplicate delivery must not notify"),
-    )
-
     await worker._execute_transfer(transfer_id, dispatch_token)
 
     assert calls == [
@@ -87,6 +114,190 @@ async def test_redelivered_transfer_does_not_run_or_clear_active_cancellation(mo
         "event_bus_closed",
         "store_closed",
     ]
+
+
+@pytest.mark.asyncio
+async def test_progress_publish_failure_does_not_fail_a_completed_transfer(monkeypatch):
+    class WorkerStore(MemoryStore):
+        @asynccontextmanager
+        async def transfer_execution_lock(self, _transfer_id):
+            yield True
+
+        async def astart_transfer_dispatch(self, _transfer_id, _token, _now):
+            return True
+
+        async def afinish_transfer_dispatch(self, _transfer_id, _token):
+            return None
+
+        async def afail_transfer_dispatch(self, transfer_id, _token, **_kwargs):
+            self.transfers[transfer_id].status = "FAILED"
+
+        async def aclose(self):
+            return None
+
+    class EventBus:
+        def __init__(self, _client):
+            pass
+
+        async def publish_progress(self, _transfer_id, event):
+            if event["status"] == "COMPLETED":
+                raise ConnectionError("Redis is unavailable")
+
+        async def clear_cancel(self, _transfer_id):
+            return None
+
+        async def aclose(self):
+            return None
+
+    store = WorkerStore()
+    user = store.add_user("worker-owner", "worker-owner@example.test", "hash")
+    source = store.create_connection("Source", "MOCK", user.id)
+    destination = store.create_connection("Destination", "MOCK", user.id)
+    transfer = store.create_transfer(user.id, source.id, destination.id, ["/Proyectos"], "/Backup")
+    monkeypatch.setattr(worker, "get_settings", lambda: Settings())
+    monkeypatch.setattr(worker, "DatabaseStore", lambda _settings: store)
+    monkeypatch.setattr(worker.Redis, "from_url", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(worker, "RedisEventBus", EventBus)
+
+    await worker._execute_transfer(transfer.id, uuid.uuid4())
+
+    assert (await store.aget_transfer(transfer.id)).status == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_worker_stops_transfer_when_dispatch_heartbeat_is_lost(monkeypatch):
+    class LostOwnershipStore:
+        def __init__(self):
+            self.failed_dispatches = 0
+
+        @asynccontextmanager
+        async def transfer_execution_lock(self, _transfer_id):
+            yield True
+
+        async def astart_transfer_dispatch(self, _transfer_id, _token, _now):
+            return True
+
+        async def aheartbeat_transfer_dispatch(self, _transfer_id, _token, _now):
+            return False
+
+        async def ais_transfer_cancel_requested(self, _transfer_id):
+            return False
+
+        async def afail_transfer_dispatch(self, _transfer_id, _token, **_kwargs):
+            self.failed_dispatches += 1
+
+        async def afinish_transfer_dispatch(self, _transfer_id, _token):
+            return None
+
+        async def aclose(self):
+            return None
+
+    class EventBus:
+        def __init__(self, _client):
+            pass
+
+        async def clear_cancel(self, _transfer_id):
+            return None
+
+        async def aclose(self):
+            return None
+
+    class LongRunningExecutor:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def execute(self, _transfer_id):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                raise
+
+    store = LostOwnershipStore()
+    cancellation_seen = asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    async def accelerated_sleep(delay):
+        await original_sleep(0.02 if delay == 10 else delay)
+
+    monkeypatch.setattr(worker, "get_settings", lambda: Settings())
+    monkeypatch.setattr(worker, "DatabaseStore", lambda _settings: store)
+    monkeypatch.setattr(worker.Redis, "from_url", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(worker, "RedisEventBus", EventBus)
+    monkeypatch.setattr(worker, "TransferExecutor", LongRunningExecutor)
+    monkeypatch.setattr(worker.asyncio, "sleep", accelerated_sleep)
+
+    await asyncio.wait_for(worker._execute_transfer(uuid.uuid4(), uuid.uuid4()), timeout=1)
+
+    assert cancellation_seen.is_set()
+    assert store.failed_dispatches == 1
+
+
+@pytest.mark.asyncio
+async def test_notification_dispatcher_publishes_outbox_id_to_isolated_queue(monkeypatch):
+    store = MemoryStore()
+    user = store.add_user("notify-dispatch", "dispatch@example.test", "hash")
+    source = store.create_connection("Source", "MOCK", user.id)
+    destination = store.create_connection("Destination", "MOCK", user.id)
+    transfer = store.create_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/report.pdf"],
+        "/archive",
+        send_email_notification=True,
+    )
+    transfer.status = "FAILED"
+    await store.asave_transfer(transfer)
+
+    async def close_store():
+        return None
+
+    store.aclose = close_store
+    enqueued = []
+
+    class NotificationTask:
+        def apply_async(self, *, args, queue):
+            enqueued.append((args, queue))
+
+    monkeypatch.setattr(worker, "get_settings", lambda: Settings())
+    monkeypatch.setattr(worker, "DatabaseStore", lambda _settings: store)
+    monkeypatch.setattr(worker, "send_transfer_notification", NotificationTask())
+
+    assert await worker._dispatch_pending_notifications() == 1
+    notification_id = next(iter(store.notification_outbox))
+    dispatch_token = store.notification_outbox[notification_id]["claim_token"]
+    assert enqueued == [([str(notification_id), str(dispatch_token)], "notifications")]
+    assert store.notification_outbox[notification_id]["status"] == "QUEUED"
+
+
+@pytest.mark.asyncio
+async def test_staging_sweep_uses_active_transfer_ids_and_configured_path(
+    monkeypatch, tmp_path
+):
+    active_ids = {uuid.uuid4()}
+    settings = Settings(transfer_staging_path=str(tmp_path))
+    captured = {}
+
+    class StagingStore:
+        async def alist_active_transfer_ids(self):
+            return active_ids
+
+        async def aclose(self):
+            return None
+
+    def cleanup(root, *, active_transfer_ids):
+        captured["root"] = root
+        captured["active_transfer_ids"] = active_transfer_ids
+        return 3
+
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    monkeypatch.setattr(worker, "DatabaseStore", lambda _settings: StagingStore())
+    monkeypatch.setattr(worker, "cleanup_staging_areas", cleanup)
+
+    assert await worker._cleanup_orphaned_staging_areas() == 3
+    assert captured["root"].samefile(tmp_path)
+    assert captured["active_transfer_ids"] == active_ids
 
 
 @pytest.mark.asyncio
@@ -107,6 +318,11 @@ async def test_worker_passes_resolved_smtp_config(monkeypatch, tmp_path):
         destination_path="/destination",
         send_email_notification=True,
     )
+    transfer.status = "COMPLETED"
+    await transfer_store.asave_transfer(transfer)
+    notification_id, dispatch_token = (
+        await transfer_store.adispatch_pending_notifications(datetime.now(UTC))
+    )[0]
 
     async def close_store():
         return None
@@ -135,12 +351,13 @@ async def test_worker_passes_resolved_smtp_config(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "load_smtp_server_config", load_config, raising=False)
     monkeypatch.setattr(worker, "send_transfer_email", capture_email)
 
-    await worker._send_notification(transfer.id)
+    await worker._send_notification(notification_id, dispatch_token)
 
     assert captured["args"][0] is settings
     assert captured["args"][1] == resolved
     assert captured["args"][2] == user.email
-    assert captured["args"][3] is transfer
+    assert captured["args"][3].public_id == transfer.public_id
+    assert transfer_store.notification_outbox[notification_id]["status"] == "SENT"
 
 
 @pytest.mark.asyncio
@@ -170,6 +387,10 @@ async def test_worker_uses_saved_smtp_and_keeps_transfer_state_on_delivery_failu
         send_email_notification=True,
     )
     transfer.status = "COMPLETED"
+    await store.asave_transfer(transfer)
+    notification_id, dispatch_token = (
+        await store.adispatch_pending_notifications(datetime.now(UTC))
+    )[0]
     smtp_id = uuid.uuid4()
     await store.asave_smtp_settings(
         SMTPSettingsRecord(
@@ -215,11 +436,11 @@ async def test_worker_uses_saved_smtp_and_keeps_transfer_state_on_delivery_failu
     monkeypatch.setattr(worker, "DatabaseStore", lambda _settings: store)
     monkeypatch.setattr(notifications.smtplib, "SMTP", FailingSMTP)
 
-    with pytest.raises(NotificationDeliveryError) as raised:
-        await worker._send_notification(transfer.id)
+    await worker._send_notification(notification_id, dispatch_token)
 
     assert captured["connection"] == ("saved.smtp.test", 2525, 20)
     assert captured["credentials"] == ("saved-smtp-user", password)
-    assert str(raised.value) == "No fue posible entregar la notificación SMTP"
-    assert password not in str(raised.value)
+    assert password not in str(store.notification_outbox[notification_id])
+    assert store.notification_outbox[notification_id]["status"] == "PENDING"
+    assert store.notification_outbox[notification_id]["last_error_code"] == "SMTP_DELIVERY_FAILED"
     assert transfer.status == "COMPLETED"

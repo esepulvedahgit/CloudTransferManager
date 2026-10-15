@@ -296,6 +296,34 @@ async def test_runner_handles_process_finishing_during_cancellation_check(
 
 
 @pytest.mark.asyncio
+async def test_line_callback_failure_stops_megacmd_without_waiting_for_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    runner_type = _runner_type()
+    process = _FakeProcess(stderr=b"progress\n", returncode=None)
+
+    async def start(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        return process
+
+    async def fail_callback(_line: str) -> None:
+        raise RuntimeError("callback failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    runner = runner_type("/usr/bin")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        await runner.run(
+            "ls",
+            _ls_arguments(),
+            home=tmp_path / "home",
+            line_callback=fail_callback,
+            timeout_seconds=0.1,
+        )
+
+    assert process.terminated
+
+
+@pytest.mark.asyncio
 async def test_runner_terminates_process_on_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

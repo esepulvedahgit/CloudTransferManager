@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 from app.providers.base import StorageItem
 from app.providers.megacmd import MegaCmdProvider
@@ -519,6 +519,18 @@ class TransferExecutor:
                         verified_by=verified_by,
                         error_code=error_code,
                     )
+                    if error_code == "DESTINATION_RECONCILIATION_REQUIRED":
+                        await self.store.aadd_transfer_event(
+                            record.id,
+                            level="ERROR",
+                            event_type="SMB_RECONCILIATION_REQUIRED",
+                            message=(
+                                "No se pudo verificar por contenido el archivo del destino "
+                                "tras interrumpirse la copia. No se sobrescribió."
+                            ),
+                            provider_error_code=error_code,
+                            item_path=item.source_path,
+                        )
                     record = await self.store.aget_transfer(record.id) or record
                     record.current_item = item.source_path
                     record.status = "RUNNING"
@@ -674,9 +686,27 @@ class TransferExecutor:
             if (
                 item.copy_started
                 and not item.destination_existed_before
-                and destination_item.size_bytes == item.size_bytes
             ):
-                return "COPIED", "SIZE", None
+                try:
+                    verified = await self._verify_smb_interrupted_copy(
+                        source,
+                        destination,
+                        item,
+                        transfer_id=record.id,
+                        destination_is_api=destination_is_api,
+                        mega_session=mega_session,
+                    )
+                except (
+                    RcloneCancelledError,
+                    MegaCmdCancelledError,
+                    SeafileApiCancelledError,
+                ):
+                    raise
+                except Exception:
+                    verified = False
+                if verified:
+                    return "COPIED", "SHA256", None
+                return "FAILED", None, "DESTINATION_RECONCILIATION_REQUIRED"
             if record.conflict_policy == "SKIP" or destination_is_mega:
                 if item.copy_started and not item.destination_existed_before:
                     return "FAILED", None, "DESTINATION_VERIFICATION_FAILED"
@@ -762,6 +792,90 @@ class TransferExecutor:
             if uploaded is None or uploaded.is_dir or uploaded.size_bytes != item.size_bytes:
                 return "FAILED", None, "DESTINATION_VERIFICATION_FAILED"
             return "COPIED", "SIZE", None
+
+    async def _verify_smb_interrupted_copy(
+        self,
+        source: Any,
+        destination: Any,
+        item: Any,
+        *,
+        transfer_id: uuid.UUID,
+        destination_is_api: bool,
+        mega_session: Any | None,
+    ) -> bool:
+        """Confirm an interrupted remote write by content before accepting or retrying it."""
+        if item.size_bytes is None:
+            return False
+        expected_staging_bytes = item.size_bytes * (1 if destination_is_api else 2)
+        async with temporary_staging_area(
+            Path(self.settings.transfer_staging_path),
+            transfer_id=transfer_id,
+            expected_size=expected_staging_bytes,
+            reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+            margin_percent=self.settings.transfer_staging_margin_percent,
+        ) as staging_area:
+            source_area = staging_area / "source"
+            source_area.mkdir(mode=0o700)
+            await self.runner.copy_remote_to_local(
+                source.remote_path(item.source_path),
+                source_area,
+                source.config_content(),
+                transfer_id,
+                should_cancel=self.should_cancel,
+            )
+            source_file = source_area / PurePosixPath(item.source_path).name
+            if (
+                not source_file.is_file()
+                or source_file.is_symlink()
+                or source_file.stat().st_size != item.size_bytes
+            ):
+                return False
+            source_digest = await _sha256_file(source_file, self.should_cancel)
+
+            if destination_is_api:
+                destination_digest = cast(
+                    str,
+                    await destination.sha256(
+                        item.destination_path, should_cancel=self.should_cancel
+                    ),
+                )
+            else:
+                destination_area = staging_area / "destination"
+                destination_area.mkdir(mode=0o700)
+                if mega_session is not None:
+                    destination_file = await mega_session.download_file(
+                        item.destination_path,
+                        destination_area,
+                        should_cancel=self.should_cancel,
+                    )
+                else:
+                    await self.runner.copy_remote_to_local(
+                        destination.remote_path(item.destination_path),
+                        destination_area,
+                        destination.config_content(),
+                        transfer_id,
+                        should_cancel=self.should_cancel,
+                    )
+                    destination_file = destination_area / PurePosixPath(
+                        item.destination_path
+                    ).name
+                if (
+                    not destination_file.is_file()
+                    or destination_file.is_symlink()
+                    or destination_file.stat().st_size != item.size_bytes
+                ):
+                    return False
+                destination_digest = await _sha256_file(destination_file, self.should_cancel)
+
+            current_source = await source.get_item(item.source_path)
+            if (
+                current_source is None
+                or current_source.is_dir
+                or current_source.size_bytes != item.size_bytes
+                or not self._same_smb_modified_at(current_source.modified_at, item.modified_at)
+            ):
+                return False
+            return source_digest == destination_digest
 
     @staticmethod
     def _same_smb_modified_at(left: datetime | None, right: datetime | None) -> bool:

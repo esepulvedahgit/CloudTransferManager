@@ -1,8 +1,8 @@
 import hashlib
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from app.security.sanitize import sanitize_data
@@ -11,6 +11,7 @@ from app.services.transfer_progress import smb_manifest_progress_percent
 ACTIVE_TRANSFER_STATUSES = frozenset(
     {"SCHEDULED", "QUEUED", "VALIDATING", "RUNNING", "RETRYING", "CANCELLING"}
 )
+_NOTIFICATION_LEASE_SECONDS = 300
 
 
 class ConnectionInUseError(ValueError):
@@ -24,6 +25,10 @@ class ConnectionUnavailableError(ValueError):
         self.reason = reason
         message = "Connection not found" if reason == "not_found" else "Connection is inactive"
         super().__init__(message)
+
+
+class IdempotencyConflictError(ValueError):
+    """Raised when a caller reuses an idempotency key for different input."""
 
 
 @dataclass
@@ -120,6 +125,7 @@ class TransferRecord:
     started_at: datetime | None = None
     completed_at: datetime | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+    idempotent_replay: bool = False
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -213,7 +219,9 @@ class MemoryStore:
         self.transfers: dict[uuid.UUID, TransferRecord] = {}
         self.connection_grants: set[tuple[uuid.UUID, uuid.UUID]] = set()
         self.transfer_events: dict[uuid.UUID, list[dict[str, Any]]] = {}
+        self.notification_outbox: dict[uuid.UUID, dict[str, Any]] = {}
         self.transfer_manifest_items: dict[tuple[uuid.UUID, str], TransferManifestItemRecord] = {}
+        self.transfer_idempotency: dict[tuple[uuid.UUID, uuid.UUID], tuple[str, uuid.UUID]] = {}
         self.audit_events: list[dict[str, Any]] = []
 
     async def acheck(self) -> bool:
@@ -400,15 +408,84 @@ class MemoryStore:
     async def afind_user(self, username_or_email: str) -> UserAccount | None:
         return self.find_user(username_or_email)
 
-    async def asave_user(self, user: UserAccount) -> None:
-        existing_username = self.find_user(user.username)
-        existing_email = self.find_user(user.email)
+    async def arecord_login_failure(
+        self, user_id: uuid.UUID, expected_password_hash: str, now: datetime
+    ) -> None:
+        user = self.users.get(user_id)
+        if user is None or user.password_hash != expected_password_hash:
+            return
+        user.failed_login_attempts += 1
+        if user.failed_login_attempts >= 5:
+            user.locked_until = now + timedelta(minutes=15)
+
+    async def arecord_login_success(
+        self, user_id: uuid.UUID, expected_password_hash: str, now: datetime
+    ) -> UserAccount | None:
+        user = self.users.get(user_id)
+        if (
+            user is None
+            or user.password_hash != expected_password_hash
+            or not user.is_active
+            or (user.locked_until is not None and user.locked_until > now)
+        ):
+            return None
+        user.failed_login_attempts = 0
+        user.locked_until = None
+        user.last_login_at = now
+        return user
+
+    async def aupdate_user_password(
+        self,
+        user_id: uuid.UUID,
+        password_hash: str,
+        *,
+        must_change_password: bool,
+        reset_login_failures: bool = False,
+        expected_password_hash: str | None = None,
+    ) -> UserAccount | None:
+        user = self.users.get(user_id)
+        if user is None or (
+            expected_password_hash is not None
+            and user.password_hash != expected_password_hash
+        ):
+            return None
+        user.password_hash = password_hash
+        user.must_change_password = must_change_password
+        if reset_login_failures:
+            user.failed_login_attempts = 0
+            user.locked_until = None
+        return user
+
+    async def aupdate_user_profile(
+        self, user_id: uuid.UUID, changes: dict[str, str | bool]
+    ) -> tuple[UserAccount | None, bool]:
+        allowed = {"username", "email", "role", "is_active"}
+        if set(changes) - allowed:
+            raise ValueError("Unsupported user profile field")
+        user = self.users.get(user_id)
+        if user is None:
+            return None, False
+        removes_admin = (
+            user.is_active
+            and user.role == "ADMIN"
+            and (changes.get("is_active", True) is False or changes.get("role") == "USER")
+        )
+        if removes_admin and await self.acount_active_admins() <= 1:
+            return None, True
+        username = changes.get("username", user.username)
+        email = changes.get("email", user.email)
+        if not isinstance(username, str) or not isinstance(email, str):
+            raise ValueError("Invalid user profile value")
+        existing_username = self.find_user(username)
+        existing_email = self.find_user(email)
         if any(
             existing is not None and existing.id != user.id
             for existing in (existing_username, existing_email)
         ):
             raise ValueError("Username or email is already in use")
-        self.users[user.id] = user
+        for field_name, value in changes.items():
+            setattr(user, field_name, value)
+        return user, False
 
     async def aget_connection(self, connection_id: uuid.UUID) -> ConnectionRecord | None:
         return self.get_connection(connection_id)
@@ -512,6 +589,10 @@ class MemoryStore:
     async def aget_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
         return self.get_transfer(transfer_id)
 
+    async def ais_transfer_cancel_requested(self, transfer_id: uuid.UUID) -> bool:
+        transfer = self.get_transfer(transfer_id)
+        return transfer is not None and transfer.cancel_requested_at is not None
+
     async def alist_transfers(
         self,
         requested_by: uuid.UUID | None = None,
@@ -526,6 +607,31 @@ class MemoryStore:
             exclude_background,
         )
 
+    async def alist_active_transfer_ids(self) -> set[uuid.UUID]:
+        return {
+            transfer.id
+            for transfer in self.transfers.values()
+            if transfer.status in ACTIVE_TRANSFER_STATUSES
+        }
+
+    async def alist_transfer_page(
+        self,
+        requested_by: uuid.UUID | None,
+        *,
+        offset: int,
+        limit: int,
+        pending_only: bool = False,
+        background_only: bool = False,
+        exclude_background: bool = False,
+    ) -> tuple[list[TransferRecord], int]:
+        records = await self.alist_transfers(
+            requested_by,
+            pending_only,
+            background_only,
+            exclude_background,
+        )
+        return records[offset : offset + limit], len(records)
+
     async def acreate_transfer(
         self,
         requested_by: uuid.UUID,
@@ -539,7 +645,18 @@ class MemoryStore:
         schedule_timezone: str = "UTC",
         execution_mode: str = "AUTO",
         depends_on_transfer_id: uuid.UUID | None = None,
+        idempotency_key: uuid.UUID | None = None,
+        idempotency_request_hash: str | None = None,
+        audit_event: dict[str, Any] | None = None,
     ) -> TransferRecord:
+        if (idempotency_key is None) != (idempotency_request_hash is None):
+            raise ValueError("Idempotency key and request hash must be supplied together")
+        if idempotency_key is not None:
+            existing = await self.aget_transfer_by_idempotency(
+                requested_by, idempotency_key, idempotency_request_hash or ""
+            )
+            if existing is not None:
+                return existing
         for connection_id in {source_connection_id, destination_connection_id}:
             connection = self.get_connection(connection_id)
             if connection is None:
@@ -548,7 +665,7 @@ class MemoryStore:
                 raise ConnectionUnavailableError("inactive")
         source = self.get_connection(source_connection_id)
         destination = self.get_connection(destination_connection_id)
-        return self.create_transfer(
+        record = self.create_transfer(
             requested_by,
             source_connection_id,
             destination_connection_id,
@@ -563,9 +680,224 @@ class MemoryStore:
             execution_mode,
             depends_on_transfer_id,
         )
+        if idempotency_key is not None and idempotency_request_hash is not None:
+            self.transfer_idempotency[(requested_by, idempotency_key)] = (
+                idempotency_request_hash,
+                record.id,
+            )
+        if audit_event is not None:
+            event_metadata = dict(audit_event.get("metadata") or {})
+            event_metadata.setdefault("public_id", record.public_id)
+            await self.aadd_audit_event(
+                actor_user_id=requested_by,
+                action="TRANSFER_CREATED",
+                resource_type="transfer",
+                resource_id=str(record.id),
+                result="SUCCESS",
+                metadata=event_metadata,
+                ip_address=audit_event.get("ip_address"),
+                user_agent=audit_event.get("user_agent"),
+            )
+        return record
+
+    async def aget_transfer_by_idempotency(
+        self,
+        requested_by: uuid.UUID,
+        idempotency_key: uuid.UUID,
+        request_hash: str,
+    ) -> TransferRecord | None:
+        entry = self.transfer_idempotency.get((requested_by, idempotency_key))
+        if entry is None:
+            return None
+        stored_hash, transfer_id = entry
+        if stored_hash != request_hash:
+            raise IdempotencyConflictError(
+                "Idempotency key was already used for different input"
+            )
+        record = self.transfers.get(transfer_id)
+        return replace(record, idempotent_replay=True) if record is not None else None
 
     async def asave_transfer(self, transfer: TransferRecord) -> None:
         self.transfers[transfer.id] = transfer
+        self._ensure_notification_outbox(transfer)
+
+    def _ensure_notification_outbox(self, transfer: TransferRecord) -> None:
+        if not transfer.send_email_notification or transfer.status not in {
+            "COMPLETED",
+            "COMPLETED_WITH_WARNINGS",
+            "FAILED",
+            "CANCELLED",
+        }:
+            return
+        if any(
+            item["transfer_job_id"] == transfer.id
+            and item["transfer_attempt"] == transfer.attempt_count
+            for item in self.notification_outbox.values()
+        ):
+            return
+        user = self.users.get(transfer.requested_by)
+        source = self.connections.get(transfer.source_connection_id)
+        destination = self.connections.get(transfer.destination_connection_id)
+        if user is None or source is None or destination is None:
+            return
+        now = datetime.now(UTC)
+        notification_id = uuid.uuid4()
+        self.notification_outbox[notification_id] = {
+            "id": notification_id,
+            "transfer_job_id": transfer.id,
+            "transfer_public_id": transfer.public_id,
+            "transfer_attempt": transfer.attempt_count,
+            "status": "PENDING",
+            "attempt_count": 0,
+            "snapshot": {
+                "public_id": transfer.public_id,
+                "status": transfer.status,
+                "bytes_transferred": transfer.bytes_transferred,
+                "created_at": transfer.created_at.isoformat(),
+                "completed_at": (transfer.completed_at or now).isoformat(),
+                "recipient": user.email,
+                "source_name": source.name,
+                "destination_name": destination.name,
+            },
+            "next_attempt_at": now,
+            "claimed_at": None,
+            "claim_token": None,
+            "last_error_code": None,
+            "created_at": now,
+        }
+
+    async def adispatch_pending_notifications(
+        self, now: datetime, limit: int = 100, lease_seconds: int = _NOTIFICATION_LEASE_SECONDS
+    ) -> list[tuple[uuid.UUID, uuid.UUID]]:
+        now = now.astimezone(UTC)
+        dispatch_ids = []
+        for item in sorted(
+            self.notification_outbox.values(), key=lambda entry: entry["created_at"]
+        ):
+            stale = item["claimed_at"] is not None and item["claimed_at"] < now - timedelta(
+                seconds=lease_seconds
+            )
+            due = item["status"] == "PENDING" and item["next_attempt_at"] <= now
+            if not due and not (item["status"] in {"QUEUED", "SENDING"} and stale):
+                continue
+            if item["attempt_count"] >= 5:
+                item["status"] = "FAILED"
+                item["last_error_code"] = "ATTEMPTS_EXHAUSTED"
+                item["claimed_at"] = None
+                item["claim_token"] = None
+                continue
+            item["status"] = "QUEUED"
+            item["claimed_at"] = now
+            item["claim_token"] = uuid.uuid4()
+            dispatch_ids.append((item["id"], item["claim_token"]))
+            if len(dispatch_ids) >= max(1, min(limit, 500)):
+                break
+        return dispatch_ids
+
+    async def arelease_notification_dispatch(
+        self, notification_id: uuid.UUID, now: datetime, dispatch_token: uuid.UUID
+    ) -> None:
+        item = self.notification_outbox.get(notification_id)
+        if (
+            item is None
+            or item["status"] != "QUEUED"
+            or item["claim_token"] != dispatch_token
+        ):
+            return
+        item["status"] = "PENDING"
+        item["claimed_at"] = None
+        item["claim_token"] = None
+        item["next_attempt_at"] = now.astimezone(UTC) + timedelta(seconds=15)
+        item["last_error_code"] = "QUEUE_UNAVAILABLE"
+
+    async def aclaim_notification_delivery(
+        self,
+        notification_id: uuid.UUID,
+        now: datetime,
+        dispatch_token: uuid.UUID,
+        lease_seconds: int = _NOTIFICATION_LEASE_SECONDS,
+    ) -> tuple[dict[str, Any], uuid.UUID] | None:
+        item = self.notification_outbox.get(notification_id)
+        if (
+            item is None
+            or item["status"] != "QUEUED"
+            or item["claim_token"] != dispatch_token
+            or item["claimed_at"] is None
+            or item["claimed_at"] <= now.astimezone(UTC) - timedelta(seconds=lease_seconds)
+        ):
+            return None
+        if item["attempt_count"] >= 5:
+            item["status"] = "FAILED"
+            item["last_error_code"] = "ATTEMPTS_EXHAUSTED"
+            item["claimed_at"] = None
+            item["claim_token"] = None
+            return None
+        item["status"] = "SENDING"
+        item["attempt_count"] += 1
+        item["claimed_at"] = now.astimezone(UTC)
+        item["claim_token"] = uuid.uuid4()
+        return dict(item["snapshot"]), item["claim_token"]
+
+    async def amark_notification_sent(
+        self, notification_id: uuid.UUID, claim_token: uuid.UUID
+    ) -> None:
+        item = self.notification_outbox.get(notification_id)
+        if (
+            item is not None
+            and item["status"] == "SENDING"
+            and item["claim_token"] == claim_token
+        ):
+            item["status"] = "SENT"
+            item["claimed_at"] = None
+            item["claim_token"] = None
+            item["last_error_code"] = None
+
+    async def afail_notification_delivery(
+        self,
+        notification_id: uuid.UUID,
+        now: datetime,
+        claim_token: uuid.UUID,
+        error_code: str = "SMTP_DELIVERY_FAILED",
+    ) -> None:
+        item = self.notification_outbox.get(notification_id)
+        if (
+            item is None
+            or item["status"] != "SENDING"
+            or item["claim_token"] != claim_token
+        ):
+            return
+        item["claimed_at"] = None
+        item["claim_token"] = None
+        item["last_error_code"] = (
+            error_code
+            if error_code in {"SMTP_CONFIGURATION_INVALID", "SMTP_DELIVERY_FAILED"}
+            else "SMTP_DELIVERY_FAILED"
+        )
+        if item["attempt_count"] >= 5:
+            item["status"] = "FAILED"
+        else:
+            item["status"] = "PENDING"
+            item["next_attempt_at"] = now.astimezone(UTC) + timedelta(
+                seconds=min(3600, 15 * (2 ** (item["attempt_count"] - 1)))
+            )
+
+    async def alist_notification_outbox(self, limit: int = 100) -> list[dict[str, Any]]:
+        items = sorted(
+            self.notification_outbox.values(), key=lambda entry: entry["created_at"], reverse=True
+        )[: max(1, min(limit, 200))]
+        return [
+            {
+                "id": str(item["id"]),
+                "transfer_public_id": item["transfer_public_id"],
+                "transfer_attempt": item["transfer_attempt"],
+                "status": item["status"],
+                "attempt_count": item["attempt_count"],
+                "last_error_code": item["last_error_code"],
+                "next_attempt_at": item["next_attempt_at"].isoformat(),
+                "created_at": item["created_at"].isoformat(),
+            }
+            for item in items
+        ]
 
     async def aupdate_transfer_schedule(
         self,
@@ -625,6 +957,7 @@ class MemoryStore:
             transfer.dispatch_token = None
             transfer.dispatch_claimed_at = None
             transfer.execution_heartbeat_at = None
+            self._ensure_notification_outbox(transfer)
             return transfer, False
         transfer.status = "CANCELLING"
         return transfer, True

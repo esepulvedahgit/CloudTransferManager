@@ -1,0 +1,38 @@
+services:
+  restore-postgres:
+    image: postgres:16-bookworm
+    restart: "no"
+    environment:
+      POSTGRES_DB: cloud_transfer
+      POSTGRES_USER: cloud_transfer
+      POSTGRES_PASSWORD_FILE: /restore/secrets/postgres_password
+    volumes:
+      - ${RESTORE_DIR:?Set RESTORE_DIR to the decrypted backup directory}:/restore:ro
+      - restore_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloud_transfer -d cloud_transfer"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  restore-verifier:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: "no"
+    entrypoint: ["python", "-m", "app.backup_verification"]
+    environment:
+      POSTGRES_HOST: restore-postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: cloud_transfer
+      POSTGRES_USER: cloud_transfer
+      POSTGRES_PASSWORD_FILE: /restore/secrets/postgres_password
+      MASTER_ENCRYPTION_KEY_FILE: /restore/secrets/master_key
+    volumes:
+      - ${RESTORE_DIR:?Set RESTORE_DIR to the decrypted backup directory}:/restore:ro
+    depends_on:
+      restore-postgres:
+        condition: service_healthy
+
+volumes:
+  restore_pgdata:

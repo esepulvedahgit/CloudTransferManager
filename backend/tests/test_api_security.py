@@ -1,3 +1,5 @@
+import uuid
+
 import httpx
 import pytest
 
@@ -149,7 +151,10 @@ async def test_transfer_request_is_queued_without_checking_remote_source(monkeyp
                 "source_paths": ["/some/remote/file.bin"],
                 "destination_path": "/backup",
             },
-            headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+            headers={
+                "X-CSRF-Token": client.cookies["ctm_csrf"],
+                "Idempotency-Key": str(uuid.uuid4()),
+            },
         )
         too_many_paths = await client.post(
             "/api/v1/transfers",
@@ -159,7 +164,10 @@ async def test_transfer_request_is_queued_without_checking_remote_source(monkeyp
                 "source_paths": [f"/item-{index}" for index in range(101)],
                 "destination_path": "/backup",
             },
-            headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+            headers={
+                "X-CSRF-Token": client.cookies["ctm_csrf"],
+                "Idempotency-Key": str(uuid.uuid4()),
+            },
         )
 
     assert response.status_code == 201

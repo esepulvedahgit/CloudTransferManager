@@ -34,6 +34,8 @@ Las programaciones no son recurrentes. Una programación tampoco crea conectivid
 
 ## Despliegue con Docker Compose
 
+Configuración y evidencia de la instalación local: [CloudLab](docs/deployment-cloudlab.md).
+
 ### Requisitos
 
 - Docker Engine y Docker Compose v2.
@@ -48,7 +50,7 @@ Desde la raíz del repositorio, copia `.env.example` y edita `APP_BASE_URL` ante
 ```bash
 cp .env.example .env
 # Edita APP_BASE_URL=https://localhost:8443 en .env antes de continuar.
-./scripts/setup-local-secrets.sh
+bash scripts/setup-local-secrets.sh
 docker compose up -d --build
 ```
 
@@ -92,6 +94,7 @@ Edita `.env` antes de iniciar Compose. Los valores iniciales están en `.env.exa
 | `NEXTCLOUD_MAX_CONCURRENT` | `1` | Máximo de trabajos activos que usan Nextcloud; se aplica junto al límite global. |
 | `NEXTCLOUD_BANDWIDTH_LIMIT` / `NEXTCLOUD_CHUNK_SIZE` / `NEXTCLOUD_JOB_TIMEOUT_SECONDS` | `8M` / `10Mi` / `43200` | Perfil conservador de subida y timeout total de 12 h. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USE_TLS`, `SMTP_FROM_ADDRESS` | vacío, `587`, `true`, vacío | Completa la configuración si esta instalación enviará correo; también se administra desde la sección SMTP de Administración. |
+| `BACKUP_TMPFS_SIZE` / `BACKUP_MEMORY_LIMIT` | `2G` / `3G` | Tamaño del scratch volátil y límite del servicio de respaldo opcional. Reserva cerca de tres veces el tamaño del dump más margen. |
 
 `TRANSFER_TEMP_PATH` y `TRANSFER_STAGING_PATH` normalmente se dejan con sus rutas predeterminadas. Si cambias `TRANSFER_TEMP_PATH`, actualiza también el montaje `tmpfs` correspondiente en `compose.yaml` para backend y worker; de lo contrario, el nuevo destino no quedará cubierto por ese `tmpfs`. Si cambias `TRANSFER_STAGING_PATH`, configura la misma ruta en ambos servicios y confirma que sea un directorio absoluto dedicado y escribible por UID `10001`.
 
@@ -116,12 +119,15 @@ Antes de registrar el callback, establece `APP_BASE_URL=https://localhost:8443` 
 - `backend`: API FastAPI, migraciones Alembic al arrancar, exploración, autenticación y coordinación de transferencias.
 - `worker`: ejecuta la cola `transfers`, Rclone, MEGAcmd y el acceso a proveedores.
 - `control-worker` y `beat`: despachan trabajos programados; mantén una sola instancia de `beat`.
+- `notification-worker`: envía correo desde una cola aislada; no puede retrasar ni cambiar el estado de una transferencia.
 - `postgres`: PostgreSQL 16, base de datos de usuarios, conexiones, credenciales cifradas, transferencias y auditoría.
-- `redis`: Redis 7 con AOF, broker y canal de eventos.
+- `redis`: Redis 7 con AOF, presupuesto de memoria y política `noeviction`; actúa como broker y canal de eventos.
 
 Solo `reverse-proxy` publica puertos. `ctm_internal` es una red Docker interna para la aplicación y sus dependencias. `ctm_proxy_edge` permite publicar el proxy sin dar salida externa a los servicios internos. `provider_egress` da salida al backend y al worker para llegar a los proveedores; esa red por sí sola no configura rutas a redes privadas corporativas. PostgreSQL, Redis, backend y workers no deben exponerse directamente al host o a Internet.
 
-La imagen de backend/worker contiene Rclone y MEGAcmd. Rclone se invoca sin shell y solo con `lsjson`, `copy`, `about` y `size`; no se expone la API RC. Las operaciones destructivas (`delete`, `purge`, `sync`, `move`, `moveto`, `rmdir`, `dedupe`, entre otras) están fuera del flujo de aplicación. Las migraciones de base de datos se ejecutan al iniciar `backend`. Si el healthcheck `/health/ready` falla, revisa PostgreSQL, Redis, los binarios del motor y la cola Celery antes de habilitar tráfico.
+La imagen de backend/worker contiene Rclone y MEGAcmd. Rclone se invoca sin shell y solo con `lsjson`, `copy`, `about` y `size`; no se expone la API RC. Las operaciones destructivas (`delete`, `purge`, `sync`, `move`, `moveto`, `rmdir`, `dedupe`, entre otras) están fuera del flujo de aplicación. Las migraciones de base de datos se ejecutan al iniciar `backend`. Si el healthcheck `/health/ready` falla, revisa PostgreSQL, Redis, los binarios del motor, los consumidores de ambas colas Celery y la señal periódica de Beat antes de habilitar tráfico.
+
+Compose limita memoria y CPU de los nueve servicios habituales. Sus valores iniciales reservan hasta unos 5,4 GiB de memoria y 7,5 CPU; el perfil opcional `backup` agrega hasta 3 GiB y 1 CPU. Ajústalos con las variables `*_MEMORY_LIMIT` y `*_CPU_LIMIT` de `.env` según la capacidad del host. El worker de transferencias recibe el mayor presupuesto por MEGAcmd y las copias con staging. Los logs JSON de cada contenedor rotan a 20 MiB por archivo y conservan cinco archivos. Redis usa `REDIS_MAXMEMORY=256mb` bajo un límite de 384 MiB y `noeviction`: al llenarse, rechaza nuevas escrituras para preservar mensajes existentes, mientras PostgreSQL conserva las intenciones y el dispatcher vuelve a intentar trabajos pendientes.
 
 ### SMB/NAS
 
@@ -145,13 +151,15 @@ Nextcloud queda desactivado por defecto. Para habilitarlo, establece `NEXTCLOUD_
 |---|---|---|
 | `secrets/*` en el host | Archivos Docker Secret para la clave de sesión, contraseña PostgreSQL, clave maestra y contraseña SMTP. | Permanecen en el host. Restringe sus permisos y respáldalos de forma segura. `setup-local-secrets.sh` no los sobrescribe. |
 | `/run/secrets` | Montaje de solo lectura de los secretos Docker dentro de cada contenedor autorizado. | Lo administra Docker; no es un directorio de datos de la aplicación. |
-| `/run/ctm-secrets` | Copia runtime de secretos para backend, worker y control-worker. El entrypoint la crea en `tmpfs`, con modo `0700`; los archivos quedan con modo `0600` y propietario `ctm` (UID `10001`). | Memoria volátil; desaparece al detener/recrear el contenedor. El entrypoint inicia como root solo para copiar secretos y luego ejecuta el proceso como `ctm`. |
+| `/run/ctm-secrets` | Copia runtime de secretos para backend, workers y control-worker. El entrypoint la crea en `tmpfs`, con modo `0700`; los archivos quedan con modo `0600` y propietario `ctm` (UID `10001`). | Memoria volátil; desaparece al detener/recrear el contenedor. El entrypoint inicia como root solo para copiar secretos y luego ejecuta el proceso como `ctm`. |
 | `/var/lib/cloud-transfer/tmp` (`TRANSFER_TEMP_PATH`) | Configuraciones Rclone efímeras por trabajo, con permisos `0600`. | `tmpfs` de 64 MiB en backend y worker; directorio `0700`. La configuración se elimina al finalizar, fallar o cancelar la invocación. No almacena el contenido de los archivos transferidos. |
-| `/var/lib/cloud-transfer/staging` (`TRANSFER_STAGING_PATH`) | Datos temporales por archivo para rutas que necesitan staging; también HOME privado temporal de una sesión MEGAcmd. | Directorio `0700` respaldado por el filesystem writable del contenedor. No está montado como volumen ni `tmpfs`, por lo que consume almacenamiento del host usado por Docker y no sobrevive a la recreación del contenedor. Cada área por archivo se elimina al terminar; un fallo de limpieza hace fallar el trabajo. |
+| `/var/lib/cloud-transfer/staging` (`TRANSFER_STAGING_PATH`) | Datos temporales por archivo para rutas que necesitan staging; también HOME privado temporal de una sesión MEGAcmd. | Directorio `0700` respaldado por el filesystem writable del contenedor. No está montado como volumen ni `tmpfs`, por lo que consume almacenamiento del host usado por Docker y no sobrevive a la recreación del contenedor. Cada área por archivo se elimina al terminar; además, cada 10 minutos un barrido elimina carpetas `transfer-<uuid>-*` con más de 10 minutos solo si la transferencia no está activa. Omite enlaces simbólicos, nombres desconocidos y homes `megacmd-*`. Un fallo de limpieza normal hace fallar el trabajo. |
 | `/tmp` en `beat` | Archivo PID `/tmp/celerybeat.pid`. | Filesystem efímero del contenedor; no es un volumen persistente. |
 | `postgres_data` | Datos PostgreSQL, incluidas las credenciales cifradas. | Volumen Docker persistente; respáldalo junto con `master_key`. |
 | `redis_data` | Datos AOF de Redis. | Volumen Docker persistente. |
-| `application_logs` | Logs de la aplicación en `/var/log/cloud-transfer`. | Volumen Docker persistente; considera rotación, retención y espacio. |
+| `backup_state` | Marca del último ciclo de respaldo y bloqueo. | Volumen Docker persistente; no contiene dumps ni secretos temporales. El scratch de respaldo usa `/run/ctm-backup-work` en `tmpfs` y se pierde al detener/recrear el contenedor. Dimensiona `BACKUP_TMPFS_SIZE` y `BACKUP_MEMORY_LIMIT` de acuerdo con [la guía de respaldo](docs/backup-recovery.md). |
+| `./restore` | Archivos descifrados de una restauración solicitada explícitamente. | Montaje persistente del host; contiene la base de datos y secretos en claro hasta borrarlos. Restringe el acceso y limpia el directorio después del ensayo o recuperación. |
+| Logs de Docker | Salida estándar de los servicios. | Driver `json-file` con rotación de 20 MiB × 5 archivos por contenedor. |
 
 Por defecto, el staging se mantiene en el disco de Docker, no en RAM. Antes de transferir, el worker exige espacio libre para el archivo más grande más `max(TRANSFER_STAGING_RESERVE_BYTES, tamaño × TRANSFER_STAGING_MARGIN_PERCENT)`. Los valores por defecto son una reserva de 1 GiB y margen de 20%. Un tamaño desconocido o espacio insuficiente detiene el trabajo antes de copiar. Dimensiona el filesystem de Docker, revisa su cuota y monitoriza el uso durante migraciones grandes. Si cambias `TRANSFER_STAGING_PATH`, usa una ruta absoluta, dedicada y respaldada por disco; si montas un directorio del host, aplícale permisos para UID `10001` tanto en backend como en worker. No lo cambies a `/tmp`, `/run` ni a un `tmpfs` pequeño.
 
@@ -174,10 +182,10 @@ Comprueba los servicios y sus logs:
 
 ```bash
 docker compose ps
-docker compose logs --tail=100 backend worker control-worker beat
+docker compose logs --tail=100 backend worker control-worker notification-worker beat
 ```
 
-`/health/live` comprueba que el API responde. `/health/ready` comprueba dependencias requeridas para operar. El frontend, la API, PostgreSQL y Redis no tienen puertos publicados para acceder desde el host; usa el proxy o comandos `docker compose exec` para diagnósticos internos.
+`/health/live` comprueba que el API responde. `/health/ready` comprueba dependencias, consumidores activos de las colas `transfers` y `control`, y un heartbeat de Beat actualizado en los últimos 60 segundos. `/health/notifications` señala por separado si hay un consumidor de correo; su falla no retira del balanceador la API de transferencias. La cola `notifications` tiene un worker aislado; los pendientes y fallos se inspeccionan en `/api/v1/notifications/outbox` como ADMIN. El frontend, la API, PostgreSQL y Redis no tienen puertos publicados para acceder desde el host; usa el proxy o comandos `docker compose exec` para diagnósticos internos.
 
 Antes de una actualización, respalda PostgreSQL y los secretos, conserva la misma `master_key`, revisa los cambios de `.env.example` y vuelve a construir las imágenes. Mantén al menos una copia segura y probada de la base de datos y de los archivos de `secrets/` fuera del servidor.
 
@@ -207,6 +215,7 @@ npm run build
 - [Contrato de API](docs/api/openapi-contracts.md)
 - [Especificación de infraestructura Docker](docs/specs/07-infrastructure-docker-spec.md)
 - [Especificación del motor de transferencias](docs/specs/04-transfers-engine-spec.md)
+- [Respaldos y recuperación con MEGA S4](docs/backup-recovery.md)
 - [Programación y cola de transferencias](docs/integrations/transfer-scheduling.md)
 - [Conexión y migración SMB/NAS](docs/integrations/smb-nas-setup.md)
 - [Compatibilidad de Seafile](docs/integrations/seafile-compatibility.md)

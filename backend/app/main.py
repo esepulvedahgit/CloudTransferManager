@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import uuid
@@ -44,6 +46,7 @@ from app.services.memory_store import (
     ConnectionInUseError,
     ConnectionRecord,
     ConnectionUnavailableError,
+    IdempotencyConflictError,
     MemoryStore,
     SMTPSettingsRecord,
     TransferRecord,
@@ -62,6 +65,8 @@ from app.services.smtp_config import (
 )
 from app.services.transfer_executor import TransferExecutor
 from app.settings import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -476,33 +481,43 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
     async def publish_transfer(record: TransferRecord) -> None:
         await app.state.store.asave_transfer(record)
         event = transfer_event(record)
-        await app.state.store.aadd_transfer_event(
-            record.id,
-            level="ERROR" if record.status == "FAILED" else "INFO",
-            event_type=record.status,
-            message=f"Estado de transferencia: {record.status}",
-            technical_details={
-                "progress_percent": record.progress_percent,
-                "files_completed": record.files_completed,
-                "files_total": record.files_total,
-                "bytes_transferred": record.bytes_transferred,
-                "bytes_total": record.bytes_total,
-                "average_speed_bps": record.average_speed_bps,
-                "current_speed_bps": record.current_speed_bps,
-                "attempt_count": record.attempt_count,
-                "error_count": record.error_count,
-            },
-            provider_error_code="TRANSFER_FAILED" if record.status == "FAILED" else None,
-        )
-        if app.state.event_bus:
-            await app.state.event_bus.publish_progress(str(record.id), event)
-        else:
-            await app.state.event_hub.publish(str(record.id), event)
+        try:
+            await app.state.store.aadd_transfer_event(
+                record.id,
+                level="ERROR" if record.status == "FAILED" else "INFO",
+                event_type=record.status,
+                message=f"Estado de transferencia: {record.status}",
+                technical_details={
+                    "progress_percent": record.progress_percent,
+                    "files_completed": record.files_completed,
+                    "files_total": record.files_total,
+                    "bytes_transferred": record.bytes_transferred,
+                    "bytes_total": record.bytes_total,
+                    "average_speed_bps": record.average_speed_bps,
+                    "current_speed_bps": record.current_speed_bps,
+                    "attempt_count": record.attempt_count,
+                    "error_count": record.error_count,
+                },
+                provider_error_code="TRANSFER_FAILED" if record.status == "FAILED" else None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Transfer event persistence failed",
+                extra={"transfer_id": str(record.id), "exception_type": type(exc).__name__},
+            )
+        try:
+            if app.state.event_bus:
+                await app.state.event_bus.publish_progress(str(record.id), event)
+            else:
+                await app.state.event_hub.publish(str(record.id), event)
+        except Exception as exc:
+            logger.warning(
+                "Transfer progress publication failed",
+                extra={"transfer_id": str(record.id), "exception_type": type(exc).__name__},
+            )
 
     async def cancel_requested(transfer_id: uuid.UUID) -> bool:
-        if app.state.event_bus:
-            return bool(await app.state.event_bus.cancellation_requested(str(transfer_id)))
-        return transfer_id in app.state.cancel_requests
+        return bool(await app.state.store.ais_transfer_cancel_requested(transfer_id))
 
     async def audit_request(
         request: Request,
@@ -561,8 +576,46 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 workers = await asyncio.to_thread(celery_app.control.ping, timeout=1)
                 if not workers:
                     raise RuntimeError("No Celery workers are available")
+                inspector = celery_app.control.inspect(timeout=1)
+                active_queues = (
+                    await asyncio.to_thread(inspector.active_queues) if inspector else None
+                )
+                available_queues = {
+                    str(queue.get("name"))
+                    for queues in (active_queues or {}).values()
+                    for queue in queues
+                    if isinstance(queue, dict) and queue.get("name")
+                }
+                if not {"transfers", "control"}.issubset(available_queues):
+                    raise RuntimeError("Required Celery queues have no active consumers")
+                if not await app.state.event_bus.beat_is_alive():
+                    raise RuntimeError("Celery Beat heartbeat is stale")
         except Exception as exc:
             raise HTTPException(status_code=503, detail="Dependencias no disponibles") from exc
+        return {"status": "ready"}
+
+    @app.get("/health/notifications")
+    async def notifications_health() -> dict[str, str]:
+        if config.app_env.lower() != "production":
+            return {"status": "not_required"}
+        try:
+            from app.worker import celery_app
+
+            inspector = celery_app.control.inspect(timeout=1)
+            active_queues = (
+                await asyncio.to_thread(inspector.active_queues) if inspector else None
+            )
+            notification_queue_ready = any(
+                isinstance(queue, dict) and queue.get("name") == "notifications"
+                for queues in (active_queues or {}).values()
+                for queue in queues
+            )
+            if not notification_queue_ready:
+                raise RuntimeError("Notification queue has no active consumer")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail="Servicio de notificaciones no disponible"
+            ) from exc
         return {"status": "ready"}
 
     @app.get("/api/v1/auth/csrf")
@@ -617,10 +670,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise invalid
         valid_password = app.state.password_service.verify(payload.password, user.password_hash)
         if not user.is_active or not valid_password:
-            user.failed_login_attempts += 1
-            if user.failed_login_attempts >= 5:
-                user.locked_until = now + timedelta(minutes=15)
-            await app.state.store.asave_user(user)
+            await app.state.store.arecord_login_failure(user.id, user.password_hash, now)
             await audit_request(
                 request,
                 actor_user_id=user.id,
@@ -630,10 +680,20 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 result="FAILURE",
             )
             raise invalid
-        user.failed_login_attempts = 0
-        user.locked_until = None
-        user.last_login_at = now
-        await app.state.store.asave_user(user)
+        updated_user = await app.state.store.arecord_login_success(
+            user.id, user.password_hash, now
+        )
+        if updated_user is None:
+            await audit_request(
+                request,
+                actor_user_id=user.id,
+                action="LOGIN",
+                resource_type="user",
+                resource_id=str(user.id),
+                result="FAILURE",
+            )
+            raise invalid
+        user = updated_user
         await audit_request(
             request,
             actor_user_id=user.id,
@@ -710,9 +770,16 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=400, detail="La contraseña actual no es válida")
         if payload.current_password == payload.new_password:
             raise HTTPException(status_code=422, detail="La nueva contraseña debe ser diferente")
-        user.password_hash = app.state.password_service.hash(payload.new_password)
-        user.must_change_password = False
-        await app.state.store.asave_user(user)
+        updated_user = await app.state.store.aupdate_user_password(
+            user.id,
+            app.state.password_service.hash(payload.new_password),
+            must_change_password=False,
+            expected_password_hash=user.password_hash,
+        )
+        if updated_user is None:
+            raise HTTPException(
+                status_code=409, detail="La contraseña cambió; inicia sesión nuevamente"
+            )
         await audit_request(
             request,
             actor_user_id=user.id,
@@ -788,18 +855,17 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         user_csrf: None = Depends(csrf_guard),
     ) -> dict[str, str]:
         del user_csrf
-        target = await app.state.store.aget_user(user_id)
+        if user_id == admin.id:
+            raise HTTPException(status_code=409, detail="No puedes desactivar tu propia cuenta")
+        target, blocked_last_admin = await app.state.store.aupdate_user_profile(
+            user_id, {"is_active": False}
+        )
+        if blocked_last_admin:
+            raise HTTPException(
+                status_code=409, detail="No se puede desactivar al último administrador"
+            )
         if target is None:
             raise HTTPException(status_code=404, detail="Usuario no encontrado")
-        if target.id == admin.id:
-            raise HTTPException(status_code=409, detail="No puedes desactivar tu propia cuenta")
-        if target.role == "ADMIN" and target.is_active:
-            if await app.state.store.acount_active_admins() <= 1:
-                raise HTTPException(
-                    status_code=409, detail="No se puede desactivar al último administrador"
-                )
-        target.is_active = False
-        await app.state.store.asave_user(target)
         await audit_request(
             request,
             actor_user_id=admin.id,
@@ -819,31 +885,29 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         user_csrf: None = Depends(csrf_guard),
     ) -> dict[str, Any]:
         del user_csrf
-        target = await app.state.store.aget_user(user_id)
-        if target is None:
-            raise HTTPException(status_code=404, detail="Usuario no encontrado")
         if not payload.model_fields_set:
             raise HTTPException(status_code=422, detail="No hay cambios para aplicar")
-        removing_admin = payload.is_active is False or payload.role == "USER"
-        if target.is_active and target.role == "ADMIN" and removing_admin:
-            if await app.state.store.acount_active_admins() <= 1:
-                raise HTTPException(
-                    status_code=409, detail="No se puede quitar al último administrador"
-                )
-        if target.id == admin.id and payload.is_active is False:
+        if admin.id == user_id and payload.is_active is False:
             raise HTTPException(status_code=409, detail="No puedes desactivar tu propia cuenta")
-        if payload.username is not None:
-            target.username = payload.username.strip().casefold()
-        if payload.email is not None:
-            target.email = payload.email.strip().casefold()
-        if payload.role is not None:
-            target.role = payload.role
-        if payload.is_active is not None:
-            target.is_active = payload.is_active
+        changes: dict[str, str | bool] = payload.model_dump(
+            exclude_unset=True, exclude_none=True
+        )
+        if "username" in changes:
+            changes["username"] = str(changes["username"]).strip().casefold()
+        if "email" in changes:
+            changes["email"] = str(changes["email"]).strip().casefold()
         try:
-            await app.state.store.asave_user(target)
+            target, blocked_last_admin = await app.state.store.aupdate_user_profile(
+                user_id, changes
+            )
         except (IntegrityError, ValueError) as exc:
             raise HTTPException(status_code=409, detail="El usuario o correo ya existe") from exc
+        if blocked_last_admin:
+            raise HTTPException(
+                status_code=409, detail="No se puede quitar al último administrador"
+            )
+        if target is None:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
         await audit_request(
             request,
             actor_user_id=admin.id,
@@ -871,14 +935,14 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         user_csrf: None = Depends(csrf_guard),
     ) -> dict[str, str]:
         del user_csrf
-        target = await app.state.store.aget_user(user_id)
+        target = await app.state.store.aupdate_user_password(
+            user_id,
+            app.state.password_service.hash(payload.password),
+            must_change_password=True,
+            reset_login_failures=True,
+        )
         if target is None:
             raise HTTPException(status_code=404, detail="Usuario no encontrado")
-        target.password_hash = app.state.password_service.hash(payload.password)
-        target.must_change_password = True
-        target.failed_login_attempts = 0
-        target.locked_until = None
-        await app.state.store.asave_user(target)
         await audit_request(
             request,
             actor_user_id=_admin.id,
@@ -1042,6 +1106,14 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
     ) -> dict[str, Any]:
         events = await app.state.store.alist_audit_events(limit)
         return {"items": events}
+
+    @app.get("/api/v1/notifications/outbox")
+    async def list_notification_outbox(
+        limit: int = Query(default=100, ge=1, le=200),
+        _admin: UserAccount = Depends(admin_user),
+    ) -> dict[str, Any]:
+        items = await app.state.store.alist_notification_outbox(limit)
+        return {"items": items}
 
     @app.get("/api/v1/connections")
     async def list_connections(user: UserAccount = Depends(current_user)) -> dict[str, Any]:
@@ -1579,6 +1651,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
     async def create_transfer(
         payload: TransferCreate,
         request: Request,
+        idempotency_key: uuid.UUID = Header(alias="Idempotency-Key"),
         user: UserAccount = Depends(current_user),
         user_csrf: None = Depends(csrf_guard),
     ) -> dict[str, Any]:
@@ -1589,6 +1662,36 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=422, detail="Política de conflicto no válida")
         if payload.source_connection_id == payload.destination_connection_id:
             raise HTTPException(status_code=422, detail="Origen y destino deben ser distintos")
+        try:
+            safe_paths = [MockStorageProvider.normalize_path(path) for path in payload.source_paths]
+            safe_destination = MockStorageProvider.normalize_path(payload.destination_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Ruta no válida") from exc
+        canonical_intent = payload.model_dump(mode="json")
+        canonical_intent["source_paths"] = safe_paths
+        canonical_intent["destination_path"] = safe_destination
+        request_hash = hashlib.sha256(
+            json.dumps(canonical_intent, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        try:
+            replay = await app.state.store.aget_transfer_by_idempotency(
+                user.id, idempotency_key, request_hash
+            )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="La clave de idempotencia ya se usó con otros datos.",
+            ) from exc
+        if replay is not None:
+            if config.app_env.lower() == "production":
+                try:
+                    from app.worker import dispatch_pending_transfers
+
+                    dispatch_pending_transfers.delay()
+                except Exception:
+                    pass
+            return cast(dict[str, Any], replay.public_dict())
+
         source = await app.state.store.aget_connection(payload.source_connection_id)
         destination = await app.state.store.aget_connection(payload.destination_connection_id)
         if source is None or destination is None:
@@ -1599,11 +1702,6 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             for connection_id in (source.id, destination.id):
                 if not await app.state.store.ahas_connection_access(user.id, connection_id):
                     raise HTTPException(status_code=404, detail="Conexión no encontrada")
-        try:
-            safe_paths = [MockStorageProvider.normalize_path(path) for path in payload.source_paths]
-            safe_destination = MockStorageProvider.normalize_path(payload.destination_path)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Ruta no válida") from exc
         try:
             if payload.depends_on_transfer_id is not None:
                 parent = await app.state.store.aget_transfer(payload.depends_on_transfer_id)
@@ -1623,31 +1721,44 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 payload.schedule_timezone,
                 payload.execution_mode,
                 payload.depends_on_transfer_id,
+                idempotency_key,
+                request_hash,
+                audit_event={
+                    "ip_address": request.client.host if request.client else None,
+                    "user_agent": request.headers.get("user-agent"),
+                    "metadata": {
+                        "operation": "COPY",
+                        "execution_mode": payload.execution_mode,
+                        "scheduled_at": (
+                            payload.scheduled_at.isoformat() if payload.scheduled_at else None
+                        ),
+                        "depends_on_transfer_id": (
+                            str(payload.depends_on_transfer_id)
+                            if payload.depends_on_transfer_id
+                            else None
+                        ),
+                    },
+                },
             )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="La clave de idempotencia ya se usó con otros datos.",
+            ) from exc
         except ConnectionUnavailableError as exc:
             if exc.reason == "inactive":
                 raise HTTPException(status_code=409, detail="Una conexión está inactiva") from exc
             raise HTTPException(status_code=404, detail="Conexión no encontrada") from exc
+        if record.idempotent_replay:
+            if config.app_env.lower() == "production":
+                try:
+                    from app.worker import dispatch_pending_transfers
+
+                    dispatch_pending_transfers.delay()
+                except Exception:
+                    pass
+            return cast(dict[str, Any], record.public_dict())
         await publish_transfer(record)
-        await audit_request(
-            request,
-            actor_user_id=user.id,
-            action="TRANSFER_CREATED",
-            resource_type="transfer",
-            resource_id=str(record.id),
-            result="SUCCESS",
-            metadata={
-                "public_id": record.public_id,
-                "operation": "COPY",
-                "execution_mode": record.execution_mode,
-                "scheduled_at": record.scheduled_at.isoformat() if record.scheduled_at else None,
-                "depends_on_transfer_id": (
-                    str(record.depends_on_transfer_id)
-                    if record.depends_on_transfer_id
-                    else None
-                ),
-            },
-        )
         if config.app_env.lower() == "production":
             try:
                 from app.worker import dispatch_pending_transfers
@@ -1767,13 +1878,14 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         user: UserAccount = Depends(current_user),
     ) -> dict[str, Any]:
         user_filter = None if user.role == "ADMIN" else user.id
-        records = await app.state.store.alist_transfers(
+        page_records, total_count = await app.state.store.alist_transfer_page(
             user_filter,
-            pending_only,
-            background_only,
-            exclude_background,
+            offset=offset,
+            limit=page_size,
+            pending_only=pending_only,
+            background_only=background_only,
+            exclude_background=exclude_background,
         )
-        page_records = records[offset : offset + page_size]
         summaries = await app.state.store.alist_transfer_manifest_summaries(
             [record.id for record in page_records]
         )
@@ -1787,7 +1899,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             items.append(item)
         return {
             "items": items,
-            "total_count": len(records),
+            "total_count": total_count,
         }
 
     @app.get("/api/v1/transfers/{transfer_id}")
@@ -1873,7 +1985,11 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=409, detail="La transferencia ya no se puede reanudar")
         record = cast(TransferRecord, resumed)
         if app.state.event_bus:
-            await app.state.event_bus.clear_cancel(str(transfer_id))
+            try:
+                await app.state.event_bus.clear_cancel(str(transfer_id))
+            except Exception:
+                # The database flag was cleared by resume; Redis is only a hint.
+                pass
         app.state.cancel_requests.discard(transfer_id)
         await publish_transfer(record)
         await audit_request(
@@ -2013,7 +2129,11 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=409, detail="La transferencia ya terminó")
         if needs_worker_signal:
             if app.state.event_bus:
-                await app.state.event_bus.request_cancel(str(transfer_id))
+                try:
+                    await app.state.event_bus.request_cancel(str(transfer_id))
+                except Exception:
+                    # PostgreSQL already contains the durable cancellation request.
+                    pass
             else:
                 app.state.cancel_requests.add(transfer_id)
         await publish_transfer(record)

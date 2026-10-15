@@ -327,7 +327,7 @@ async def test_archived_connection_cannot_be_used_by_connection_routes(tmp_path:
                 "source_paths": ["/Proyectos/informe.pdf"],
                 "destination_path": "/Backup",
             },
-            headers=client.headers,
+            headers={**client.headers, "Idempotency-Key": str(uuid.uuid4())},
         )
 
     assert [

@@ -258,6 +258,11 @@ class MegaCmdRunner:
             wait_task = asyncio.create_task(process.wait())
             started_at = time.monotonic()
             while not (wait_task.done() and all(task.done() for task in reader_tasks)):
+                for task in reader_tasks:
+                    if task.done() and not task.cancelled():
+                        reader_error = task.exception()
+                        if reader_error is not None:
+                            raise reader_error
                 if should_cancel is not None and await should_cancel():
                     await self._terminate(process, wait_task)
                     raise MegaCmdCancelledError("La operación MEGAcmd fue cancelada")

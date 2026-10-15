@@ -44,3 +44,14 @@ async def test_redis_event_bus_publishes_progress_and_tracks_cooperative_cancell
     assert await bus.cancellation_requested("transfer-id") is True
     await bus.clear_cancel("transfer-id")
     assert await bus.cancellation_requested("transfer-id") is False
+
+
+@pytest.mark.asyncio
+async def test_beat_heartbeat_expires_when_periodic_control_work_stops():
+    client = FakeRedis()
+    bus = RedisEventBus(client)
+
+    assert await bus.beat_is_alive() is False
+    await bus.record_beat_heartbeat()
+    assert await bus.beat_is_alive() is True
+    assert client.keys["ctm:health:beat-heartbeat"] == ("1", 60)

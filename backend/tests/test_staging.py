@@ -1,12 +1,17 @@
 import asyncio
+import os
 import shutil
+import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from app.services.staging import temporary_staging_area
+from app.services.staging import (
+    cleanup_orphaned_transfer_staging_areas,
+    temporary_staging_area,
+)
 
 
 @pytest.mark.asyncio
@@ -135,3 +140,38 @@ async def test_staging_cleanup_failure_is_not_suppressed(tmp_path: Path, monkeyp
     assert created_area is not None and created_area.exists()
     monkeypatch.setattr("app.services.staging.shutil.rmtree", real_rmtree)
     real_rmtree(created_area)
+
+
+def test_orphan_staging_cleanup_only_removes_old_inactive_transfer_areas(tmp_path: Path):
+    active_id = uuid.uuid4()
+    orphan_id = uuid.uuid4()
+    young_id = uuid.uuid4()
+    active = tmp_path / f"transfer-{active_id.hex}-active"
+    orphan = tmp_path / f"transfer-{orphan_id.hex}-orphan"
+    young = tmp_path / f"transfer-{young_id.hex}-young"
+    megacmd_home = tmp_path / f"megacmd-{uuid.uuid4().hex[:12]}-home"
+    malformed = tmp_path / "transfer-not-a-uuid-or-file"
+    for path in (active, orphan, young, megacmd_home, malformed):
+        path.mkdir()
+
+    old_time = time.time() - 3600
+    os.utime(orphan, (old_time, old_time))
+    external = tmp_path.parent / f"outside-{uuid.uuid4().hex}"
+    external.mkdir()
+    symlinked = tmp_path / f"transfer-{uuid.uuid4().hex}-symlink"
+    symlinked.symlink_to(external, target_is_directory=True)
+
+    removed = cleanup_orphaned_transfer_staging_areas(
+        tmp_path,
+        active_transfer_ids={active_id},
+        minimum_age_seconds=600,
+    )
+
+    assert removed == 1
+    assert active.is_dir()
+    assert not orphan.exists()
+    assert young.is_dir()
+    assert megacmd_home.is_dir()
+    assert malformed.is_dir()
+    assert symlinked.is_symlink()
+    assert external.is_dir()

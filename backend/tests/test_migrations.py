@@ -18,6 +18,11 @@ def test_migration_chain_matches_current_schema_and_downgrades(tmp_path):
         for path in sorted(migration_dir.glob("*.py"))
         if path.name != "__init__.py"
     ]
+    scheduling_index = next(
+        index
+        for index, migration in enumerate(migrations)
+        if migration["revision"] == "20261013_0008"
+    )
     engine = create_engine(f"sqlite:///{tmp_path / 'migration.sqlite'}")
 
     with engine.begin() as connection:
@@ -47,14 +52,14 @@ def test_migration_chain_matches_current_schema_and_downgrades(tmp_path):
             )
         )
         with Operations.context(MigrationContext.configure(connection)):
-            migrations[-1]["downgrade"]()
-            migrations[-2]["downgrade"]()
+            for migration in reversed(migrations[scheduling_index:]):
+                migration["downgrade"]()
         assert connection.scalar(
             select(TransferJob.status).where(TransferJob.id == scheduled_transfer_id)
         ) == "QUEUED"
 
         with Operations.context(MigrationContext.configure(connection)):
-            for migration in reversed(migrations[:-2]):
+            for migration in reversed(migrations[:scheduling_index]):
                 migration["downgrade"]()
 
         assert inspect(connection).get_table_names() == []

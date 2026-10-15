@@ -46,7 +46,7 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Controller, useForm } from 'react-hook-form';
 import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { z } from 'zod';
@@ -144,6 +144,23 @@ function isProgrammedBackgroundTransfer(transfer: Transfer): boolean {
     || transfer.execution_mode === 'EXCLUSIVE'
     || transfer.depends_on_transfer_id,
   );
+}
+
+function mergeTransferState(current: Transfer, incoming: Transfer): Transfer {
+  const currentAttempt = current.attempt_count ?? 1;
+  const incomingAttempt = incoming.attempt_count ?? 1;
+  if (incomingAttempt < currentAttempt) return current;
+  if (incomingAttempt > currentAttempt) return incoming;
+  const currentIsTerminal = terminalTransferStatuses.includes(current.status);
+  const incomingIsTerminal = terminalTransferStatuses.includes(incoming.status);
+  if (currentIsTerminal && !incomingIsTerminal) return current;
+  if (currentIsTerminal && incomingIsTerminal) return current;
+  if (
+    incoming.progress_percent < current.progress_percent
+    || incoming.files_completed < current.files_completed
+    || incoming.bytes_transferred < current.bytes_transferred
+  ) return current;
+  return incoming;
 }
 type LoginForm = { username_or_email: string; password: string };
 type ConnectionForm = {
@@ -1723,6 +1740,19 @@ function TransferWorkspace({
   onUserUpdated: (patch: Partial<User>) => void;
 }) {
   const queryClient = useQueryClient();
+  const pendingTransferKeys = useRef(new Map<string, string>());
+  const createTransfer = async (payload: Record<string, unknown>) => {
+    const fingerprint = JSON.stringify(payload);
+    const key = pendingTransferKeys.current.get(fingerprint) ?? crypto.randomUUID();
+    pendingTransferKeys.current.set(fingerprint, key);
+    const transfer = await apiRequest<Transfer>('/api/v1/transfers', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': key },
+      body: fingerprint,
+    });
+    pendingTransferKeys.current.delete(fingerprint);
+    return transfer;
+  };
   const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections' | 'private' | 'scheduled' | 'documentation'>('explorer');
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
@@ -1833,8 +1863,10 @@ function TransferWorkspace({
   const historyTransfers = (transfersQuery.data?.items ?? [])
     .filter((transfer) => !isProgrammedBackgroundTransfer(transfer))
     .map((transfer) => (
-    visibleActiveTransfer?.id === transfer.id ? { ...transfer, ...visibleActiveTransfer } : transfer
-  ));
+      visibleActiveTransfer?.id === transfer.id
+        ? mergeTransferState(transfer, visibleActiveTransfer)
+        : transfer
+    ));
   if (visibleActiveTransfer && !historyTransfers.some((transfer) => transfer.id === visibleActiveTransfer.id)) {
     historyTransfers.unshift(visibleActiveTransfer);
   }
@@ -1884,10 +1916,11 @@ function TransferWorkspace({
   }, [activeTransfer, latestTransfer]);
 
   useEffect(() => {
-    if (!activeTransfer || activeTransfer.status !== 'FAILED') return;
+    if (!activeTransfer) return;
     const refreshed = transfersQuery.data?.items.find((transfer) => transfer.id === activeTransfer.id);
-    if (refreshed && successfulTransferStatuses.includes(refreshed.status)) {
-      setActiveTransfer(refreshed);
+    if (refreshed) {
+      const merged = mergeTransferState(activeTransfer, refreshed);
+      if (merged !== activeTransfer) setActiveTransfer(merged);
     }
   }, [activeTransfer?.id, activeTransfer?.status, transfersQuery.data]);
 
@@ -1925,7 +1958,7 @@ function TransferWorkspace({
         items: existingTransfer
           ? items.map((transfer) => (
             transfer.id === terminalTransfer.id
-              ? { ...transfer, ...terminalTransfer }
+              ? mergeTransferState(transfer, terminalTransfer)
               : transfer
           ))
           : [terminalTransfer, ...items],
@@ -2009,7 +2042,9 @@ function TransferWorkspace({
         const update = JSON.parse(event.data) as Transfer;
         const isBackground = backgroundTransferIds.has(update.id) || isProgrammedBackgroundTransfer(update);
         if (!isBackground) {
-          setActiveTransfer((current) => current?.id === update.id ? update : current);
+          setActiveTransfer((current) => (
+            current?.id === update.id ? mergeTransferState(current, update) : current
+          ));
         }
         const targetQueryKey = isBackground && !terminalTransferStatuses.includes(update.status)
           ? ['background-transfers']
@@ -2020,7 +2055,9 @@ function TransferWorkspace({
           return {
             ...(current ?? { items: [], total_count: 0 }),
             items: found
-              ? items.map((item) => item.id === update.id ? { ...item, ...update } : item)
+              ? items.map((item) => (
+                item.id === update.id ? mergeTransferState(item, update) : item
+              ))
               : [update, ...items],
             total_count: found ? current?.total_count ?? items.length : (current?.total_count ?? items.length) + 1,
           };
@@ -2032,7 +2069,9 @@ function TransferWorkspace({
               ...current,
               pages: current.pages.map((page) => ({
                 ...page,
-                items: page.items.map((item) => item.id === update.id ? { ...item, ...update } : item),
+                items: page.items.map((item) => (
+                  item.id === update.id ? mergeTransferState(item, update) : item
+                )),
               })),
             }),
           );
@@ -2108,9 +2147,7 @@ function TransferWorkspace({
           method: 'PATCH',
           body: JSON.stringify(scheduling),
         })
-        : await apiRequest<Transfer>('/api/v1/transfers', {
-          method: 'POST',
-          body: JSON.stringify({
+        : await createTransfer({
             source_connection_id: sourceId,
             destination_connection_id: destinationId,
             source_paths: selectedPaths,
@@ -2119,7 +2156,6 @@ function TransferWorkspace({
             conflict_policy: conflictPolicy,
             send_email_notification: sendEmailNotification,
             ...scheduling,
-          }),
         });
       setActiveTransfer((current) => (
         isProgrammedBackgroundTransfer(transfer)
@@ -2148,9 +2184,7 @@ function TransferWorkspace({
     setNotice('');
     setTransferFailure(null);
     try {
-      const transfer = await apiRequest<Transfer>('/api/v1/transfers', {
-        method: 'POST',
-        body: JSON.stringify({
+      const transfer = await createTransfer({
           source_connection_id: sourceId,
           destination_connection_id: destinationId,
           source_paths: selectedPaths,
@@ -2158,7 +2192,6 @@ function TransferWorkspace({
           operation: 'COPY',
           conflict_policy: conflictPolicy,
           send_email_notification: sendEmailNotification,
-        }),
       });
       setActiveTransfer(transfer);
       setSelectedPaths([]);
@@ -2619,9 +2652,31 @@ function TransferWorkspace({
         ) : (
           <>
             {connectionsQuery.isError && <Alert severity="error" sx={{ mb: 2 }}>No se pudieron cargar las conexiones.</Alert>}
-            {connections.length < 2 && (
+            {!connectionsQuery.isLoading && !connectionsQuery.isError && connections.length === 0 && (
+              <Alert
+                severity="info"
+                sx={{ mb: 2 }}
+                action={user.role === 'ADMIN' ? (
+                  <Button
+                    color="inherit"
+                    size="small"
+                    onClick={() => {
+                      setConnectionDialogProvider('MEGA');
+                      setConnectionDialogOpen(true);
+                    }}
+                  >
+                    Crear primera conexión
+                  </Button>
+                ) : undefined}
+              >
+                {user.role === 'ADMIN'
+                  ? 'Aún no hay conexiones. Crea tu primera conexión para empezar a explorar y transferir archivos.'
+                  : 'Aún no tienes conexiones asignadas. Pide a un administrador que te comparta una conexión.'}
+              </Alert>
+            )}
+            {!connectionsQuery.isLoading && !connectionsQuery.isError && connections.length === 1 && (
               <Alert severity="info" sx={{ mb: 2 }}>
-                Se necesitan dos conexiones autorizadas para comenzar. Un administrador puede configurar MEGA, Google Drive o un adaptador simulado.
+                Se necesita otra conexión autorizada para comenzar. Un administrador puede configurar MEGA, Google Drive o un adaptador simulado.
               </Alert>
             )}
 
