@@ -223,7 +223,7 @@ class TransferCreate(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def validate_source_item_ids(self) -> TransferCreate:
+    def validate_source_item_ids(self) -> "TransferCreate":
         for values in (self.source_item_ids, self.source_parent_ids):
             if values is None:
                 continue
