@@ -36,7 +36,10 @@ def transfer_requires_staging(
     destination_provider: str,
     source_adapter: str = "RCLONE",
     destination_adapter: str = "RCLONE",
+    conflict_policy: str = "KEEP_BOTH",
 ) -> bool:
+    if conflict_policy == "KEEP_BOTH":
+        return True
     return (
         source_provider in {"SMB", "MEGA"}
         or destination_provider == "MEGA"

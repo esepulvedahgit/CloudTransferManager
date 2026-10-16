@@ -133,6 +133,14 @@ async def test_runner_rejects_unapproved_actions_and_control_characters(tmp_path
         await runner.run("put", ["/tmp/file"], home=tmp_path / "home")
 
 
+def test_runner_keeps_valid_mega_handle_as_a_node_reference(tmp_path: Path):
+    runner = _runner_type()(str(tmp_path))
+
+    command = runner._build_command("get", ["H:AbCd1234", str(tmp_path)])
+
+    assert command[-2] == "H:AbCd1234"
+
+
 @pytest.mark.asyncio
 async def test_runner_rejects_symlink_components_in_isolated_home(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

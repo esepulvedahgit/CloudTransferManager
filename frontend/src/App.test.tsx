@@ -106,7 +106,7 @@ describe('Cloud Transfer Manager', () => {
       destination_connection_id: 'destination',
       source_paths: ['/report.csv'],
       destination_path: '/',
-      conflict_policy: 'OVERWRITE_IF_DIFFERENT',
+      conflict_policy: 'KEEP_BOTH',
       send_email_notification: false,
       created_at: '2026-10-11T10:15:00.000Z',
       started_at: '2026-10-11T10:15:10.000Z',
@@ -1095,7 +1095,7 @@ describe('Cloud Transfer Manager', () => {
     expect(within(summary).getByText('Drive de operaciones')).toBeVisible();
     expect(within(summary).getByText('MEGA de respaldo')).toBeVisible();
     expect(within(summary).getByText('Carpeta raíz')).toBeVisible();
-    expect(within(summary).getByRole('combobox', { name: 'Si ya existe' })).toBeVisible();
+    expect(within(summary).getByText('Conservar ambos · numerar la copia')).toBeVisible();
     expect(within(summary).getByText('Avisarme por correo al terminar')).toBeVisible();
   });
 
@@ -1165,7 +1165,7 @@ describe('Cloud Transfer Manager', () => {
         destination_connection_id: 'destination',
         source_paths: ['/origen.txt'],
         destination_path: '/',
-        conflict_policy: 'OVERWRITE_IF_DIFFERENT',
+        conflict_policy: 'KEEP_BOTH',
         send_email_notification: false,
       };
       let completedTransfer: typeof transfer | null = null;
@@ -1282,7 +1282,7 @@ describe('Cloud Transfer Manager', () => {
       destination_connection_id: 'destination',
       source_paths: ['/origen.txt'],
       destination_path: '/',
-      conflict_policy: 'OVERWRITE_IF_DIFFERENT',
+      conflict_policy: 'KEEP_BOTH',
       send_email_notification: false,
     };
     let latestTransfer: typeof transfer | null = null;

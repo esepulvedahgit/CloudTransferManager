@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import stat
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -147,13 +148,22 @@ class MegaCmdRunner:
             self._validate_token(value)
 
         if action == "ls":
-            if len(values) != 3 or values[0] != "-l" or values[1] != self._ls_time_format:
+            legacy_listing = (
+                len(values) == 3 and values[:2] == ["-l", self._ls_time_format]
+            )
+            handle_listing = (
+                len(values) == 4
+                and values[:3] == ["-l", "--show-handles", self._ls_time_format]
+            )
+            if not legacy_listing and not handle_listing:
                 raise ValueError("Invalid MEGAcmd arguments for ls")
-            values[2] = self._normalize_remote_path(values[2])
+            if not re.fullmatch(r"H:[A-Za-z0-9_-]{8}", values[-1]):
+                values[-1] = self._normalize_remote_path(values[-1])
         elif action == "get":
             if len(values) != 2:
                 raise ValueError("Invalid MEGAcmd arguments for get")
-            values[0] = self._normalize_remote_path(values[0])
+            if not re.fullmatch(r"H:[A-Za-z0-9_-]{8}", values[0]):
+                values[0] = self._normalize_remote_path(values[0])
             values[1] = self._absolute_local_path(values[1])
         elif action == "put":
             if len(values) != 3 or values[0] != "-c":

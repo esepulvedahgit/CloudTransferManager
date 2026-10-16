@@ -1,6 +1,6 @@
 # Estado de implementación
 
-**Revisión del repositorio: 2026-10-14.** Este documento resume lo que existe en el código y separa esa evidencia de la validación que depende de CI, credenciales o redes de una instalación.
+**Revisión del repositorio: 2026-10-16.** Este documento resume lo que existe en el código y separa esa evidencia de la validación que depende de CI, credenciales o redes de una instalación.
 
 ## Estado por área
 
@@ -10,7 +10,7 @@
 | Conexiones y credenciales | Implementado | Administración, asignación privada, OAuth de Google, cifrado AES-GCM y respuestas públicas sin credenciales. El archivado es lógico y rechaza conexiones con trabajos activos. Véanse `backend/app/main.py`, `backend/app/security/credentials.py` y las migraciones. |
 | Proveedores | Implementado con validación externa | MEGA usa MEGAcmd; Google Drive usa Rclone/OAuth; Seafile ofrece adaptadores Rclone o API explícito; la UI usa SMB/NAS como origen; Nextcloud usa Rclone WebDAV con URL y credenciales administradas por conexión. Cada instalación necesita sus credenciales, permisos y rutas de red. La compatibilidad de Seafile API se acota inicialmente a CE 13.x. Nextcloud requiere prueba real por instalación antes de activarlo. |
 | Explorador | Implementado | Navegación, búsqueda, selección múltiple y destino por carpeta existente; paneles coordinados en escritorio y pasos separados en pantallas estrechas. No hay creación manual de carpetas desde la UI. Véanse `frontend/src/App.tsx` y `docs/specs/03-file-explorer-spec.md`. |
-| Transferencias | Implementado | Operación `COPY`, ejecución de fondo, límites, cancelación durable consultada desde PostgreSQL, reintentos clasificados, staging por archivo, verificación y diagnóstico sanitizado. La creación acepta `Idempotency-Key` por usuario; historial y conteo se paginan en SQL. Drive → Nextcloud verifica por archivo; SMB reconcilia resultados ambiguos mediante SHA-256 cuando puede leer ambos lados y deja el caso sin demostrar como pendiente de revisión. La reanudación por manifiesto está disponible para SMB; no es una capacidad general de todos los adaptadores. |
+| Transferencias | Implementado en código; migración y validación pendientes | Las transferencias nuevas usan `KEEP_BOTH` global, inventario por identidad, asignación de nombres `_01`, `_02`, manifiesto común y staging por archivo. Rclone no reemplaza objetos existentes; Seafile API solicita `replace=false`; los resultados de escritura ambiguos solo se aceptan tras reconciliar SHA-256. La reanudación manual se amplía a trabajos nuevos con manifiesto. La migración `20261016_0012` aún no está aplicada y no se han validado estas rutas contra servicios reales. |
 | Programaciones | Implementado | Ejecuciones futuras de una sola vez, zonas IANA, modos `AUTO`/`EXCLUSIVE`, dependencias y despacho durable vía PostgreSQL, Celery Beat y `control-worker`. No hay recurrencia. Detalle en `docs/integrations/transfer-scheduling.md`. |
 | Progreso e historial | Implementado | SSE sobre Redis en despliegue, reconciliación monotónica entre SSE, polling e historial, paginación SQL y resultados por archivo para manifiestos SMB. Véanse `docs/specs/05-realtime-telemetry-spec.md` y el contrato API. |
 | Auditoría y SMTP | Implementado con límite por confirmar | Registro de eventos, sanitización, configuración/prueba SMTP desde Administración, secretos SMTP cifrados y outbox transaccional por intento terminal. La creación de transferencias y su evento de auditoría comparten transacción; el envío usa worker/cola aislados, tokens de despacho y de intento, reintentos durables y vista ADMIN de estados sin correo del destinatario. `/health/notifications` vigila el worker sin degradar readiness de copias. SMTP no garantiza exactamente una entrega si el proceso cae tras la aceptación remota. La aplicación escribe auditoría append-only, pero su inmutabilidad no está impuesta por trigger/permisos de PostgreSQL. |
@@ -25,6 +25,7 @@
 - Administración de conexiones privadas y archivado lógico sin borrar referencias históricas.
 - Configuración SMTP desde Administración y menú de cuenta que agrupa administración, cambio de contraseña y cierre de sesión.
 - CI de backend/frontend y análisis Trivy de repositorio, configuración e imágenes.
+- Conservación y numeración de nombres ocupados en las transferencias nuevas de todos los proveedores reales admitidos; el contenido igual también recibe un nombre numerado. Mock sigue simulando progreso sin modelar escrituras.
 
 ## Remediación de resiliencia (2026-10-14)
 

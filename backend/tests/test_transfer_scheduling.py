@@ -151,8 +151,9 @@ def test_staging_transfer_waits_for_the_single_staging_slot():
     assert transfer_requires_staging("SMB", "GOOGLE_DRIVE")
     assert transfer_requires_staging("GOOGLE_DRIVE", "MEGA")
     assert transfer_requires_staging("GOOGLE_DRIVE", "SEAFILE", "RCLONE", "SEAFILE_API")
-    assert not transfer_requires_staging("GOOGLE_DRIVE", "SEAFILE")
-    assert not transfer_requires_staging("GOOGLE_DRIVE", "NEXTCLOUD")
+    assert transfer_requires_staging("GOOGLE_DRIVE", "SEAFILE")
+    assert transfer_requires_staging("GOOGLE_DRIVE", "NEXTCLOUD")
+    assert not transfer_requires_staging("GOOGLE_DRIVE", "NEXTCLOUD", conflict_policy="SKIP")
     assert admission_wait_reason(
         source_connection_id="drive-b",
         destination_connection_id="drive-c",
@@ -188,6 +189,7 @@ async def test_database_dispatcher_admits_parallel_jobs_and_holds_an_exclusive_b
                 connections[index * 2 + 1].id,
                 ["/source"],
                 "/destination",
+                conflict_policy="SKIP",
                 execution_mode=mode,
             )
         )
@@ -198,6 +200,7 @@ async def test_database_dispatcher_admits_parallel_jobs_and_holds_an_exclusive_b
         connections[1].id,
         ["/later"],
         "/destination",
+        conflict_policy="SKIP",
         scheduled_at=scheduled_at,
         schedule_timezone="America/Santiago",
     )

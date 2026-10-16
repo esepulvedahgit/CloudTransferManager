@@ -1286,6 +1286,52 @@ async def test_transfer_failure_records_sanitized_correlated_diagnostics(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_inventory_keeps_distinct_source_objects_with_the_same_path(tmp_path):
+    store = MemoryStore()
+
+    async def publish(record):
+        await store.asave_transfer(record)
+
+    async def never_cancel():
+        return False
+
+    class DuplicateNameProvider:
+        async def get_item(self, path, object_id=None):
+            return _item(path, is_dir=True, provider="MEGA")
+
+        async def list_items(self, path, cursor=None, page_size=200, **kwargs):
+            return PaginatedItems(
+                items=[
+                    StorageItem(
+                        name="History API.mp4",
+                        path="/folder/History API.mp4",
+                        is_dir=False,
+                        size_bytes=28,
+                        provider_type="MEGA",
+                        object_id="H:First123",
+                    ),
+                    StorageItem(
+                        name="History API.mp4",
+                        path="/folder/History API.mp4",
+                        is_dir=False,
+                        size_bytes=29,
+                        provider_type="MEGA",
+                        object_id="H:Second12",
+                    ),
+                ],
+                next_cursor=None,
+                total_count=2,
+            )
+
+    executor = TransferExecutor(Settings(), store, publish, never_cancel)
+    files, _directories = await executor._collect_files(
+        DuplicateNameProvider(), ["/folder"], include_selected_folder=True
+    )
+
+    assert [item.object_id for item, _relative in files] == ["H:First123", "H:Second12"]
+
+
+@pytest.mark.asyncio
 async def test_failure_diagnostic_has_safe_stage_file_and_attempt_context(tmp_path):
     store = MemoryStore()
     requester = store.add_user("operator", "operator@example.test", "hash")
@@ -1424,3 +1470,27 @@ async def test_transfer_progress_does_not_exceed_source_size(tmp_path):
     assert transfer.status == "COMPLETED"
     assert transfer.bytes_total == 4
     assert transfer.bytes_transferred == 4
+
+
+@pytest.mark.asyncio
+async def test_keep_both_transfer_versions_an_existing_destination_name(tmp_path):
+    executor, transfer, providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="SEAFILE",
+        source_items=[_item("/source.txt", size=4, provider="GOOGLE_DRIVE")],
+        destination_items=[_item("/backup/source.txt", size=4, provider="SEAFILE")],
+        source_paths=["/source.txt"],
+    )
+
+    await executor.execute(transfer.id)
+
+    assert "/backup/source_01.txt" in providers[transfer.destination_connection_id].items
+    assert runner.uploaded[0][0].name == "source_01.txt"
+    assert transfer.status == "COMPLETED_WITH_WARNINGS"
+    manifest = await store.alist_transfer_manifest_items(
+        transfer.id, statuses={"COPIED"}
+    )
+    assert manifest[0].requested_destination_path == "/backup/source.txt"
+    assert manifest[0].destination_path == "/backup/source_01.txt"
+    assert manifest[0].rename_reason == "NAME_CONFLICT"

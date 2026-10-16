@@ -241,7 +241,7 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 ## 5. Explorador (`/connections/{id}/items`)
 
 ### `GET /api/v1/connections/{connection_id}/items`
-- **Query Params:** `path=/`, `cursor=`, `page_size=50`, `sort=name`, `direction=asc`, `search=`
+- **Query Params:** `path=/`, `parent_object_id=`, `cursor=`, `page_size=50`, `sort=name`, `direction=asc`, `search=`. Envía `parent_object_id` cuando el proveedor expone IDs y se explora una carpeta homónima.
 - **Response `200 OK`:**
 ```json
 {
@@ -252,7 +252,9 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
       "is_dir": true,
       "size_bytes": null,
       "modified_at": "2026-10-01T12:00:00Z",
-      "provider_type": "MEGA"
+      "provider_type": "MEGA",
+      "object_id": "H:AbCd1234",
+      "parent_object_id": "H:Root1234"
     },
     {
       "name": "database.sql.gz",
@@ -274,8 +276,9 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 
 ### `POST /api/v1/transfers`
 - Requiere `Idempotency-Key` con un UUID nuevo por intención de copia. Repetir la clave con el mismo usuario y los mismos datos devuelve la transferencia existente; usarla con datos distintos responde `409 Conflict`.
-- Acepta hasta 100 rutas de origen y responde `201 Created` al registrar y agendar el trabajo. La existencia de cada ruta se valida en el worker para que una consulta lenta del proveedor no bloquee la solicitud HTTP.
-- La interfaz solo ofrece conexiones SMB como origen y filtra SMB del selector de destino. El endpoint no impone actualmente esa restricción por tipo de proveedor.
+- Acepta hasta 100 rutas de origen y responde `201 Created` al registrar y agendar el trabajo. La existencia de cada ruta se valida en el worker para que una consulta lenta del proveedor no bloquee la solicitud HTTP. `source_item_ids` y `source_parent_ids` son listas opcionales, alineadas con `source_paths`, para conservar identidad en proveedores con nombres duplicados.
+- En solicitudes nuevas, `conflict_policy` es siempre `KEEP_BOTH` (también es el valor predeterminado si se omite). `SKIP` y `OVERWRITE_IF_DIFFERENT` explícitos se rechazan con `422`. Los trabajos históricos mantienen su política almacenada.
+- SMB solo se admite como origen de migración; el API rechaza una conexión SMB como destino con `422`.
 - `scheduled_at` opcional acepta una fecha futura con offset; el servidor la normaliza a UTC. `schedule_timezone` debe ser una zona IANA y conserva la zona mostrada en la interfaz. Si no se envía `scheduled_at`, el trabajo queda en la cola normal.
 - `execution_mode` opcional admite `AUTO` (predeterminado) o `EXCLUSIVE`. `depends_on_transfer_id` es opcional y solo libera el trabajo cuando el padre finaliza correctamente, incluso con advertencias.
 - El worker aplica `TRANSFER_MAX_FILES` (predeterminado 5000), el límite opcional `TRANSFER_MAX_FILE_BYTES` (0 = sin límite fijo) y la reserva de staging antes de escribir en destino. Si el preflight falla, la transferencia pasa a `FAILED`; el usuario puede ver el mensaje seguro en `/api/v1/transfers/{transfer_id}/events`.
@@ -287,9 +290,11 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
   "source_paths": [
     "/Backups/database.sql.gz"
   ],
+  "source_item_ids": ["H:AbCd1234"],
+  "source_parent_ids": ["H:Root1234"],
   "destination_path": "/Migraciones/Octubre",
   "operation": "COPY",
-  "conflict_policy": "OVERWRITE_IF_DIFFERENT",
+  "conflict_policy": "KEEP_BOTH",
   "send_email_notification": true,
   "scheduled_at": "2026-11-20T18:45:00-03:00",
   "schedule_timezone": "America/Santiago",
@@ -337,12 +342,12 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 - Devuelve eventos auditables con categorías de error y detalles técnicos sanitizados; solo el solicitante o ADMIN puede consultarlos.
 
 ### `GET /api/v1/transfers/{transfer_id}/items`
-- Devuelve una página del manifiesto (entradas de directorio y estados `PENDING`, `COPIED`, `SKIPPED` o `FAILED`).
+- Devuelve una página del manifiesto común (entradas de directorio y estados `PENDING`, `COPIED`, `SKIPPED` o `FAILED`). Las filas incluyen identidad de origen, `requested_destination_path`, `destination_path` asignada y `rename_reason` cuando aplica.
 - Acepta `after_id` como cursor y `limit` de 1 a 200; la respuesta incluye `next_cursor` y los conteos agregados.
 
 ### `POST /api/v1/transfers/{transfer_id}/resume`
-- Disponible para transferencias SMB en estado `FAILED` o `CANCELLED` cuando el manifiesto conserva archivos pendientes/fallidos y ambas conexiones siguen activas.
-- Requiere que las versiones de credenciales y la raíz SMB coincidan con las capturadas por el trabajo. Responde `202 Accepted`; no reanuda transferencias de otros proveedores.
+- Disponible para transferencias nuevas `KEEP_BOTH` y para trabajos SMB históricos en estado `FAILED` o `CANCELLED`, cuando el manifiesto conserva archivos pendientes/fallidos y ambas conexiones siguen activas.
+- Requiere las mismas versiones de credenciales capturadas por el trabajo y, para SMB, la misma raíz del NAS. Reutiliza los nombres ya asignados y responde `202 Accepted`. Las escrituras ambiguas se verifican por SHA-256 o se detienen para evitar duplicar.
 
 ### `POST /api/v1/transfers/{transfer_id}/cancel`
 - Para una transferencia pendiente sin reserva, la cancela de inmediato. Si ya fue admitida, envía la orden al worker y pasa a `CANCELLING`.

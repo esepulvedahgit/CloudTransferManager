@@ -16,7 +16,7 @@ Proporcionar una experiencia visual intuitiva y ágil para explorar sistemas de 
 En pantallas estrechas, el flujo muestra el origen y el destino como pasos separados:
 1. **Paso 1:** Seleccionar conexión de origen y navegar para seleccionar elementos.
 2. **Paso 2:** Seleccionar conexión de destino y seleccionar la carpeta de destino.
-3. La política de conflicto (`SKIP` o `OVERWRITE_IF_DIFFERENT`) y la notificación por correo se configuran en el resumen de la transferencia antes de confirmarla.
+3. Las transferencias nuevas conservan ambos objetos: si el nombre ya existe en destino, la copia se numera (`_01`, `_02`, etc.), incluso cuando el contenido coincide. Esta regla es fija y se informa en el resumen. La notificación por correo se configura antes de confirmar.
 
 ---
 
@@ -29,6 +29,7 @@ Cada elemento listado debe contener:
 - `size_bytes`: Tamaño en bytes (o `null` para directorios o si el proveedor no lo expone).
 - `modified_at`: Fecha ISO-8601 (o `null` en proveedores como MEGA que no siempre la entregan).
 - `mime_type`: Tipo detectado.
+- `object_id` y `parent_object_id`: identidad estable y carpeta padre cuando el proveedor la expone; permiten explorar y seleccionar objetos homónimos por separado.
 
 ### Reglas disponibles:
 - Formateo amigable de tamaño (ej. `14.2 MB`, `1.05 GB`).
@@ -41,7 +42,7 @@ Cada elemento listado debe contener:
 ## 4. Endpoints de la API
 
 ```http
-GET /api/v1/connections/{connection_id}/items?path=/&cursor=&page_size=50&sort=name&direction=asc&search=
+GET /api/v1/connections/{connection_id}/items?path=/&parent_object_id=&cursor=&page_size=50&sort=name&direction=asc&search=
 ```
 
 No existe actualmente un endpoint de metadatos individuales ni de creación manual de carpetas. El contrato de API mantenido está en [`docs/api/openapi-contracts.md`](../api/openapi-contracts.md).

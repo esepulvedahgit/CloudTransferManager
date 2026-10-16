@@ -14,7 +14,11 @@ from app.providers.base import StorageItem
 from app.providers.megacmd import MegaCmdProvider
 from app.providers.mock import MockStorageProvider
 from app.providers.nextcloud import NextcloudRcloneProvider
-from app.providers.rclone import RcloneGoogleDriveProvider
+from app.providers.rclone import (
+    GoogleDriveCancelledError,
+    RcloneGoogleDriveProvider,
+    RcloneStorageProvider,
+)
 from app.providers.seafile import SeafileRcloneProvider
 from app.providers.seafile_api import (
     SeafileApiCancelledError,
@@ -43,7 +47,17 @@ from app.services.rclone import (
 from app.services.staging import StagingSpaceError, temporary_staging_area
 from app.services.telemetry import parse_mega_progress_line, parse_rclone_stats_line
 from app.services.transfer_progress import smb_manifest_progress_percent
+from app.services.transfer_naming import allocate_available_name, collision_key
 from app.settings import Settings
+
+
+def reserved_directory_names(parent_path: str, entries: list[dict[str, Any]]) -> set[str]:
+    return {
+        collision_key(entry["destination_path"].rsplit("/", 1)[-1])
+        for entry in entries
+        if entry.get("is_dir")
+        and entry["destination_path"].rsplit("/", 1)[0] == parent_path.rstrip("/")
+    }
 
 
 class TransferExecutor:
@@ -122,10 +136,20 @@ class TransferExecutor:
                 self.settings.nextcloud_job_timeout_seconds if uses_nextcloud else None
             ):
                 if source.provider_type == "SMB":
-                    await self._run_smb_transfer(record, source, destination)
+                    if record.conflict_policy == "KEEP_BOTH":
+                        await self._run_versioned_copy(record, source, destination)
+                    else:
+                        await self._run_smb_transfer(record, source, destination)
+                elif record.conflict_policy == "KEEP_BOTH":
+                    await self._run_versioned_copy(record, source, destination)
                 else:
                     await self._run_rclone(record, source, destination)
-        except (RcloneCancelledError, MegaCmdCancelledError, SeafileApiCancelledError):
+        except (
+            RcloneCancelledError,
+            MegaCmdCancelledError,
+            SeafileApiCancelledError,
+            GoogleDriveCancelledError,
+        ):
             await self._cancel(record)
         except SeafileApiError as exc:
             await self._fail(
@@ -1619,6 +1643,1045 @@ class TransferExecutor:
     def _uses_seafile_api(connection: ConnectionRecord) -> bool:
         return connection.provider_type == "SEAFILE" and connection.adapter_type == "SEAFILE_API"
 
+    @staticmethod
+    def _versioned_identity(item: StorageItem) -> str:
+        return f"object:{item.object_id}" if item.object_id else f"path:{item.path}"
+
+    async def _collect_versioned_tree(
+        self,
+        source: Any,
+        record: TransferRecord,
+        *,
+        allow_unknown_size: bool,
+        maximum_files: int,
+    ) -> tuple[list[tuple[StorageItem, str]], list[tuple[StorageItem, str]]]:
+        files: dict[str, tuple[StorageItem, str]] = {}
+        directories: dict[str, tuple[StorageItem, str]] = {}
+        visited_directories: set[str] = set()
+
+        def validate_name(item: StorageItem) -> None:
+            if (
+                not item.name
+                or item.name in {".", ".."}
+                or "/" in item.name
+                or "\\" in item.name
+                or any(ord(character) < 32 for character in item.name)
+            ):
+                raise ValueError("Provider returned an invalid item name")
+
+        async def add_directory(item: StorageItem, relative: PurePosixPath) -> None:
+            validate_name(item)
+            key = self._versioned_identity(item)
+            old = directories.get(key)
+            if old is not None:
+                return
+            if any(
+                existing.path == item.path
+                and (not existing.object_id or not item.object_id)
+                for existing, _relative in directories.values()
+            ):
+                raise self._PreflightError(
+                    "SOURCE_OBJECT_ID_UNAVAILABLE",
+                    "El origen devolvió carpetas homónimas sin identificadores únicos.",
+                    {"source_path": PurePosixPath(item.path).name},
+                )
+            directories[key] = (item, relative.as_posix())
+
+        async def walk(
+            directory: StorageItem,
+            relative_directory: PurePosixPath,
+        ) -> None:
+            identity = self._versioned_identity(directory)
+            if identity in visited_directories:
+                return
+            visited_directories.add(identity)
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            directory_path = MockStorageProvider.normalize_path(directory.path)
+            listed_children: dict[str, StorageItem] = {}
+            while True:
+                if await self.should_cancel():
+                    raise SeafileApiCancelledError("Transfer cancelled")
+                page = await source.list_items(
+                    directory_path,
+                    cursor=cursor,
+                    page_size=200,
+                    parent_object_id=directory.object_id,
+                )
+                for child in page.items:
+                    child_path = MockStorageProvider.normalize_path(child.path)
+                    if (child_path.rpartition("/")[0] or "/") != directory_path:
+                        raise ValueError("Provider returned an item outside the requested folder")
+                    prior_child = listed_children.get(child_path)
+                    if prior_child is not None and (
+                        not prior_child.object_id
+                        or not child.object_id
+                    ):
+                        raise self._PreflightError(
+                            "SOURCE_OBJECT_ID_UNAVAILABLE",
+                            "El origen devolvió elementos homónimos sin identificadores únicos.",
+                            {"source_path": PurePosixPath(child_path).name},
+                        )
+                    if (
+                        prior_child is not None
+                        and prior_child.object_id != child.object_id
+                    ):
+                        listed_children[child_path] = child
+                    else:
+                        listed_children.setdefault(child_path, child)
+                    relative_child = relative_directory / child.name
+                    validate_name(child)
+                    if child.is_dir:
+                        await add_directory(child, relative_child)
+                        await walk(child, relative_child)
+                    else:
+                        self._add_file_to_manifest(
+                            files,
+                            child_path,
+                            child,
+                            relative_child.as_posix(),
+                            allow_unknown_size=allow_unknown_size,
+                            maximum_files=maximum_files,
+                        )
+                if page.next_cursor is None:
+                    break
+                if page.next_cursor in seen_cursors:
+                    raise ValueError("Provider returned a repeated page cursor")
+                seen_cursors.add(page.next_cursor)
+                cursor = page.next_cursor
+
+        if (
+            record.source_item_ids is not None
+            and len(record.source_item_ids) != len(record.source_paths)
+        ):
+            raise ValueError("Selected source paths and object identifiers do not match")
+        if (
+            record.source_parent_ids is not None
+            and len(record.source_parent_ids) != len(record.source_paths)
+        ):
+            raise ValueError("Selected source paths and parent identifiers do not match")
+
+        for index, requested_path in enumerate(record.source_paths):
+            if await self.should_cancel():
+                raise SeafileApiCancelledError("Transfer cancelled")
+            normalized = MockStorageProvider.normalize_path(requested_path)
+            object_id = (
+                record.source_item_ids[index]
+                if record.source_item_ids is not None
+                else None
+            )
+            parent_object_id = (
+                record.source_parent_ids[index] if record.source_parent_ids is not None else None
+            )
+            if object_id is not None or parent_object_id is not None:
+                selected = await source.get_item(
+                    normalized,
+                    object_id=object_id,
+                    parent_object_id=parent_object_id,
+                )
+            else:
+                selected = await source.get_item(normalized)
+            if selected is None:
+                raise FileNotFoundError("Source item was not found")
+            validate_name(selected)
+            if MockStorageProvider.normalize_path(selected.path) != normalized:
+                raise ValueError("Provider returned a different source path")
+            if selected.is_dir:
+                relative_root = PurePosixPath(selected.name)
+                await add_directory(selected, relative_root)
+                await walk(selected, relative_root)
+            else:
+                self._add_file_to_manifest(
+                    files,
+                    normalized,
+                    selected,
+                    selected.name,
+                    allow_unknown_size=allow_unknown_size,
+                    maximum_files=maximum_files,
+                )
+        return list(files.values()), list(directories.values())
+
+    async def _list_versioned_destination(
+        self, provider: Any, path: str
+    ) -> list[StorageItem]:
+        items: list[StorageItem] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            options: dict[str, Any] = {}
+            if isinstance(provider, RcloneStorageProvider):
+                options["force_refresh"] = cursor is None
+            page = await provider.list_items(path, cursor=cursor, page_size=200, **options)
+            items.extend(page.items)
+            if page.next_cursor is None:
+                return items
+            if page.next_cursor in seen_cursors:
+                raise ValueError("Destination returned a repeated page cursor")
+            seen_cursors.add(page.next_cursor)
+            cursor = page.next_cursor
+
+    @staticmethod
+    def _manifest_identity(item: TransferManifestItemRecord) -> str:
+        if item.source_object_id:
+            return f"object:{item.source_object_id}"
+        return f"path:{item.source_path}"
+
+    @staticmethod
+    def _remote_join(parent: str, name: str) -> str:
+        return MockStorageProvider.normalize_path(f"{parent.rstrip('/')}/{name}")
+
+    @staticmethod
+    def _versioning_reason(
+        requested_path: str, assigned_path: str, original_name: str
+    ) -> str | None:
+        if requested_path == assigned_path:
+            return None
+        if len(original_name.encode("utf-8")) > 255:
+            return "COMPONENT_LIMIT"
+        return "NAME_CONFLICT"
+
+    async def _run_versioned_copy(
+        self,
+        record: TransferRecord,
+        source_connection: ConnectionRecord,
+        destination_connection: ConnectionRecord,
+    ) -> None:
+        """Copy each inventoried item to a durable, numbered destination assignment."""
+        if destination_connection.provider_type == "SMB" or (
+            source_connection.provider_type == "SMB"
+            and destination_connection.provider_type
+            not in {"GOOGLE_DRIVE", "MEGA", "SEAFILE", "NEXTCLOUD"}
+        ):
+            await self._fail(record, error_code="PROVIDER_PAIR_UNSUPPORTED")
+            return
+        if source_connection.provider_type == destination_connection.provider_type == "MEGA":
+            await self._fail(record, error_code="PROVIDER_PAIR_UNSUPPORTED")
+            return
+        source = self._provider(source_connection)
+        destination = self._provider(destination_connection)
+        async with AsyncExitStack() as stack:
+            if source_connection.provider_type == "MEGA":
+                source = await stack.enter_async_context(
+                    source.open_session(transfer_id=record.id, should_cancel=self.should_cancel)
+                )
+            if destination_connection.provider_type == "MEGA":
+                destination = await stack.enter_async_context(
+                    destination.open_session(
+                        transfer_id=record.id,
+                        should_cancel=self.should_cancel,
+                    )
+                )
+            try:
+                files, directories = await self._collect_versioned_tree(
+                    source,
+                    record,
+                    allow_unknown_size=source_connection.provider_type == "GOOGLE_DRIVE",
+                    maximum_files=(
+                        self.settings.smb_transfer_max_files
+                        if source_connection.provider_type == "SMB"
+                        else self.settings.transfer_max_files
+                    ),
+                )
+            except FileNotFoundError:
+                await self._fail(record, error_code="SOURCE_ITEM_NOT_FOUND")
+                return
+            except self._PreflightError as exc:
+                await self._fail(
+                    record,
+                    error_code=exc.error_code,
+                    message=exc.message,
+                    technical_details=exc.technical_details,
+                )
+                return
+
+            unknown_size_files = [(item, path) for item, path in files if item.size_bytes is None]
+            if unknown_size_files and source_connection.provider_type != "GOOGLE_DRIVE":
+                await self._fail(record, error_code="TRANSFER_FILE_SIZE_UNKNOWN")
+                return
+            known_files = [(item, path) for item, path in files if item.size_bytes is not None]
+            if known_files and not await self._preflight_staging(record, known_files):
+                return
+            if not files and not directories:
+                record.status = "RUNNING"
+                record.files_total = 0
+                record.progress_percent = 100.0
+                record.status = "COMPLETED"
+                record.completed_at = datetime.now(UTC)
+                await self.publish(record)
+                return
+
+            destination_root = MockStorageProvider.normalize_path(record.destination_path)
+            previous_rows = await self.store.alist_transfer_manifest_items(
+                record.id,
+                statuses={"DIRECTORY", "PENDING", "COPIED", "SKIPPED", "FAILED"},
+                include_directories=True,
+            )
+            previous = {
+                (row.is_dir, self._manifest_identity(row)): row for row in previous_rows
+            }
+            assigned_directories: dict[str, str] = {}
+            relative_directories: dict[str, str] = {".": destination_root}
+            occupied_by_parent: dict[str, set[str]] = {}
+            cached_children: dict[str, list[StorageItem]] = {}
+            planned_new_directories: set[str] = set()
+            manifest_entries: list[dict[str, Any]] = []
+
+            async def destination_children(parent_path: str) -> list[StorageItem]:
+                if parent_path not in cached_children:
+                    cached_children[parent_path] = (
+                        []
+                        if parent_path in planned_new_directories
+                        else await self._list_versioned_destination(destination, parent_path)
+                    )
+                    occupied_by_parent[parent_path] = {
+                        collision_key(item.name) for item in cached_children[parent_path]
+                    }
+                return cached_children[parent_path]
+
+            def parent_destination(item: StorageItem, relative_path: str) -> str:
+                relative_parent = PurePosixPath(relative_path).parent.as_posix()
+                if relative_parent == ".":
+                    return destination_root
+                if item.parent_object_id and item.parent_object_id in assigned_directories:
+                    return assigned_directories[item.parent_object_id]
+                return relative_directories.get(relative_parent, destination_root)
+
+            for directory, relative_path in sorted(
+                directories,
+                key=lambda entry: (len(PurePosixPath(entry[1]).parts), entry[1]),
+            ):
+                identity = self._versioned_identity(directory)
+                stored = previous.get((True, identity))
+                raw_relative = PurePosixPath(relative_path)
+                parent_path = parent_destination(directory, relative_path)
+                requested_path = self._remote_join(
+                    destination_root,
+                    raw_relative.as_posix(),
+                )
+                if stored is not None:
+                    assigned_path = stored.destination_path
+                    rename_reason = stored.rename_reason
+                else:
+                    children = await destination_children(parent_path)
+                    occupied = occupied_by_parent.setdefault(parent_path, set())
+                    same_name = [
+                        child
+                        for child in children
+                        if collision_key(child.name) == collision_key(directory.name)
+                    ]
+                    same_named_directory = (
+                        same_name[0]
+                        if len(same_name) == 1 and same_name[0].is_dir
+                        else None
+                    )
+                    if (
+                        same_named_directory is not None
+                        and collision_key(directory.name)
+                        not in reserved_directory_names(parent_path, manifest_entries)
+                    ):
+                        assigned_path = same_named_directory.path
+                        actual_name = same_named_directory.name
+                    else:
+                        occupied_names = {child.name for child in children}
+                        occupied_names.update(
+                            entry["destination_path"].rsplit("/", 1)[-1]
+                            for entry in manifest_entries
+                            if entry.get("is_dir")
+                            and entry["destination_path"].rsplit("/", 1)[0]
+                            == parent_path.rstrip("/")
+                        )
+                        actual_name = allocate_available_name(directory.name, occupied_names, 255)
+                        assigned_path = self._remote_join(parent_path, actual_name)
+                        planned_new_directories.add(assigned_path)
+                    occupied.add(collision_key(actual_name))
+                    rename_reason = self._versioning_reason(
+                        requested_path, assigned_path, directory.name
+                    )
+                occupied_by_parent.setdefault(parent_path, set()).add(
+                    collision_key(PurePosixPath(assigned_path).name)
+                )
+                assigned_directories[directory.object_id or identity] = assigned_path
+                relative_directories.setdefault(relative_path, assigned_path)
+                manifest_entries.append(
+                    {
+                        "source_path": directory.path,
+                        "source_object_id": directory.object_id,
+                        "destination_path": assigned_path,
+                        "requested_destination_path": requested_path,
+                        "rename_reason": rename_reason,
+                        "is_dir": True,
+                        "size_bytes": None,
+                        "modified_at": directory.modified_at,
+                    }
+                )
+
+            for item, relative_path in files:
+                identity = self._versioned_identity(item)
+                stored = previous.get((False, identity))
+                relative = PurePosixPath(relative_path)
+                parent_path = parent_destination(item, relative_path)
+                requested_path = self._remote_join(destination_root, relative.as_posix())
+                if stored is not None:
+                    assigned_path = stored.destination_path
+                    rename_reason = stored.rename_reason
+                else:
+                    children = await destination_children(parent_path)
+                    occupied = occupied_by_parent.setdefault(
+                        parent_path,
+                        {collision_key(child.name) for child in children},
+                    )
+                    name = allocate_available_name(
+                        item.name,
+                        {child.name for child in children}
+                        | {
+                            entry["destination_path"].rsplit("/", 1)[-1]
+                            for entry in manifest_entries
+                            if entry["destination_path"].rsplit("/", 1)[0]
+                            == parent_path.rstrip("/")
+                        },
+                        255,
+                    )
+                    assigned_path = self._remote_join(parent_path, name)
+                    rename_reason = self._versioning_reason(
+                        requested_path, assigned_path, item.name
+                    )
+                    occupied.add(collision_key(name))
+                manifest_entries.append(
+                    {
+                        "source_path": item.path,
+                        "source_object_id": item.object_id,
+                        "destination_path": assigned_path,
+                        "requested_destination_path": requested_path,
+                        "rename_reason": rename_reason,
+                        "is_dir": False,
+                        "size_bytes": item.size_bytes,
+                        "modified_at": item.modified_at,
+                    }
+                )
+
+            await self.store.aadd_transfer_manifest_items(record.id, manifest_entries)
+            rows = await self.store.alist_transfer_manifest_items(
+                record.id,
+                statuses={"DIRECTORY", "PENDING", "COPIED", "SKIPPED", "FAILED"},
+                include_directories=True,
+            )
+            row_by_identity = {
+                (row.is_dir, self._manifest_identity(row)): row for row in rows
+            }
+            for directory_row in (row for row in rows if row.is_dir):
+                if not directory_row.scan_complete:
+                    await self.store.amark_transfer_directory_scanned(
+                        record.id, directory_row.id
+                    )
+            directory_count = sum(
+                1 for row in rows if row.is_dir and row.rename_reason is not None
+            )
+            renamed_file_count = sum(
+                1 for row in rows if not row.is_dir and row.rename_reason is not None
+            )
+            existing_file_warnings = sum(
+                1 for row in rows if not row.is_dir and row.status in {"FAILED", "SKIPPED"}
+            )
+            record.files_total = len(files)
+            record.bytes_total = sum(
+                row.size_bytes or 0 for row in rows if not row.is_dir
+            )
+            record.warning_count = directory_count + renamed_file_count + existing_file_warnings
+            record.status = "RUNNING"
+            await self.publish(record)
+
+            ordered_rows = [
+                row_by_identity[(True, self._versioned_identity(item))]
+                for item, _relative in sorted(
+                    directories,
+                    key=lambda entry: (len(PurePosixPath(entry[1]).parts), entry[1]),
+                )
+            ]
+            if destination_connection.provider_type == "MEGA":
+                for row in ordered_rows:
+                    if await self.should_cancel():
+                        await self._cancel(record)
+                        return
+                    await destination.mkdir(row.destination_path)
+            elif self._uses_seafile_api(destination_connection):
+                for row in ordered_rows:
+                    if await self.should_cancel():
+                        await self._cancel(record)
+                        return
+                    await destination.mkdir(row.destination_path, should_cancel=self.should_cancel)
+            elif ordered_rows:
+                async with temporary_staging_area(
+                    Path(self.settings.transfer_staging_path),
+                    transfer_id=record.id,
+                    expected_size=0,
+                ) as area:
+                    for row in ordered_rows:
+                        relative_path = self._safe_relative_path(
+                            row.destination_path[len(destination_root.rstrip("/")) :].lstrip("/")
+                        )
+                        area.joinpath(*PurePosixPath(relative_path).parts).mkdir(
+                            parents=True, exist_ok=True
+                        )
+                    await self.runner.copy_local_directory_to_remote(
+                        area,
+                        destination.remote_path(destination_root),
+                        destination.config_content(),
+                        record.id,
+                        should_cancel=self.should_cancel,
+                        conflict_policy="KEEP_BOTH",
+                    )
+
+            for item, relative_path in files:
+                row = row_by_identity[(False, self._versioned_identity(item))]
+                if row.status == "COPIED":
+                    continue
+                if await self.should_cancel():
+                    await self._cancel(record)
+                    return
+                current_path = row.destination_path
+                if row.copy_started:
+                    existing = await self._find_versioned_destination_item(
+                        destination, current_path
+                    )
+                    if existing is None:
+                        await self.store.aupdate_transfer_manifest_item(
+                            record.id,
+                            row.id,
+                            status="FAILED",
+                            error_code="DESTINATION_STATE_UNCERTAIN",
+                        )
+                        await self._refresh_versioned_record(record)
+                        await self._fail(
+                            record,
+                            error_code="DESTINATION_STATE_UNCERTAIN",
+                            message="La copia interrumpida no puede reanudarse con seguridad.",
+                        )
+                        return
+                    # An interrupted write may have completed remotely. Reconcile by content
+                    # before accepting it; otherwise stop without changing the assigned name.
+                    if not await self._reconcile_versioned_destination(
+                        record,
+                        source_connection,
+                        destination_connection,
+                        source,
+                        destination,
+                        item,
+                        existing,
+                        current_path,
+                    ):
+                        await self.store.aupdate_transfer_manifest_item(
+                            record.id,
+                            row.id,
+                            status="FAILED",
+                            error_code="DESTINATION_STATE_UNCERTAIN",
+                        )
+                        await self._refresh_versioned_record(record)
+                        await self._fail(
+                            record,
+                            error_code="DESTINATION_STATE_UNCERTAIN",
+                            message="La copia interrumpida no pudo verificarse por contenido.",
+                        )
+                        return
+                    await self.store.aupdate_transfer_manifest_item(
+                        record.id, row.id, status="COPIED", verified_by="SHA256_RECONCILED"
+                    )
+                    await self._refresh_versioned_record(record)
+                    continue
+
+                success = await self._copy_versioned_file(
+                    record,
+                    source_connection,
+                    destination_connection,
+                    source,
+                    destination,
+                    item,
+                    row,
+                )
+                if not success:
+                    return
+
+            counts = await self.store.aget_transfer_manifest_counts(record.id)
+            record = await self.store.aget_transfer(record.id) or record
+            record.current_item = None
+            record.current_speed_bps = None
+            record.warning_count = (
+                counts.get("failed", counts.get("FAILED", 0))
+                + counts.get("skipped", counts.get("SKIPPED", 0))
+                + directory_count
+                + renamed_file_count
+            )
+            record.progress_percent = 100.0
+            record.status = "COMPLETED_WITH_WARNINGS" if record.warning_count else "COMPLETED"
+            record.completed_at = datetime.now(UTC)
+            await self.publish(record)
+
+    async def _find_versioned_destination_item(
+        self, destination: Any, destination_path: str
+    ) -> StorageItem | None:
+        parent = PurePosixPath(destination_path).parent.as_posix()
+        name = PurePosixPath(destination_path).name
+        items = await self._list_versioned_destination(destination, parent)
+        return next(
+            (item for item in items if collision_key(item.name) == collision_key(name)),
+            None,
+        )
+
+    async def _download_versioned_source(
+        self,
+        record: TransferRecord,
+        connection: ConnectionRecord,
+        source: Any,
+        item: StorageItem,
+        area: Path,
+        *,
+        max_bytes: int | None,
+    ) -> Path:
+        target = area / item.name
+        if connection.provider_type == "MEGA":
+            return await source.download_file(
+                item.path,
+                area,
+                object_id=item.object_id,
+                should_cancel=self.should_cancel,
+            )
+        if (
+            connection.provider_type == "GOOGLE_DRIVE"
+            and isinstance(source, RcloneGoogleDriveProvider)
+            and item.object_id is not None
+        ):
+            await source.download_file_by_id(
+                item,
+                target,
+                should_cancel=self.should_cancel,
+                max_bytes=max_bytes,
+            )
+            return target
+        if self._uses_seafile_api(connection):
+            await source.download_file(
+                item.path,
+                target,
+                should_cancel=self.should_cancel,
+            )
+            return target
+        await self.runner.copy_remote_to_local(
+            source.remote_path(item.path),
+            area,
+            source.config_content(),
+            record.id,
+            should_cancel=self.should_cancel,
+            conflict_policy="KEEP_BOTH",
+            max_transfer_bytes=max_bytes,
+        )
+        return target
+
+    async def _upload_versioned_destination(
+        self,
+        record: TransferRecord,
+        connection: ConnectionRecord,
+        destination: Any,
+        local_file: Path,
+        destination_path: str,
+    ) -> str | None:
+        parent = PurePosixPath(destination_path).parent.as_posix()
+        if connection.provider_type == "MEGA":
+            await destination.upload_file(
+                local_file,
+                parent,
+                should_cancel=self.should_cancel,
+            )
+            return destination_path
+        if self._uses_seafile_api(connection):
+            return await destination.upload_file(
+                local_file,
+                destination_path,
+                replace=False,
+                should_cancel=self.should_cancel,
+            )
+        await self.runner.copy_local_to_remote(
+            local_file,
+            destination.remote_path(parent),
+            destination.config_content(),
+            record.id,
+            should_cancel=self.should_cancel,
+            conflict_policy="KEEP_BOTH",
+        )
+        return destination_path
+
+    async def _hash_versioned_destination(
+        self,
+        record: TransferRecord,
+        connection: ConnectionRecord,
+        destination: Any,
+        item: StorageItem,
+        destination_path: str,
+        area: Path,
+    ) -> str:
+        if self._uses_seafile_api(connection):
+            return await destination.sha256(destination_path, should_cancel=self.should_cancel)
+        verify_area = area / "destination-verification"
+        verify_area.mkdir(mode=0o700)
+        if connection.provider_type == "MEGA":
+            verified_file = await destination.download_file(
+                destination_path,
+                verify_area,
+                object_id=item.object_id,
+                should_cancel=self.should_cancel,
+            )
+        elif (
+            connection.provider_type == "GOOGLE_DRIVE"
+            and isinstance(destination, RcloneGoogleDriveProvider)
+            and item.object_id is not None
+        ):
+            verified_file = verify_area / item.name
+            await destination.download_file_by_id(
+                item,
+                verified_file,
+                should_cancel=self.should_cancel,
+                max_bytes=self.settings.transfer_max_file_bytes or None,
+            )
+        else:
+            await self.runner.copy_remote_to_local(
+                destination.remote_path(destination_path),
+                verify_area,
+                destination.config_content(),
+                record.id,
+                should_cancel=self.should_cancel,
+                conflict_policy="KEEP_BOTH",
+                max_transfer_bytes=self.settings.transfer_max_file_bytes or None,
+            )
+            verified_file = verify_area / item.name
+        if not verified_file.is_file() or verified_file.is_symlink():
+            raise RuntimeError("Destination verification did not produce a regular file")
+        return await _sha256_file(verified_file, self.should_cancel)
+
+    async def _reconcile_versioned_destination(
+        self,
+        record: TransferRecord,
+        source_connection: ConnectionRecord,
+        destination_connection: ConnectionRecord,
+        source: Any,
+        destination: Any,
+        source_item: StorageItem,
+        destination_item: StorageItem,
+        destination_path: str,
+    ) -> bool:
+        expected_size = source_item.size_bytes or destination_item.size_bytes
+        unknown_google_export = (
+            expected_size is None and source_connection.provider_type == "GOOGLE_DRIVE"
+        )
+        if expected_size is None and not unknown_google_export:
+            return False
+        cap = min(
+            64 * 1024**2,
+            self.settings.transfer_max_file_bytes or 64 * 1024**2,
+        )
+        staging_size = cap if unknown_google_export else expected_size
+        if staging_size is None:
+            return False
+        staging_reservation = (
+            staging_size
+            if self._uses_seafile_api(destination_connection)
+            else staging_size * 2
+        )
+        async with temporary_staging_area(
+            Path(self.settings.transfer_staging_path),
+            transfer_id=record.id,
+            expected_size=staging_reservation,
+            reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+            margin_percent=self.settings.transfer_staging_margin_percent,
+        ) as area:
+            source_area = area / "source"
+            source_area.mkdir(mode=0o700)
+            download_limit = (
+                cap
+                if unknown_google_export
+                else self.settings.transfer_max_file_bytes or None
+            )
+            source_file = await self._download_versioned_source(
+                record,
+                source_connection,
+                source,
+                source_item,
+                source_area,
+                max_bytes=download_limit,
+            )
+            if not source_file.is_file() or source_file.is_symlink():
+                return False
+            actual_size = source_file.stat().st_size
+            if source_item.size_bytes is not None and actual_size != source_item.size_bytes:
+                return False
+            if (
+                destination_item.size_bytes is not None
+                and actual_size != destination_item.size_bytes
+            ):
+                return False
+            source_digest = await _sha256_file(source_file, self.should_cancel)
+            destination_digest = await self._hash_versioned_destination(
+                record,
+                destination_connection,
+                destination,
+                destination_item,
+                destination_path,
+                area,
+            )
+            return source_digest == destination_digest
+
+    async def _copy_versioned_file(
+        self,
+        record: TransferRecord,
+        source_connection: ConnectionRecord,
+        destination_connection: ConnectionRecord,
+        source: Any,
+        destination: Any,
+        item: StorageItem,
+        manifest_item: TransferManifestItemRecord,
+    ) -> bool:
+        unknown_google_export = (
+            item.size_bytes is None and source_connection.provider_type == "GOOGLE_DRIVE"
+        )
+        google_export_limit = min(
+            64 * 1024**2,
+            self.settings.transfer_max_file_bytes or 64 * 1024**2,
+        )
+        max_bytes = (
+            google_export_limit
+            if unknown_google_export
+            else self.settings.transfer_max_file_bytes or None
+        )
+        attempts = self.settings.transfer_max_retries + 1
+        safe_to_retry_copy = not manifest_item.copy_started
+        for attempt in range(1, attempts + 1):
+            if await self.should_cancel():
+                await self._cancel(record)
+                return False
+            record.attempt_count = max(record.attempt_count, attempt)
+            record.status = "RUNNING" if attempt == 1 else "RETRYING"
+            record.current_item = item.path
+            record.current_speed_bps = None
+            record.estimated_remaining_seconds = None
+            await self.publish(record)
+            reserve_size = google_export_limit if unknown_google_export else item.size_bytes
+            try:
+                async with temporary_staging_area(
+                    Path(self.settings.transfer_staging_path),
+                    transfer_id=record.id,
+                    expected_size=reserve_size,
+                    reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+                    margin_percent=self.settings.transfer_staging_margin_percent,
+                ) as area:
+                    local_file = await self._download_versioned_source(
+                        record,
+                        source_connection,
+                        source,
+                        item,
+                        area,
+                        max_bytes=max_bytes,
+                    )
+                    if not local_file.is_file() or local_file.is_symlink():
+                        raise RuntimeError("Source download did not produce a regular file")
+                    actual_size = local_file.stat().st_size
+                    if item.size_bytes is not None and actual_size != item.size_bytes:
+                        raise ValueError("Source size did not match the inventoried size")
+                    if (
+                        self.settings.transfer_max_file_bytes > 0
+                        and actual_size > self.settings.transfer_max_file_bytes
+                    ):
+                        raise ValueError("Source file exceeded the configured size limit")
+                    if item.size_bytes is None:
+                        await self.store.aupdate_transfer_manifest_item_size(
+                            record.id, manifest_item.id, size_bytes=actual_size
+                        )
+                        manifest_item.size_bytes = actual_size
+                        record.bytes_total += actual_size
+                    digest = await _sha256_file(local_file, self.should_cancel)
+                    destination_name = PurePosixPath(manifest_item.destination_path).name
+                    if (
+                        not self._uses_seafile_api(destination_connection)
+                        and local_file.name != destination_name
+                    ):
+                        renamed_local_file = local_file.with_name(destination_name)
+                        if renamed_local_file.exists() or renamed_local_file.is_symlink():
+                            raise RuntimeError("Temporary destination name is already occupied")
+                        local_file.rename(renamed_local_file)
+                        local_file = renamed_local_file
+                    if not manifest_item.copy_started:
+                        await self.store.amark_transfer_manifest_item_started(
+                            record.id,
+                            manifest_item.id,
+                            destination_existed_before=False,
+                        )
+                        manifest_item.copy_started = True
+                    try:
+                        actual_destination = await self._upload_versioned_destination(
+                            record,
+                            destination_connection,
+                            destination,
+                            local_file,
+                            manifest_item.destination_path,
+                        )
+                    except Exception as upload_error:
+                        existing = await self._find_versioned_destination_item(
+                            destination, manifest_item.destination_path
+                        )
+                        if (
+                            existing is not None
+                            and not existing.is_dir
+                            and existing.size_bytes == actual_size
+                        ):
+                            try:
+                                remote_digest = await self._hash_versioned_destination(
+                                    record,
+                                    destination_connection,
+                                    destination,
+                                    existing,
+                                    manifest_item.destination_path,
+                                    area,
+                                )
+                            except Exception:
+                                remote_digest = None
+                            if remote_digest == digest:
+                                await self.store.aupdate_transfer_manifest_item(
+                                    record.id,
+                                    manifest_item.id,
+                                    status="COPIED",
+                                    verified_by="SHA256_RECONCILED",
+                                )
+                                await self._refresh_versioned_record(record)
+                                record.current_item = item.path
+                                record.progress_percent = min(
+                                    round(
+                                        record.files_completed * 100 / max(record.files_total, 1),
+                                        2,
+                                    ),
+                                    99.99,
+                                )
+                                await self.publish(record)
+                                return True
+                        if (
+                            existing is None
+                            and destination_connection.provider_type != "MEGA"
+                            and bool(getattr(upload_error, "retryable", False))
+                        ):
+                            safe_to_retry_copy = True
+                        if destination_connection.provider_type == "MEGA":
+                            raise RuntimeError("MEGA destination state is uncertain") from None
+                        raise upload_error
+
+                    if actual_destination != manifest_item.destination_path:
+                        raise RuntimeError("Provider did not create the assigned destination name")
+                    destination_item = await self._find_versioned_destination_item(
+                        destination, manifest_item.destination_path
+                    )
+                    if (
+                        destination_item is None
+                        or destination_item.is_dir
+                        or (
+                            destination_item.size_bytes is not None
+                            and destination_item.size_bytes != actual_size
+                        )
+                        or (
+                            destination_item.size_bytes is None
+                            and destination_connection.provider_type != "SEAFILE"
+                        )
+                    ):
+                        raise RuntimeError("Destination size verification failed")
+                    verified_by = "SIZE"
+                    if self._uses_seafile_api(destination_connection):
+                        remote_digest = await destination.sha256(
+                            manifest_item.destination_path,
+                            should_cancel=self.should_cancel,
+                        )
+                        if remote_digest != digest:
+                            raise RuntimeError("Destination content verification failed")
+                        verified_by = "SHA256"
+                    await self.store.aupdate_transfer_manifest_item(
+                        record.id,
+                        manifest_item.id,
+                        status="COPIED",
+                        verified_by=verified_by,
+                    )
+                    await self._refresh_versioned_record(record)
+                    record.current_item = item.path
+                    if record.bytes_total:
+                        record.progress_percent = min(
+                            round(record.bytes_transferred * 100 / record.bytes_total, 2),
+                            99.99,
+                        )
+                    else:
+                        record.progress_percent = min(
+                            round(record.files_completed * 100 / max(record.files_total, 1), 2),
+                            99.99,
+                        )
+                    await self.publish(record)
+                    return True
+            except (
+                RcloneCancelledError,
+                MegaCmdCancelledError,
+                SeafileApiCancelledError,
+                GoogleDriveCancelledError,
+            ):
+                await self._cancel(record)
+                return False
+            except StagingSpaceError:
+                await self.store.aupdate_transfer_manifest_item(
+                    record.id,
+                    manifest_item.id,
+                    status="FAILED",
+                    error_code="TRANSFER_STAGING_SPACE_INSUFFICIENT",
+                )
+                await self._refresh_versioned_record(record)
+                await self._fail(
+                    record,
+                    error_code="TRANSFER_STAGING_SPACE_INSUFFICIENT",
+                    message="No hay espacio temporal suficiente para transferir el archivo.",
+                    technical_details={"file_bytes": item.size_bytes},
+                )
+                return False
+            except Exception as exc:
+                retryable = bool(getattr(exc, "retryable", False))
+                if retryable and attempt < attempts and safe_to_retry_copy:
+                    if not await self._wait_for_retry(
+                        record,
+                        min(5 * (2 ** (attempt - 1)) + random.random(), 300),
+                        next_attempt=attempt + 1,
+                    ):
+                        return False
+                    continue
+                code = (
+                    "MEGA_DESTINATION_STATE_UNCERTAIN"
+                    if destination_connection.provider_type == "MEGA" and manifest_item.copy_started
+                    else "TRANSFER_FILE_COPY_FAILED"
+                )
+                await self.store.aupdate_transfer_manifest_item(
+                    record.id,
+                    manifest_item.id,
+                    status="FAILED",
+                    error_code=code,
+                )
+                await self._refresh_versioned_record(record)
+                await self._fail(
+                    record,
+                    error_code=code,
+                    message="No se pudo copiar y verificar un archivo del manifiesto.",
+                    technical_details={"exception_type": type(exc).__name__},
+                )
+                return False
+        return False
+
+    async def _refresh_versioned_record(self, record: TransferRecord) -> None:
+        saved = await self.store.aget_transfer(record.id)
+        if saved is None:
+            return
+        for field_name in (
+            "files_total",
+            "files_completed",
+            "bytes_total",
+            "bytes_transferred",
+            "warning_count",
+            "error_count",
+        ):
+            setattr(record, field_name, getattr(saved, field_name))
+
     async def _run_seafile_api_cross_provider(
         self,
         record: TransferRecord,
@@ -2571,6 +3634,8 @@ class TransferExecutor:
         *,
         include_selected_folder: bool = False,
         allow_unknown_size: bool = False,
+        selected_object_ids: list[str | None] | None = None,
+        selected_parent_ids: list[str | None] | None = None,
     ) -> tuple[list[tuple[StorageItem, str]], set[str]]:
         files: dict[str, tuple[StorageItem, str]] = {}
         directories: set[str] = set()
@@ -2581,12 +3646,21 @@ class TransferExecutor:
                 files, item_path, item, relative_path, allow_unknown_size=allow_unknown_size
             )
 
-        async def walk_directory(path: str, relative_directory: PurePosixPath) -> None:
+        async def walk_directory(
+            path: str,
+            relative_directory: PurePosixPath,
+            directory_object_id: str | None = None,
+        ) -> None:
             if await self.should_cancel():
                 raise SeafileApiCancelledError("Transfer cancelled")
-            if path in visited_directories:
+            directory_key = (
+                f"object:{directory_object_id}"
+                if directory_object_id
+                else f"path:{MockStorageProvider.normalize_path(path)}"
+            )
+            if directory_key in visited_directories:
                 return
-            visited_directories.add(path)
+            visited_directories.add(directory_key)
             if relative_directory.parts:
                 directories.add(relative_directory.as_posix())
             cursor: str | None = None
@@ -2594,7 +3668,12 @@ class TransferExecutor:
             while True:
                 if await self.should_cancel():
                     raise SeafileApiCancelledError("Transfer cancelled")
-                page = await provider.list_items(path, cursor=cursor, page_size=200)
+                page = await provider.list_items(
+                    path,
+                    cursor=cursor,
+                    page_size=200,
+                    parent_object_id=directory_object_id,
+                )
                 for child in page.items:
                     child_path = MockStorageProvider.normalize_path(child.path)
                     parent = child_path.rpartition("/")[0] or "/"
@@ -2602,7 +3681,7 @@ class TransferExecutor:
                         raise ValueError("Provider returned an item outside the requested folder")
                     relative_child = relative_directory / child.name
                     if child.is_dir:
-                        await walk_directory(child_path, relative_child)
+                        await walk_directory(child_path, relative_child, child.object_id)
                     else:
                         add_file(child_path, child, relative_child.as_posix())
                 if page.next_cursor is None:
@@ -2612,11 +3691,27 @@ class TransferExecutor:
                 seen_cursors.add(page.next_cursor)
                 cursor = page.next_cursor
 
-        for requested_path in selected_paths:
+        if selected_object_ids is not None and len(selected_object_ids) != len(selected_paths):
+            raise ValueError("Selected source paths and object identifiers do not match")
+        if selected_parent_ids is not None and len(selected_parent_ids) != len(selected_paths):
+            raise ValueError("Selected source paths and parent identifiers do not match")
+        for index, requested_path in enumerate(selected_paths):
             if await self.should_cancel():
                 raise SeafileApiCancelledError("Transfer cancelled")
             normalized = MockStorageProvider.normalize_path(requested_path)
-            item = await provider.get_item(normalized)
+            object_id = selected_object_ids[index] if selected_object_ids is not None else None
+            parent_object_id = (
+                selected_parent_ids[index] if selected_parent_ids is not None else None
+            )
+            item = (
+                await provider.get_item(
+                    normalized,
+                    object_id=object_id,
+                    parent_object_id=parent_object_id,
+                )
+                if object_id is not None or parent_object_id is not None
+                else await provider.get_item(normalized)
+            )
             if item is None:
                 raise FileNotFoundError("Source item was not found")
             item_path = MockStorageProvider.normalize_path(item.path)
@@ -2626,7 +3721,7 @@ class TransferExecutor:
                 selected_directory = (
                     PurePosixPath(item_path).name if include_selected_folder else "."
                 )
-                await walk_directory(item_path, PurePosixPath(selected_directory))
+                await walk_directory(item_path, PurePosixPath(selected_directory), item.object_id)
             else:
                 add_file(item_path, item, item.name)
         return list(files.values()), directories
@@ -2669,18 +3764,25 @@ class TransferExecutor:
         relative_path: str,
         *,
         allow_unknown_size: bool = False,
+        maximum_files: int | None = None,
     ) -> None:
-        if item_path in files:
+        identity_key = (
+            f"object:{item.object_id}"
+            if item.object_id
+            else f"path:{MockStorageProvider.normalize_path(item_path)}"
+        )
+        if identity_key in files:
             return
-        if len(files) >= self.settings.transfer_max_files:
+        file_limit = maximum_files or self.settings.transfer_max_files
+        if len(files) >= file_limit:
             raise self._PreflightError(
                 "TRANSFER_FILE_LIMIT_EXCEEDED",
                 (
                     f"La selección supera el máximo de "
-                    f"{self.settings.transfer_max_files:,} archivos. Divida la copia "
+                    f"{file_limit:,} archivos. Divida la copia "
                     "en varias transferencias."
                 ),
-                {"maximum_files": self.settings.transfer_max_files},
+                {"maximum_files": file_limit},
             )
         maximum_file_bytes = self.settings.transfer_max_file_bytes
         if maximum_file_bytes > 0 and item.size_bytes is None and not allow_unknown_size:
@@ -2708,7 +3810,18 @@ class TransferExecutor:
                     "file_bytes": item.size_bytes,
                 },
             )
-        files[item_path] = (item, relative_path)
+        duplicate_path_without_identity = any(
+            existing_item.path == item_path
+            and (not item.object_id or not existing_item.object_id)
+            for existing_item, _existing_relative in files.values()
+        )
+        if duplicate_path_without_identity:
+            raise self._PreflightError(
+                "SOURCE_OBJECT_ID_UNAVAILABLE",
+                "El origen devolvió elementos con la misma ruta sin identificadores únicos.",
+                {"source_path": PurePosixPath(item_path).name},
+            )
+        files[identity_key] = (item, relative_path)
 
     async def _preflight_staging(
         self,

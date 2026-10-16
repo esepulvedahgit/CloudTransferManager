@@ -146,3 +146,66 @@ async def test_smb_transfer_resume_requeues_failed_items_and_clears_cancel(monke
     assert dispatch_requests == [True]
     assert transfer.id not in app.state.cancel_requests
     assert resumed is not None and resumed.attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_keep_both_transfer_resume_is_available_for_cloud_pairs(monkeypatch):
+    store = MemoryStore()
+    user = store.add_user(
+        "cloud-resume-admin",
+        "cloud-resume-admin@example.test",
+        PasswordService().hash("A-Strong-Password123!"),
+        role="ADMIN",
+    )
+    source = store.create_connection(
+        "Drive", "GOOGLE_DRIVE", user.id, encrypted_credentials=b"source-encrypted"
+    )
+    destination = store.create_connection(
+        "Seafile", "SEAFILE", user.id, encrypted_credentials=b"destination-encrypted"
+    )
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/file.txt"], "/Archive"
+    )
+    transfer.status = "FAILED"
+    transfer.completed_at = None
+    await store.asave_transfer(transfer)
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": "/file.txt",
+                "destination_path": "/Archive/file.txt",
+                "is_dir": False,
+                "size_bytes": 4,
+            }
+        ],
+    )
+    manifest = (await store.alist_transfer_manifest_items(transfer.id))[0]
+    await store.aupdate_transfer_manifest_item(
+        transfer.id, manifest.id, status="FAILED", error_code="NETWORK"
+    )
+    app = create_app(
+        Settings(
+            app_env="production",
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+        ),
+        store=store,
+    )
+    app.state.event_bus = None
+    dispatch_requests: list[bool] = []
+    monkeypatch.setattr(
+        "app.worker.dispatch_pending_transfers.delay",
+        lambda: dispatch_requests.append(True),
+    )
+    client = await logged_in_client(app, user.username)
+
+    response = await client.post(
+        f"/api/v1/transfers/{transfer.id}/resume",
+        headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+    )
+    await client.aclose()
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "QUEUED"
+    assert dispatch_requests == [True]

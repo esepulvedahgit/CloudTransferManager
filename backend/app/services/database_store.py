@@ -467,6 +467,10 @@ class DatabaseStore:
             source_credential_version=row.source_credential_version,
             destination_credential_version=row.destination_credential_version,
             source_paths=list(row.source_paths),
+            source_item_ids=list(row.source_item_ids) if row.source_item_ids is not None else None,
+            source_parent_ids=(
+                list(row.source_parent_ids) if row.source_parent_ids is not None else None
+            ),
             destination_path=row.destination_path,
             conflict_policy=row.conflict_policy,
             send_email_notification=row.send_email_notification,
@@ -504,7 +508,10 @@ class DatabaseStore:
             id=row.id,
             transfer_id=row.transfer_job_id,
             source_path=row.source_path,
+            source_object_id=row.source_object_id,
             destination_path=row.destination_path,
+            requested_destination_path=row.requested_destination_path or row.destination_path,
+            rename_reason=row.rename_reason,
             is_dir=row.is_dir,
             size_bytes=row.size_bytes,
             modified_at=row.modified_at,
@@ -867,7 +874,7 @@ class DatabaseStore:
         destination_connection_id: uuid.UUID,
         source_paths: list[str],
         destination_path: str,
-        conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        conflict_policy: str = "KEEP_BOTH",
         send_email_notification: bool = False,
         scheduled_at: datetime | None = None,
         schedule_timezone: str = "UTC",
@@ -876,6 +883,8 @@ class DatabaseStore:
         idempotency_key: uuid.UUID | None = None,
         idempotency_request_hash: str | None = None,
         audit_event: dict[str, Any] | None = None,
+        source_item_ids: list[str | None] | None = None,
+        source_parent_ids: list[str | None] | None = None,
     ) -> TransferRecord:
         if (idempotency_key is None) != (idempotency_request_hash is None):
             raise ValueError("Idempotency key and request hash must be supplied together")
@@ -923,6 +932,8 @@ class DatabaseStore:
                         source_connection_id=source_connection_id,
                         destination_connection_id=destination_connection_id,
                         source_paths=source_paths,
+                        source_item_ids=source_item_ids,
+                        source_parent_ids=source_parent_ids,
                         destination_path=destination_path,
                         operation="COPY",
                         conflict_policy=conflict_policy,
@@ -1327,6 +1338,7 @@ class DatabaseStore:
             destination.provider_type,
             source.adapter_type,
             destination.adapter_type,
+            transfer.conflict_policy,
         )
 
     @staticmethod
@@ -1756,16 +1768,35 @@ class DatabaseStore:
                     values = []
                     for entry in entries[start : start + 200]:
                         source_path = str(entry["source_path"])
+                        source_object_id = entry.get("source_object_id")
+                        identity = (
+                            f"{transfer_id}:object:{source_object_id}"
+                            if isinstance(source_object_id, str) and source_object_id
+                            else f"{transfer_id}:path:{source_path}"
+                        )
                         is_dir = bool(entry.get("is_dir", False))
                         values.append(
                             {
                                 "id": uuid.uuid4(),
                                 "transfer_job_id": transfer_id,
                                 "source_path": source_path,
+                                "source_object_id": (
+                                    source_object_id
+                                    if isinstance(source_object_id, str)
+                                    else None
+                                ),
                                 "destination_path": str(entry["destination_path"]),
-                                "source_path_digest": hashlib.sha256(
-                                    f"{transfer_id}:{source_path}".encode()
-                                ).hexdigest(),
+                                "requested_destination_path": str(
+                                    entry.get(
+                                        "requested_destination_path", entry["destination_path"]
+                                    )
+                                ),
+                                "rename_reason": (
+                                    str(entry["rename_reason"])
+                                    if entry.get("rename_reason")
+                                    else None
+                                ),
+                                "source_path_digest": hashlib.sha256(identity.encode()).hexdigest(),
                                 "is_dir": is_dir,
                                 "size_bytes": entry.get("size_bytes"),
                                 "modified_at": entry.get("modified_at"),
@@ -1857,7 +1888,6 @@ class DatabaseStore:
                 .where(
                     TransferManifestItem.transfer_job_id == transfer_id,
                     TransferManifestItem.id == item_id,
-                    TransferManifestItem.is_dir.is_(False),
                 )
                 .with_for_update()
             )
@@ -1866,6 +1896,59 @@ class DatabaseStore:
             if not row.copy_started:
                 row.copy_started = True
                 row.destination_existed_before = destination_existed_before
+            await session.commit()
+
+    async def aupdate_transfer_manifest_item_size(
+        self, transfer_id: uuid.UUID, item_id: uuid.UUID, *, size_bytes: int
+    ) -> None:
+        if size_bytes < 0:
+            raise ValueError("Manifest file size cannot be negative")
+        async with self.sessions() as session:
+            async with session.begin():
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                item = await session.scalar(
+                    select(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.id == item_id,
+                        TransferManifestItem.is_dir.is_(False),
+                    )
+                    .with_for_update()
+                )
+                if transfer is None or item is None or item.copy_started:
+                    raise ValueError("Manifest file size cannot be updated")
+                if item.size_bytes is not None and item.size_bytes != size_bytes:
+                    raise ValueError("Manifest file size is already fixed")
+                if item.size_bytes is None:
+                    item.size_bytes = size_bytes
+                    transfer.bytes_total = int(transfer.bytes_total or 0) + size_bytes
+
+    async def aupdate_transfer_manifest_destination(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        destination_path: str,
+        requested_destination_path: str,
+        rename_reason: str | None,
+    ) -> None:
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(TransferManifestItem)
+                .where(
+                    TransferManifestItem.transfer_job_id == transfer_id,
+                    TransferManifestItem.id == item_id,
+                    TransferManifestItem.is_dir.is_(False),
+                )
+                .with_for_update()
+            )
+            if row is None or row.copy_started:
+                raise ValueError("Manifest destination can only change before a copy starts")
+            row.destination_path = destination_path
+            row.requested_destination_path = requested_destination_path
+            row.rename_reason = rename_reason
             await session.commit()
 
     async def alist_transfer_manifest_items(

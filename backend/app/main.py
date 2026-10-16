@@ -183,9 +183,11 @@ class TransferCreate(BaseModel):
     source_connection_id: uuid.UUID
     destination_connection_id: uuid.UUID
     source_paths: list[str] = Field(min_length=1)
+    source_item_ids: list[str | None] | None = None
+    source_parent_ids: list[str | None] | None = None
     destination_path: str = Field(min_length=1, max_length=1024)
     operation: str = "COPY"
-    conflict_policy: str = "OVERWRITE_IF_DIFFERENT"
+    conflict_policy: str = "KEEP_BOTH"
     send_email_notification: bool = False
     scheduled_at: datetime | None = None
     schedule_timezone: str = "UTC"
@@ -219,6 +221,21 @@ class TransferCreate(BaseModel):
         if len(value) > 100:
             raise ValueError("Selecciona como máximo 100 rutas por transferencia.")
         return value
+
+    @model_validator(mode="after")
+    def validate_source_item_ids(self) -> TransferCreate:
+        for values in (self.source_item_ids, self.source_parent_ids):
+            if values is None:
+                continue
+            if len(values) != len(self.source_paths):
+                raise ValueError("Cada ruta de origen debe corresponder a sus identificadores.")
+            if any(
+                value is not None
+                and (not value or len(value) > 512 or any(ord(char) < 32 for char in value))
+                for value in values
+            ):
+                raise ValueError("Identificador de elemento de origen no válido.")
+        return self
 
 
 class TransferScheduleUpdate(BaseModel):
@@ -1628,6 +1645,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         sort: str = "name",
         direction: str = "asc",
         search: str | None = None,
+        parent_object_id: str | None = Query(default=None, max_length=512),
         user: UserAccount = Depends(current_user),
     ) -> dict[str, Any]:
         connection = await app.state.store.aget_connection(connection_id)
@@ -1639,9 +1657,17 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             user.id, connection_id
         ):
             raise HTTPException(status_code=404, detail="Conexión no encontrada")
+        if parent_object_id is not None and any(ord(char) < 32 for char in parent_object_id):
+            raise HTTPException(status_code=400, detail="Identificador de carpeta no válido")
         try:
             page = await provider_for(connection).list_items(
-                path, cursor, page_size, sort, direction, search
+                path,
+                cursor,
+                page_size,
+                sort,
+                direction,
+                search,
+                parent_object_id=parent_object_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1658,8 +1684,14 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         del user_csrf
         if payload.operation != "COPY":
             raise HTTPException(status_code=422, detail="Solo se permite la operación COPY")
-        if payload.conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT"}:
-            raise HTTPException(status_code=422, detail="Política de conflicto no válida")
+        if payload.conflict_policy != "KEEP_BOTH":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Las transferencias nuevas conservan los archivos y numeran los nombres "
+                    "repetidos."
+                ),
+            )
         if payload.source_connection_id == payload.destination_connection_id:
             raise HTTPException(status_code=422, detail="Origen y destino deben ser distintos")
         try:
@@ -1698,6 +1730,11 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=404, detail="Conexión no encontrada")
         if source.status != "ACTIVE" or destination.status != "ACTIVE":
             raise HTTPException(status_code=409, detail="Una conexión está inactiva")
+        if destination.provider_type == "SMB":
+            raise HTTPException(
+                status_code=422,
+                detail="SMB solo se admite como origen de una migración.",
+            )
         if user.role != "ADMIN":
             for connection_id in (source.id, destination.id):
                 if not await app.state.store.ahas_connection_access(user.id, connection_id):
@@ -1739,6 +1776,8 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                         ),
                     },
                 },
+                source_item_ids=payload.source_item_ids,
+                source_parent_ids=payload.source_parent_ids,
             )
         except IdempotencyConflictError as exc:
             raise HTTPException(
@@ -1958,9 +1997,10 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(
                 status_code=409, detail="No se puede reanudar: una conexión ya no existe"
             )
-        if source.provider_type != "SMB":
+        if source.provider_type != "SMB" and record.conflict_policy != "KEEP_BOTH":
             raise HTTPException(
-                status_code=409, detail="Solo se pueden reanudar transferencias SMB"
+                status_code=409,
+                detail="Esta transferencia no conserva un manifiesto compatible con reanudación.",
             )
         if (
             source.credential_version != record.source_credential_version
@@ -1968,7 +2008,11 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         ):
             raise HTTPException(
                 status_code=409,
-                detail="Las credenciales o la raíz SMB cambiaron; cree una nueva transferencia.",
+                detail=(
+                    "Las credenciales o la raíz SMB cambiaron; cree una nueva transferencia."
+                    if source.provider_type == "SMB"
+                    else "Las credenciales cambiaron; cree una nueva transferencia."
+                ),
             )
         if source.status != "ACTIVE" or destination.status != "ACTIVE":
             raise HTTPException(status_code=409, detail="Una conexión está inactiva")

@@ -44,9 +44,9 @@ Si `STORAGE` es una subcarpeta dentro de otro recurso compartido, configura el n
 2. El usuario abre **Explorar NAS**, navega la raíz lógica y selecciona una o más carpetas o archivos.
 3. En el explorador selecciona Google Drive, MEGA o Seafile como destino y define la carpeta cloud.
 4. El worker inventaría las carpetas en lotes persistidos de 200 elementos y copia cada archivo con la operación Rclone permitida `copy`. El origen SMB solo se lee.
-5. El historial muestra progreso y permite consultar el resultado por archivo. Una transferencia fallida o cancelada puede reanudarse mientras las versiones de credenciales y la raíz del NAS sigan iguales.
+5. El historial muestra progreso y permite consultar el resultado por archivo, incluido el nombre final asignado si hubo colisión. Una transferencia fallida o cancelada puede reanudarse mientras las versiones de credenciales y la raíz del NAS sigan iguales.
 
-La interfaz presenta las conexiones SMB como origen. El endpoint de creación de transferencias no rechaza por sí mismo un destino SMB; no uses solicitudes API manuales para seleccionar el NAS como destino. Si el despliegue requiere garantizar que SMB sea solo de lectura, el backend debe validar ese límite además del filtro de la UI.
+La interfaz presenta las conexiones SMB como origen y el API rechaza conexiones SMB como destino. El worker también valida esa restricción antes de copiar. Las migraciones admitidas desde SMB tienen como destino MEGA, Google Drive, Seafile o Nextcloud.
 
 `SMB_INTERACTIVE_TIMEOUT_SECONDS` limita las consultas de conexión y exploración del NAS (1–300 segundos, por defecto 30). No limita la duración de copias grandes. `SMB_TRANSFER_MAX_FILES` limita el total por transferencia SMB y admite más de los 5.000 archivos del flujo cloud heredado. Las transferencias con MEGA o Seafile API usan el directorio temporal de staging para un archivo por vez; revise que `TRANSFER_STAGING_PATH` tenga espacio para el archivo más grande más la reserva configurada.
 
