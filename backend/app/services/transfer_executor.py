@@ -46,8 +46,8 @@ from app.services.rclone import (
 )
 from app.services.staging import StagingSpaceError, temporary_staging_area
 from app.services.telemetry import parse_mega_progress_line, parse_rclone_stats_line
-from app.services.transfer_progress import smb_manifest_progress_percent
 from app.services.transfer_naming import allocate_available_name, collision_key
+from app.services.transfer_progress import smb_manifest_progress_percent
 from app.settings import Settings
 
 
@@ -1826,6 +1826,27 @@ class TransferExecutor:
             return f"object:{item.source_object_id}"
         return f"path:{item.source_path}"
 
+    async def _iterate_versioned_manifest_rows(
+        self,
+        transfer_id: uuid.UUID,
+        *,
+        statuses: set[str],
+    ) -> AsyncIterator[TransferManifestItemRecord]:
+        cursor_id: uuid.UUID | None = None
+        while True:
+            page = await self.store.alist_transfer_manifest_items(
+                transfer_id,
+                statuses=statuses,
+                after_id=cursor_id,
+                limit=200,
+                include_directories=True,
+            )
+            if not page:
+                return
+            for item in page:
+                yield item
+            cursor_id = page[-1].id
+
     @staticmethod
     def _remote_join(parent: str, name: str) -> str:
         return MockStorageProvider.normalize_path(f"{parent.rstrip('/')}/{name}")
@@ -1911,11 +1932,13 @@ class TransferExecutor:
                 return
 
             destination_root = MockStorageProvider.normalize_path(record.destination_path)
-            previous_rows = await self.store.alist_transfer_manifest_items(
-                record.id,
-                statuses={"DIRECTORY", "PENDING", "COPIED", "SKIPPED", "FAILED"},
-                include_directories=True,
-            )
+            manifest_statuses = {"DIRECTORY", "PENDING", "COPIED", "SKIPPED", "FAILED"}
+            previous_rows = [
+                row
+                async for row in self._iterate_versioned_manifest_rows(
+                    record.id, statuses=manifest_statuses
+                )
+            ]
             previous = {
                 (row.is_dir, self._manifest_identity(row)): row for row in previous_rows
             }
@@ -2060,14 +2083,31 @@ class TransferExecutor:
                 )
 
             await self.store.aadd_transfer_manifest_items(record.id, manifest_entries)
-            rows = await self.store.alist_transfer_manifest_items(
-                record.id,
-                statuses={"DIRECTORY", "PENDING", "COPIED", "SKIPPED", "FAILED"},
-                include_directories=True,
-            )
+            rows = [
+                row
+                async for row in self._iterate_versioned_manifest_rows(
+                    record.id, statuses=manifest_statuses
+                )
+            ]
             row_by_identity = {
                 (row.is_dir, self._manifest_identity(row)): row for row in rows
             }
+            expected_identities = {
+                (True, self._versioned_identity(item)) for item, _relative in directories
+            } | {(False, self._versioned_identity(item)) for item, _relative in files}
+            missing_identities = expected_identities - row_by_identity.keys()
+            if missing_identities:
+                await self._fail(
+                    record,
+                    error_code="MANIFEST_INCOMPLETE",
+                    message="No se pudo confirmar el manifiesto completo antes de copiar.",
+                    technical_details={
+                        "expected_items": len(expected_identities),
+                        "persisted_items": len(row_by_identity),
+                        "missing_items": len(missing_identities),
+                    },
+                )
+                return
             for directory_row in (row for row in rows if row.is_dir):
                 if not directory_row.scan_complete:
                     await self.store.amark_transfer_directory_scanned(
@@ -2083,9 +2123,7 @@ class TransferExecutor:
                 1 for row in rows if not row.is_dir and row.status in {"FAILED", "SKIPPED"}
             )
             record.files_total = len(files)
-            record.bytes_total = sum(
-                row.size_bytes or 0 for row in rows if not row.is_dir
-            )
+            record.bytes_total = sum(item.size_bytes or 0 for item, _relative in files)
             record.warning_count = directory_count + renamed_file_count + existing_file_warnings
             record.status = "RUNNING"
             await self.publish(record)
@@ -2131,7 +2169,7 @@ class TransferExecutor:
                         conflict_policy="KEEP_BOTH",
                     )
 
-            for item, relative_path in files:
+            for item, _relative_path in files:
                 row = row_by_identity[(False, self._versioned_identity(item))]
                 if row.status == "COPIED":
                     continue
@@ -2461,6 +2499,7 @@ class TransferExecutor:
             record.estimated_remaining_seconds = None
             await self.publish(record)
             reserve_size = google_export_limit if unknown_google_export else item.size_bytes
+            provider_stage = "SOURCE_DOWNLOAD"
             try:
                 async with temporary_staging_area(
                     Path(self.settings.transfer_staging_path),
@@ -2512,6 +2551,9 @@ class TransferExecutor:
                         )
                         manifest_item.copy_started = True
                     try:
+                        provider_stage = "DESTINATION_UPLOAD"
+                        if destination_connection.provider_type == "MEGA":
+                            safe_to_retry_copy = False
                         actual_destination = await self._upload_versioned_destination(
                             record,
                             destination_connection,
@@ -2564,9 +2606,10 @@ class TransferExecutor:
                         ):
                             safe_to_retry_copy = True
                         if destination_connection.provider_type == "MEGA":
-                            raise RuntimeError("MEGA destination state is uncertain") from None
+                            raise upload_error from None
                         raise upload_error
 
+                    provider_stage = "DESTINATION_VERIFY"
                     if actual_destination != manifest_item.destination_path:
                         raise RuntimeError("Provider did not create the assigned destination name")
                     destination_item = await self._find_versioned_destination_item(
@@ -2650,6 +2693,12 @@ class TransferExecutor:
                 code = (
                     "MEGA_DESTINATION_STATE_UNCERTAIN"
                     if destination_connection.provider_type == "MEGA" and manifest_item.copy_started
+                    else (
+                        "MEGACMD_RETRIES_EXHAUSTED"
+                        if retryable
+                        else "MEGACMD_COMMAND_FAILED"
+                    )
+                    if isinstance(exc, (MegaCmdCommandError, MegaCmdTimeoutError))
                     else "TRANSFER_FILE_COPY_FAILED"
                 )
                 await self.store.aupdate_transfer_manifest_item(
@@ -2663,10 +2712,25 @@ class TransferExecutor:
                     record,
                     error_code=code,
                     message="No se pudo copiar y verificar un archivo del manifiesto.",
-                    technical_details={"exception_type": type(exc).__name__},
+                    technical_details=self._versioned_failure_details(
+                        exc, provider_stage=provider_stage
+                    ),
                 )
                 return False
         return False
+
+    @staticmethod
+    def _versioned_failure_details(exc: Exception, *, provider_stage: str) -> dict[str, Any]:
+        details: dict[str, Any] = {"exception_type": type(exc).__name__}
+        if isinstance(exc, MegaCmdCommandError):
+            details.update(
+                provider_stage=provider_stage,
+                return_code=exc.return_code,
+                retryable=exc.retryable,
+            )
+        elif isinstance(exc, MegaCmdTimeoutError):
+            details.update(provider_stage=provider_stage, retryable=exc.retryable)
+        return details
 
     async def _refresh_versioned_record(self, record: TransferRecord) -> None:
         saved = await self.store.aget_transfer(record.id)

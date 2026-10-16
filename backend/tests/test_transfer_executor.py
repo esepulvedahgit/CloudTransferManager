@@ -832,7 +832,10 @@ async def test_drive_to_mega_does_not_retry_after_ambiguous_remote_upload(
     assert ("/backup/file.txt" in mega_destination.items) is destination_visible
     assert list(Path(executor.settings.transfer_staging_path).iterdir()) == []
     events = await store.alist_transfer_events(transfer.id)
-    assert _failure_diagnostic(events, "MEGA_DESTINATION_STATE_UNCERTAIN")
+    failure = _failure_diagnostic(events, "MEGA_DESTINATION_STATE_UNCERTAIN")
+    assert failure["technical_details"]["return_code"] == 7
+    assert failure["technical_details"]["retryable"] is True
+    assert failure["technical_details"]["provider_stage"] == "DESTINATION_UPLOAD"
 
 
 @pytest.mark.asyncio
@@ -1494,3 +1497,195 @@ async def test_keep_both_transfer_versions_an_existing_destination_name(tmp_path
     assert manifest[0].requested_destination_path == "/backup/source.txt"
     assert manifest[0].destination_path == "/backup/source_01.txt"
     assert manifest[0].rename_reason == "NAME_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_versioned_transfer_reads_manifest_beyond_first_page(tmp_path):
+    source_items = [_item("/source", is_dir=True, provider="GOOGLE_DRIVE")]
+    for index in range(201):
+        folder = f"/source/folder-{index:03}"
+        source_items.extend(
+            [
+                _item(folder, is_dir=True, provider="GOOGLE_DRIVE"),
+                _item(f"{folder}/file-{index:03}.txt", size=1, provider="GOOGLE_DRIVE"),
+            ]
+        )
+    executor, transfer, providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="SEAFILE",
+        source_items=source_items,
+        source_paths=["/source"],
+    )
+
+    await executor.execute(transfer.id)
+
+    destination = providers[transfer.destination_connection_id]
+    manifest = []
+    cursor_id = None
+    while page := await store.alist_transfer_manifest_items(
+        transfer.id, statuses={"COPIED"}, after_id=cursor_id, limit=200
+    ):
+        manifest.extend(page)
+        cursor_id = page[-1].id
+    assert transfer.status == "COMPLETED"
+    assert transfer.files_total == 201
+    assert transfer.bytes_total == 201
+    assert transfer.files_completed == 201
+    assert len(runner.uploaded) == 201
+    assert len(manifest) == 201
+    assert all(
+        f"/backup/source/folder-{index:03}/file-{index:03}.txt" in destination.items
+        for index in range(201)
+    )
+
+
+@pytest.mark.asyncio
+async def test_versioned_transfer_preserves_assignments_across_manifest_pages(tmp_path):
+    source_items = [_item("/source", is_dir=True, provider="GOOGLE_DRIVE")]
+    manifest_entries = [
+        {
+            "source_path": "/source",
+            "destination_path": "/backup/retained-root",
+            "requested_destination_path": "/backup/source",
+            "rename_reason": "NAME_CONFLICT",
+            "is_dir": True,
+        }
+    ]
+    for index in range(201):
+        folder = f"/source/folder-{index:03}"
+        retained_folder = f"/backup/retained-root/retained-{index:03}"
+        source_items.extend(
+            [
+                _item(folder, is_dir=True, provider="GOOGLE_DRIVE"),
+                _item(f"{folder}/file-{index:03}.txt", size=1, provider="GOOGLE_DRIVE"),
+            ]
+        )
+        manifest_entries.extend(
+            [
+                {
+                    "source_path": folder,
+                    "destination_path": retained_folder,
+                    "requested_destination_path": f"/backup/source/folder-{index:03}",
+                    "rename_reason": "NAME_CONFLICT",
+                    "is_dir": True,
+                },
+                {
+                    "source_path": f"{folder}/file-{index:03}.txt",
+                    "destination_path": f"{retained_folder}/file-{index:03}.txt",
+                    "requested_destination_path": (
+                        f"/backup/source/folder-{index:03}/file-{index:03}.txt"
+                    ),
+                    "rename_reason": "NAME_CONFLICT",
+                    "is_dir": False,
+                    "size_bytes": 1,
+                },
+            ]
+        )
+    executor, transfer, providers, _runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="SEAFILE",
+        source_items=source_items,
+        source_paths=["/source"],
+    )
+    await store.aadd_transfer_manifest_items(transfer.id, manifest_entries)
+
+    await executor.execute(transfer.id)
+
+    destination = providers[transfer.destination_connection_id]
+    assert transfer.status == "COMPLETED_WITH_WARNINGS"
+    assert transfer.files_total == 201
+    assert transfer.bytes_total == 201
+    assert all(
+        f"/backup/retained-root/retained-{index:03}/file-{index:03}.txt"
+        in destination.items
+        for index in range(201)
+    )
+
+
+@pytest.mark.asyncio
+async def test_versioned_mega_failure_has_sanitized_command_diagnostics(
+    tmp_path, monkeypatch
+):
+    executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=[_item("/source.txt", size=4, provider="MEGA")],
+        source_paths=["/source.txt"],
+    )
+
+    async def failed_download(self, remote_path, destination_dir, **kwargs):
+        raise MegaCmdCommandError(12, b"private account diagnostic")
+
+    monkeypatch.setattr(FakeMegaSession, "download_file", failed_download)
+    await executor.execute(transfer.id)
+
+    events = await store.alist_transfer_events(transfer.id)
+    failure = _failure_diagnostic(events, "MEGACMD_COMMAND_FAILED")
+    assert failure["technical_details"]["provider_stage"] == "SOURCE_DOWNLOAD"
+    assert failure["technical_details"]["return_code"] == 12
+    assert failure["technical_details"]["retryable"] is False
+    assert "private account diagnostic" not in str(events)
+
+
+@pytest.mark.asyncio
+async def test_incomplete_versioned_manifest_fails_before_copy(tmp_path, monkeypatch):
+    executor, transfer, _providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="SEAFILE",
+        source_items=[_item("/source.txt", size=4, provider="GOOGLE_DRIVE")],
+        source_paths=["/source.txt"],
+    )
+    original_list = store.alist_transfer_manifest_items
+
+    async def omit_source_file(*args, **kwargs):
+        rows = await original_list(*args, **kwargs)
+        return [row for row in rows if row.source_path != "/source.txt"]
+
+    monkeypatch.setattr(store, "alist_transfer_manifest_items", omit_source_file)
+    await executor.execute(transfer.id)
+
+    events = await store.alist_transfer_events(transfer.id)
+    failure = _failure_diagnostic(events, "MANIFEST_INCOMPLETE")
+    assert transfer.status == "FAILED"
+    assert runner.uploaded == []
+    assert failure["technical_details"]["missing_items"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mega_upload_is_not_retried_when_destination_verification_fails(
+    tmp_path, monkeypatch
+):
+    executor, transfer, providers, _runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="MEGA",
+        source_items=[_item("/source.txt", size=4, provider="GOOGLE_DRIVE")],
+        source_paths=["/source.txt"],
+    )
+    mega_destination = providers[transfer.destination_connection_id]
+    original_list = FakeMegaSession.list_items
+    list_attempts = 0
+
+    async def fail_verification_list(self, path, cursor=None, page_size=200, **kwargs):
+        nonlocal list_attempts
+        list_attempts += 1
+        if list_attempts == 2:
+            raise MegaCmdCommandError(7, b"temporary failure")
+        return await original_list(self, path, cursor, page_size, **kwargs)
+
+    async def no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(FakeMegaSession, "list_items", fail_verification_list)
+    executor.sleep = no_delay
+    await executor.execute(transfer.id)
+
+    events = await store.alist_transfer_events(transfer.id)
+    failure = _failure_diagnostic(events, "MEGA_DESTINATION_STATE_UNCERTAIN")
+    assert transfer.status == "FAILED"
+    assert mega_destination.upload_attempts == 1
+    assert failure["technical_details"]["provider_stage"] == "DESTINATION_VERIFY"
