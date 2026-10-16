@@ -1,8 +1,11 @@
 import json
 import uuid
+from pathlib import Path
 
+import httpx
 import pytest
 
+from app.providers.base import StorageItem
 from app.providers.rclone import RcloneGoogleDriveProvider
 from app.services.rclone import RcloneRunner
 
@@ -99,5 +102,76 @@ async def test_get_item_finds_entry_after_first_200_items():
     assert item is not None
     assert item.path == "/file-204.txt"
     assert item.size_bytes == 204
+
+
+@pytest.mark.asyncio
+async def test_google_download_uses_stable_file_id_and_keeps_oauth_private(tmp_path: Path):
+    if not hasattr(RcloneGoogleDriveProvider, "download_file_by_id"):
+        pytest.fail("Google Drive ID-based downloads are not implemented")
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(
+                200,
+                json={"access_token": "refreshed-access", "expires_in": 3600},
+            )
+        return httpx.Response(200, content=b"selected-file-bytes")
+
+    provider = RcloneGoogleDriveProvider(
+        uuid.uuid4(),
+        {
+            "client_id": "client-id",
+            "client_secret": "client-secret",
+            "refresh_token": "refresh-token",
+        },
+        RcloneRunner("/usr/bin/rclone", "/tmp"),
+        http_transport=httpx.MockTransport(handle),
+    )
+    item = StorageItem(
+        name="duplicate.txt",
+        path="/duplicate.txt",
+        is_dir=False,
+        size_bytes=19,
+        provider_type="GOOGLE_DRIVE",
+        object_id="drive-file-id-2",
+    )
+
+    await provider.download_file_by_id(item, tmp_path / "selected.txt")
+
+    assert (tmp_path / "selected.txt").read_bytes() == b"selected-file-bytes"
+    media_request = requests[-1]
+    assert media_request.url.path.endswith("/files/drive-file-id-2")
+    assert media_request.url.params.get("alt") == "media"
+    assert media_request.headers["Authorization"] == "Bearer refreshed-access"
+    assert "refresh-token" not in str(media_request.headers)
+
+
+@pytest.mark.asyncio
+async def test_google_get_item_rejects_an_id_outside_the_selected_parent():
+    provider = RcloneGoogleDriveProvider(
+        uuid.uuid4(),
+        {"client_id": "id", "client_secret": "secret", "refresh_token": "token"},
+        RcloneRunner("/usr/bin/rclone", "/tmp"),
+    )
+
+    async def metadata(_object_id, *, include_download_capability=False):
+        return {
+            "id": "file-id",
+            "name": "document.txt",
+            "mimeType": "text/plain",
+            "parents": ["different-parent"],
+        }
+
+    provider._google_file_metadata = metadata
+
+    item = await provider.get_item(
+        "/folder/document.txt",
+        object_id="file-id",
+        parent_object_id="requested-parent",
+    )
+
+    assert item is None
 
 

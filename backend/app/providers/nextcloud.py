@@ -172,7 +172,14 @@ class NextcloudRcloneProvider(RcloneStorageProvider):
             + "\n"
         )
 
-    async def get_item(self, path: str) -> StorageItem | None:
+    async def get_item(
+        self,
+        path: str,
+        object_id: str | None = None,
+        parent_object_id: str | None = None,
+    ) -> StorageItem | None:
+        del object_id
+        del parent_object_id
         from app.providers.mock import MockStorageProvider
 
         normalized = MockStorageProvider.normalize_path(path)

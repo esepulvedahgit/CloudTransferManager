@@ -32,8 +32,8 @@ La validación real de extremo a extremo debe usar un usuario y datos de prueba 
 
 - Google Drive → Nextcloud se procesa por archivo. El contador avanza después de confirmar cada copia. Los tamaños negativos de Rclone se interpretan como desconocidos.
 - Los documentos nativos de Google se exportan una sola vez a staging privado y se verifica el SHA-256 de esos mismos bytes leyendo el archivo de Nextcloud. Las exportaciones tienen un límite temporal de 64 MiB, reducido si `TRANSFER_MAX_FILE_BYTES` establece un límite menor; los archivos normales conservan su límite habitual. La descarga de verificación está acotada al tamaño exportado y el staging se elimina al terminar, fallar o cancelar.
-- La exportación y su lectura posterior añaden tráfico. Si el documento exportado existente coincide en SHA-256, se conserva sin subirlo de nuevo. Con `SKIP`, un destino existente se conserva; si el tamaño de origen es desconocido se registra una advertencia, sin certificar su contenido.
-- Antes de copiar Drive → Nextcloud se rechazan nombres de archivo o componentes de carpeta que superen 255 bytes UTF-8. El usuario debe acortar esos nombres; la aplicación no cambia el origen ni renombra automáticamente el destino.
+- Las transferencias nuevas numeran cualquier nombre ocupado, aunque el contenido coincida. Si se exporta un documento nativo con tamaño desconocido, el límite es 64 MiB o `TRANSFER_MAX_FILE_BYTES` si es menor.
+- Los nombres y carpetas que superan 255 bytes UTF-8 se acortan en el destino preservando la extensión y dejando constancia del nombre solicitado y el asignado. El origen no se cambia.
 - Configura proxy, DNS y certificados del sistema para que backend y worker alcancen el mismo host guardado en la conexión.
 - Los listados se almacenan en una caché en memoria de cada proceso durante un máximo de 30 segundos. La caché está limitada por tamaño, entradas y volumen total, y las actualizaciones de credenciales cambian su clave.
 - Rclone proporciona listado, metadatos y consulta de cuota sobre WebDAV. La cuota depende de que el servidor Nextcloud exponga valores DAV válidos; si no los informa, la aplicación deja esos valores vacíos.

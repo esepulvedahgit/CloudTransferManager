@@ -94,9 +94,11 @@ class TransferRecord:
     destination_connection_id: uuid.UUID
     source_paths: list[str]
     destination_path: str
+    source_item_ids: list[str | None] | None = None
+    source_parent_ids: list[str | None] | None = None
     source_credential_version: int = 1
     destination_credential_version: int = 1
-    conflict_policy: str = "OVERWRITE_IF_DIFFERENT"
+    conflict_policy: str = "KEEP_BOTH"
     send_email_notification: bool = False
     status: str = "QUEUED"
     scheduled_at: datetime | None = None
@@ -175,6 +177,9 @@ class TransferManifestItemRecord:
     source_path: str
     destination_path: str
     is_dir: bool
+    source_object_id: str | None = None
+    requested_destination_path: str | None = None
+    rename_reason: str | None = None
     size_bytes: int | None = None
     modified_at: datetime | None = None
     scan_complete: bool = False
@@ -188,7 +193,10 @@ class TransferManifestItemRecord:
         return {
             "id": str(self.id),
             "source_path": self.source_path,
+            "source_object_id": self.source_object_id,
             "destination_path": self.destination_path,
+            "requested_destination_path": self.requested_destination_path or self.destination_path,
+            "rename_reason": self.rename_reason,
             "is_dir": self.is_dir,
             "size_bytes": self.size_bytes,
             "modified_at": self.modified_at.isoformat() if self.modified_at else None,
@@ -331,7 +339,7 @@ class MemoryStore:
         destination_connection_id: uuid.UUID,
         source_paths: list[str],
         destination_path: str,
-        conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        conflict_policy: str = "KEEP_BOTH",
         send_email_notification: bool = False,
         source_credential_version: int = 1,
         destination_credential_version: int = 1,
@@ -339,6 +347,8 @@ class MemoryStore:
         schedule_timezone: str = "UTC",
         execution_mode: str = "AUTO",
         depends_on_transfer_id: uuid.UUID | None = None,
+        source_item_ids: list[str | None] | None = None,
+        source_parent_ids: list[str | None] | None = None,
     ) -> TransferRecord:
         is_scheduled = scheduled_at is not None and scheduled_at > datetime.now(UTC)
         record = TransferRecord(
@@ -351,6 +361,8 @@ class MemoryStore:
             destination_credential_version=destination_credential_version,
             source_paths=source_paths,
             destination_path=destination_path,
+            source_item_ids=source_item_ids,
+            source_parent_ids=source_parent_ids,
             conflict_policy=conflict_policy,
             send_email_notification=send_email_notification,
             status="SCHEDULED" if is_scheduled else "QUEUED",
@@ -639,7 +651,7 @@ class MemoryStore:
         destination_connection_id: uuid.UUID,
         source_paths: list[str],
         destination_path: str,
-        conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        conflict_policy: str = "KEEP_BOTH",
         send_email_notification: bool = False,
         scheduled_at: datetime | None = None,
         schedule_timezone: str = "UTC",
@@ -648,6 +660,8 @@ class MemoryStore:
         idempotency_key: uuid.UUID | None = None,
         idempotency_request_hash: str | None = None,
         audit_event: dict[str, Any] | None = None,
+        source_item_ids: list[str | None] | None = None,
+        source_parent_ids: list[str | None] | None = None,
     ) -> TransferRecord:
         if (idempotency_key is None) != (idempotency_request_hash is None):
             raise ValueError("Idempotency key and request hash must be supplied together")
@@ -679,6 +693,8 @@ class MemoryStore:
             schedule_timezone,
             execution_mode,
             depends_on_transfer_id,
+            source_item_ids,
+            source_parent_ids,
         )
         if idempotency_key is not None and idempotency_request_hash is not None:
             self.transfer_idempotency[(requested_by, idempotency_key)] = (
@@ -988,7 +1004,13 @@ class MemoryStore:
         inserted = 0
         for entry in entries:
             source_path = str(entry["source_path"])
-            digest = hashlib.sha256(f"{transfer_id}:{source_path}".encode()).hexdigest()
+            source_object_id = entry.get("source_object_id")
+            identity = (
+                f"{transfer_id}:object:{source_object_id}"
+                if isinstance(source_object_id, str) and source_object_id
+                else f"{transfer_id}:path:{source_path}"
+            )
+            digest = hashlib.sha256(identity.encode()).hexdigest()
             key = (transfer_id, digest)
             if key in self.transfer_manifest_items:
                 continue
@@ -999,6 +1021,15 @@ class MemoryStore:
                 source_path=source_path,
                 destination_path=str(entry["destination_path"]),
                 is_dir=is_dir,
+                source_object_id=(
+                    source_object_id if isinstance(source_object_id, str) else None
+                ),
+                requested_destination_path=str(
+                    entry.get("requested_destination_path", entry["destination_path"])
+                ),
+                rename_reason=(
+                    str(entry["rename_reason"]) if entry.get("rename_reason") else None
+                ),
                 size_bytes=entry.get("size_bytes"),
                 modified_at=entry.get("modified_at"),
                 status="DIRECTORY" if is_dir else "PENDING",
@@ -1045,6 +1076,37 @@ class MemoryStore:
         if not item.copy_started:
             item.copy_started = True
             item.destination_existed_before = destination_existed_before
+
+    async def aupdate_transfer_manifest_item_size(
+        self, transfer_id: uuid.UUID, item_id: uuid.UUID, *, size_bytes: int
+    ) -> None:
+        item = self._manifest_item(transfer_id, item_id)
+        transfer = self.transfers.get(transfer_id)
+        if item is None or item.is_dir or transfer is None or size_bytes < 0:
+            raise ValueError("Manifest file size cannot be updated")
+        if item.copy_started:
+            raise ValueError("Manifest file size cannot change after a copy starts")
+        if item.size_bytes is not None and item.size_bytes != size_bytes:
+            raise ValueError("Manifest file size is already fixed")
+        if item.size_bytes is None:
+            item.size_bytes = size_bytes
+            transfer.bytes_total += size_bytes
+
+    async def aupdate_transfer_manifest_destination(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        destination_path: str,
+        requested_destination_path: str,
+        rename_reason: str | None,
+    ) -> None:
+        item = self._manifest_item(transfer_id, item_id)
+        if item is None or item.copy_started:
+            raise ValueError("Manifest destination can only change before a copy starts")
+        item.destination_path = destination_path
+        item.requested_destination_path = requested_destination_path
+        item.rename_reason = rename_reason
 
     async def alist_transfer_manifest_items(
         self,

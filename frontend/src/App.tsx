@@ -82,6 +82,8 @@ type StorageItem = {
   modified_at: string | null;
   mime_type: string | null;
   provider_type: string;
+  object_id?: string | null;
+  parent_object_id?: string | null;
 };
 type ItemPage = { items: StorageItem[]; next_cursor: string | null; total_count: number };
 type Transfer = {
@@ -91,6 +93,8 @@ type Transfer = {
   source_connection_id?: string;
   destination_connection_id: string;
   source_paths?: string[];
+  conflict_policy?: string;
+  warning_count?: number;
   destination_path: string;
   progress_percent: number;
   files_completed: number;
@@ -117,7 +121,10 @@ type TransferListPage = { items: Transfer[]; total_count: number };
 type TransferManifestItem = {
   id: string;
   source_path: string;
+  source_object_id: string | null;
   destination_path: string;
+  requested_destination_path: string;
+  rename_reason: string | null;
   is_dir: boolean;
   size_bytes: number | null;
   modified_at: string | null;
@@ -1559,7 +1566,8 @@ function ExplorerPanel({
   onConnectionChange,
   path,
   onPathChange,
-  selectedPaths,
+  directoryIds,
+  selectedItems,
   onToggle,
   isAdmin,
   onTestConnection,
@@ -1570,8 +1578,9 @@ function ExplorerPanel({
   connectionId: string;
   onConnectionChange: (id: string) => void;
   path: string;
-  onPathChange: (path: string) => void;
-  selectedPaths?: string[];
+  onPathChange: (path: string, objectId?: string | null) => void;
+  directoryIds?: Record<string, string>;
+  selectedItems?: StorageItem[];
   onToggle?: (item: StorageItem) => void;
   isAdmin: boolean;
   onTestConnection: (connectionId: string, otp?: string) => Promise<void>;
@@ -1580,12 +1589,14 @@ function ExplorerPanel({
   const [testing, setTesting] = useState(false);
   const [otp, setOtp] = useState('');
   const active = connections.find((connection) => connection.id === connectionId);
+  const parentObjectId = directoryIds?.[path] ?? null;
   const query = useInfiniteQuery({
-    queryKey: ['items', connectionId, path, search],
+    queryKey: ['items', connectionId, path, parentObjectId, search],
     enabled: Boolean(connectionId) && active?.status === 'ACTIVE',
     initialPageParam: undefined as string | undefined,
     queryFn: ({ pageParam }) => {
       const params = new URLSearchParams({ path, page_size: '50', sort: 'name', direction: 'asc' });
+      if (parentObjectId) params.set('parent_object_id', parentObjectId);
       if (search.trim()) params.set('search', search.trim());
       if (pageParam) params.set('cursor', pageParam);
       return apiRequest<ItemPage>(`/api/v1/connections/${connectionId}/items?${params}`);
@@ -1615,7 +1626,7 @@ function ExplorerPanel({
             <Typography variant="overline" color="text.secondary">{side === 'source' ? '01 · ORIGEN' : '02 · DESTINO'}</Typography>
             <Typography variant="h6">{title}</Typography>
           </Box>
-          {side === 'source' && <Typography className="selection-count">{selectedPaths?.length ?? 0} seleccionados</Typography>}
+          {side === 'source' && <Typography className="selection-count">{selectedItems?.length ?? 0} seleccionados</Typography>}
         </Stack>
         <FormControl fullWidth size="small" sx={{ mt: 2 }}>
           <InputLabel id={`${side}-connection-label`}>Conexión</InputLabel>
@@ -1671,7 +1682,7 @@ function ExplorerPanel({
               <Button size="small" onClick={() => onPathChange('/')}>Mi unidad</Button>
               {crumbs.map((crumb, index) => {
                 const crumbPath = `/${crumbs.slice(0, index + 1).join('/')}`;
-                return <Button key={crumbPath} size="small" onClick={() => onPathChange(crumbPath)}>{crumb}</Button>;
+                return <Button key={crumbPath} size="small" onClick={() => onPathChange(crumbPath, directoryIds?.[crumbPath] ?? null)}>{crumb}</Button>;
               })}
             </Stack>
             <TextField
@@ -1684,23 +1695,30 @@ function ExplorerPanel({
             />
             <Paper variant="outlined" className="file-list">
               {path !== '/' && (
-                <Button className="parent-row" fullWidth onClick={() => onPathChange(`/${crumbs.slice(0, -1).join('/')}` || '/')}>↑ Subir un nivel</Button>
+                <Button className="parent-row" fullWidth onClick={() => {
+                  const parentPath = `/${crumbs.slice(0, -1).join('/')}` || '/';
+                  onPathChange(parentPath, directoryIds?.[parentPath] ?? null);
+                }}>↑ Subir un nivel</Button>
               )}
               {query.isLoading && <Box sx={{ p: 2 }}><LinearProgress /></Box>}
               {query.isError && <Alert severity="error" sx={{ m: 1 }}>No se pudo cargar esta carpeta.</Alert>}
               {items.map((item) => (
-                <Box className="file-row" key={item.path}>
+                <Box className="file-row" key={item.object_id ?? `${item.is_dir ? 'dir' : 'file'}:${item.path}`}>
                   {side === 'source' ? (
                     <Checkbox
                       size="small"
-                      checked={selectedPaths?.includes(item.path) ?? false}
+                      checked={selectedItems?.some((selected) => (
+                        item.object_id
+                          ? selected.object_id === item.object_id
+                          : !selected.object_id && selected.path === item.path
+                      )) ?? false}
                       onChange={() => onToggle?.(item)}
                       inputProps={{ 'aria-label': `Seleccionar ${item.name}` }}
                     />
                   ) : <Box className="file-row-spacer" />}
                   <Button
                     className="file-name"
-                    onClick={() => item.is_dir && onPathChange(item.path)}
+                    onClick={() => item.is_dir && onPathChange(item.path, item.object_id ?? null)}
                     disabled={!item.is_dir}
                     startIcon={<InterfaceIcon name={item.is_dir ? 'folder' : 'file'} />}
                   >
@@ -1822,8 +1840,10 @@ function TransferWorkspace({
   const [sourceId, setSourceId] = useState('');
   const [destinationId, setDestinationId] = useState('');
   const [sourcePath, setSourcePath] = useState('/');
+  const [sourceDirectoryIds, setSourceDirectoryIds] = useState<Record<string, string>>({});
   const [destinationPath, setDestinationPath] = useState('/');
-  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const [selectedItems, setSelectedItems] = useState<StorageItem[]>([]);
+  const selectedPaths = selectedItems.map((item) => item.path);
   const sourceConnection = connectionById.get(sourceId);
   const destinationConnection = connectionById.get(destinationId);
   const canTransfer = Boolean(
@@ -1833,7 +1853,6 @@ function TransferWorkspace({
     && selectedPaths.length > 0
     && selectedPaths.length <= 100,
   );
-  const [conflictPolicy, setConflictPolicy] = useState<'SKIP' | 'OVERWRITE_IF_DIFFERENT'>('OVERWRITE_IF_DIFFERENT');
   const [sendEmailNotification, setSendEmailNotification] = useState(false);
   const [mobileStep, setMobileStep] = useState(0);
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
@@ -1999,7 +2018,8 @@ function TransferWorkspace({
     if (sourceId && !sourceIsAvailable) {
       setSourceId(connections[0]?.id ?? '');
       setSourcePath('/');
-      setSelectedPaths([]);
+      setSourceDirectoryIds({});
+      setSelectedItems([]);
     } else if (!sourceId && connections[0]) {
       setSourceId(connections[0].id);
     }
@@ -2106,9 +2126,18 @@ function TransferWorkspace({
   }, [streamTransferIds, backgroundTransferIds, queryClient]);
 
   const toggleItem = (item: StorageItem) => {
-    setSelectedPaths((current) => current.includes(item.path)
-      ? current.filter((path) => path !== item.path)
-      : [...current, item.path]);
+    setSelectedItems((current) => {
+      const selected = current.some((candidate) => (
+        item.object_id
+          ? candidate.object_id === item.object_id
+          : !candidate.object_id && candidate.path === item.path
+      ));
+      return selected
+        ? current.filter((candidate) => item.object_id
+          ? candidate.object_id !== item.object_id
+          : Boolean(candidate.object_id) || candidate.path !== item.path)
+        : [...current, item];
+    });
   };
 
   const openScheduleDialog = (transfer?: Transfer) => {
@@ -2151,9 +2180,11 @@ function TransferWorkspace({
             source_connection_id: sourceId,
             destination_connection_id: destinationId,
             source_paths: selectedPaths,
+            source_item_ids: selectedItems.map((item) => item.object_id ?? null),
+            source_parent_ids: selectedItems.map((item) => item.parent_object_id ?? null),
             destination_path: destinationPath,
             operation: 'COPY',
-            conflict_policy: conflictPolicy,
+            conflict_policy: 'KEEP_BOTH',
             send_email_notification: sendEmailNotification,
             ...scheduling,
         });
@@ -2163,7 +2194,7 @@ function TransferWorkspace({
           : transfer
       ));
       setScheduleDialogOpen(false);
-      setSelectedPaths(editingScheduleId ? selectedPaths : []);
+      setSelectedItems(editingScheduleId ? selectedItems : []);
       setNotice(editingScheduleId ? 'La transferencia se reprogramó.' : 'La transferencia quedó programada.');
       setNoticeSeverity('success');
       await Promise.all([
@@ -2188,13 +2219,15 @@ function TransferWorkspace({
           source_connection_id: sourceId,
           destination_connection_id: destinationId,
           source_paths: selectedPaths,
+          source_item_ids: selectedItems.map((item) => item.object_id ?? null),
+          source_parent_ids: selectedItems.map((item) => item.parent_object_id ?? null),
           destination_path: destinationPath,
           operation: 'COPY',
-          conflict_policy: conflictPolicy,
+          conflict_policy: 'KEEP_BOTH',
           send_email_notification: sendEmailNotification,
       });
       setActiveTransfer(transfer);
-      setSelectedPaths([]);
+      setSelectedItems([]);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['transfers'] }),
         queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
@@ -2269,7 +2302,8 @@ function TransferWorkspace({
     if (sourceId === connection.id) {
       setSourceId('');
       setSourcePath('/');
-      setSelectedPaths([]);
+      setSourceDirectoryIds({});
+      setSelectedItems([]);
     }
     if (destinationId === connection.id) {
       setDestinationId('');
@@ -2286,10 +2320,23 @@ function TransferWorkspace({
         side="source"
         connections={connections}
         connectionId={sourceId}
-        onConnectionChange={(id) => { setSourceId(id); setSourcePath('/'); setSelectedPaths([]); }}
+        onConnectionChange={(id) => { setSourceId(id); setSourcePath('/'); setSourceDirectoryIds({}); setSelectedItems([]); }}
         path={sourcePath}
-        onPathChange={setSourcePath}
-        selectedPaths={selectedPaths}
+        directoryIds={sourceDirectoryIds}
+        onPathChange={(path, objectId) => {
+          setSourcePath(path);
+          if (path === '/') {
+            setSourceDirectoryIds({});
+          } else {
+            setSourceDirectoryIds((current) => {
+              const next = { ...current };
+              if (objectId) next[path] = objectId;
+              else delete next[path];
+              return next;
+            });
+          }
+        }}
+        selectedItems={selectedItems}
         onToggle={toggleItem}
         isAdmin={user.role === 'ADMIN'}
         onTestConnection={runConnectionTest}
@@ -2542,7 +2589,8 @@ function TransferWorkspace({
             onExplore={(connection) => {
               setSourceId(connection.id);
               setSourcePath('/');
-              setSelectedPaths([]);
+              setSourceDirectoryIds({});
+              setSelectedItems([]);
               setWorkspaceSection('explorer');
             }}
             onArchive={archiveConnection}
@@ -2748,18 +2796,10 @@ function TransferWorkspace({
             </Box>
           </Box>
           <Stack className="transfer-options" spacing={0.75}>
-            <FormControl size="small" fullWidth>
-              <InputLabel id="conflict-policy-label">Si ya existe</InputLabel>
-              <Select
-                labelId="conflict-policy-label"
-                label="Si ya existe"
-                value={conflictPolicy}
-                onChange={(event) => setConflictPolicy(event.target.value as typeof conflictPolicy)}
-              >
-                <MenuItem value="OVERWRITE_IF_DIFFERENT">Reemplazar si cambió</MenuItem>
-                <MenuItem value="SKIP">Omitir existentes</MenuItem>
-              </Select>
-            </FormControl>
+            <Box className="transfer-conflict-policy" aria-label="Política de archivos existentes">
+              <Typography variant="caption" color="text.secondary">Si ya existe</Typography>
+              <Typography variant="body2" fontWeight={650}>Conservar ambos · numerar la copia</Typography>
+            </Box>
             <FormControlLabel
               control={<Checkbox checked={sendEmailNotification} onChange={(_event, checked) => setSendEmailNotification(checked)} size="small" />}
               label={<Typography variant="caption">Avisarme por correo al terminar</Typography>}
@@ -2822,11 +2862,11 @@ function TransferWorkspace({
         ))}
 
         {reportTransferId && (
-          <Card className="progress-card" variant="outlined" aria-label="Resultado de migración SMB">
+          <Card className="progress-card" variant="outlined" aria-label="Resultado de transferencia">
             <CardContent>
               <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2}>
                 <Box>
-                  <Typography variant="overline" color="text.secondary">INVENTARIO Y RESULTADOS</Typography>
+                  <Typography variant="overline" color="text.secondary">ARCHIVOS Y NOMBRES ASIGNADOS</Typography>
                   <Typography variant="h6">
                     {historyTransfers.find((transfer) => transfer.id === reportTransferId)?.public_id}
                   </Typography>
@@ -2839,13 +2879,18 @@ function TransferWorkspace({
                 </Typography>
               )}
               {transferManifestQuery.isLoading && <LinearProgress sx={{ mt: 1 }} />}
-              {transferManifestQuery.isError && <Alert severity="error" sx={{ mt: 1 }}>No se pudo cargar el resultado de la migración.</Alert>}
+              {transferManifestQuery.isError && <Alert severity="error" sx={{ mt: 1 }}>No se pudo cargar el resultado de la transferencia.</Alert>}
               <Stack spacing={0.75} sx={{ mt: 1.5 }}>
                 {transferManifestQuery.data?.pages.flatMap((page) => page.items).map((item) => (
                   <Box key={item.id} className="history-row">
                     <Chip size="small" label={item.status === 'DIRECTORY' ? 'Carpeta' : item.status} color={item.status === 'FAILED' ? 'error' : item.status === 'COPIED' ? 'success' : 'default'} />
                     <Box className="history-label">
                       <Typography variant="body2" title={item.source_path}>{item.source_path}</Typography>
+                      {item.requested_destination_path !== item.destination_path && (
+                        <Typography variant="caption" color="text.secondary" title={item.requested_destination_path}>
+                          Nombre solicitado: {item.requested_destination_path}
+                        </Typography>
+                      )}
                       <Typography variant="caption" color="text.secondary" title={item.destination_path}>{item.destination_path}</Typography>
                     </Box>
                     {item.error_code && <Typography variant="caption" color="error">{item.error_code}</Typography>}
@@ -2897,7 +2942,9 @@ function TransferWorkspace({
                   <span>{destinationConnection?.name ?? 'Conexión no disponible'}</span>
                 </Box>
                 <Typography variant="caption" color="text.secondary" className="history-counts">
-                  {sourceConnection?.provider_type === 'SMB'
+                  {transfer.conflict_policy === 'KEEP_BOTH'
+                    ? `${transfer.files_completed} de ${transfer.files_total} archivos · ${transfer.warning_count ?? 0} nombres numerados · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
+                    : sourceConnection?.provider_type === 'SMB'
                     ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${transfer.manifest_summary?.failed ?? 0} con error · ${transfer.manifest_summary?.skipped ?? 0} omitidos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
                     : `${transfer.files_completed} de ${transfer.files_total} archivos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`}
                 </Typography>
@@ -2914,7 +2961,7 @@ function TransferWorkspace({
                 <Typography variant="body2" fontWeight={700}>{formatProgressPercent(transfer.progress_percent)}%</Typography>
                 <Box className="history-progress-track"><Box style={{ width: `${Math.max(0, Math.min(100, transfer.progress_percent))}%` }} /></Box>
               </Box>
-              {sourceConnection?.provider_type === 'SMB' && (
+              {(sourceConnection?.provider_type === 'SMB' || transfer.conflict_policy === 'KEEP_BOTH') && (
                 <Stack spacing={0.5} alignItems="flex-start">
                   <Button
                     size="small"

@@ -75,6 +75,20 @@ async def test_lists_directories_and_files_preserving_spaces_and_unicode(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_listing_keeps_mega_handles_separate_from_duplicate_names(tmp_path: Path):
+    listing = (
+        b"---- 1 42 2026-10-09T08:15:00 History API.mp4 H:AbCd1234\n"
+        b"---- 1 43 2026-10-09T08:15:00 History API.mp4 H:EfGh5678\n"
+    )
+    page = await make_provider(tmp_path, ListingRunner(listing)).list_items("/")
+
+    assert [(item.name, item.object_id) for item in page.items] == [
+        ("History API.mp4", "H:AbCd1234"),
+        ("History API.mp4", "H:EfGh5678"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_listing_handles_empty_and_malformed_rows(tmp_path: Path):
     provider = make_provider(tmp_path, ListingRunner(b"\nmalformed row\n"))
 

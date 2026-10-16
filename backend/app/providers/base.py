@@ -14,6 +14,8 @@ class StorageItem(BaseModel):
     modified_at: datetime | None = None
     mime_type: str | None = None
     provider_type: str
+    object_id: str | None = None
+    parent_object_id: str | None = None
 
 
 class PaginatedItems(BaseModel):
@@ -50,11 +52,17 @@ class StorageProvider(ABC):
         sort_by: str = "name",
         direction: str = "asc",
         search: str | None = None,
+        parent_object_id: str | None = None,
     ) -> PaginatedItems:
         """List files and directories directly below a path."""
 
     @abstractmethod
-    async def get_item(self, path: str) -> StorageItem | None:
+    async def get_item(
+        self,
+        path: str,
+        object_id: str | None = None,
+        parent_object_id: str | None = None,
+    ) -> StorageItem | None:
         """Return metadata for one item."""
 
     @abstractmethod

@@ -139,6 +139,7 @@ class MegaCmdSession:
         sort_by: str = "name",
         direction: str = "asc",
         search: str | None = None,
+        parent_object_id: str | None = None,
     ) -> PaginatedItems:
         if not 1 <= page_size <= 200:
             raise ValueError("page_size must be between 1 and 200")
@@ -149,10 +150,12 @@ class MegaCmdSession:
         if direction not in {"asc", "desc"}:
             raise ValueError("Unsupported sort direction")
         safe_path = MockStorageProvider.normalize_path(path)
+        remote_reference = parent_object_id or safe_path
         stdout, _stderr = await self._run(
-            "ls", ["-l", "--time-format=ISO6081_WITH_TIME", safe_path]
+            "ls",
+            ["-l", "--show-handles", "--time-format=ISO6081_WITH_TIME", remote_reference],
         )
-        items = _parse_listing(stdout, safe_path)
+        items = _parse_listing(stdout, safe_path, parent_object_id)
         if search:
             items = [item for item in items if search.casefold() in item.name.casefold()]
 
@@ -182,13 +185,31 @@ class MegaCmdSession:
             total_count=len(items),
         )
 
-    async def get_item(self, path: str) -> StorageItem | None:
+    async def get_item(
+        self,
+        path: str,
+        object_id: str | None = None,
+        parent_object_id: str | None = None,
+    ) -> StorageItem | None:
         normalized = MockStorageProvider.normalize_path(path)
         if normalized == "/":
             return StorageItem(name="/", path="/", is_dir=True, provider_type="MEGA")
         parent, _, name = normalized.rpartition("/")
-        result = await self.list_items(parent or "/", page_size=200, search=name)
-        return next((item for item in result.items if item.path == normalized), None)
+        result = await self.list_items(
+            parent or "/",
+            page_size=200,
+            search=name,
+            parent_object_id=parent_object_id,
+        )
+        return next(
+            (
+                item
+                for item in result.items
+                if item.path == normalized
+                and (object_id is None or item.object_id == object_id)
+            ),
+            None,
+        )
 
     async def get_quota(self) -> StorageQuota | None:
         stdout, stderr = await self._run("df", ["-h"])
@@ -200,6 +221,7 @@ class MegaCmdSession:
         remote_path: str,
         destination_dir: Path,
         *,
+        object_id: str | None = None,
         line_callback: LineCallback | None = None,
         should_cancel: CancelCheck | None = None,
     ) -> Path:
@@ -208,9 +230,10 @@ class MegaCmdSession:
             raise ValueError("A remote file path is required")
         destination = destination_dir.resolve()
         destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+        remote_reference = object_id or safe_remote_path
         await self._run(
             "get",
-            [safe_remote_path, str(destination)],
+            [remote_reference, str(destination)],
             line_callback=line_callback,
             should_cancel=should_cancel,
         )
@@ -346,6 +369,7 @@ class MegaCmdProvider(StorageProvider):
         sort_by: str = "name",
         direction: str = "asc",
         search: str | None = None,
+        parent_object_id: str | None = None,
     ) -> PaginatedItems:
         async with self.open_session() as session:
             return await session.list_items(
@@ -355,11 +379,17 @@ class MegaCmdProvider(StorageProvider):
                 sort_by=sort_by,
                 direction=direction,
                 search=search,
+                parent_object_id=parent_object_id,
             )
 
-    async def get_item(self, path: str) -> StorageItem | None:
+    async def get_item(
+        self,
+        path: str,
+        object_id: str | None = None,
+        parent_object_id: str | None = None,
+    ) -> StorageItem | None:
         async with self.open_session() as session:
-            return await session.get_item(path)
+            return await session.get_item(path, object_id, parent_object_id)
 
     async def get_quota(self) -> StorageQuota | None:
         try:
@@ -369,7 +399,9 @@ class MegaCmdProvider(StorageProvider):
             return None
 
 
-def _parse_listing(output: bytes, parent_path: str) -> list[StorageItem]:
+def _parse_listing(
+    output: bytes, parent_path: str, parent_object_id: str | None = None
+) -> list[StorageItem]:
     text = output.decode("utf-8", errors="replace")
     items: list[StorageItem] = []
     for line in text.splitlines():
@@ -384,6 +416,13 @@ def _parse_listing(output: bytes, parent_path: str) -> list[StorageItem]:
         # their first column, never the filename (a real NAME must survive).
         if flags.upper() == "FLAGS" or flags.startswith("/"):
             continue
+        handle_match = re.search(r"(?<!\S)H:[A-Za-z0-9_-]{8}(?!\S)", time_and_name)
+        object_id = handle_match.group(0) if handle_match is not None else None
+        if handle_match is not None:
+            time_and_name = (
+                f"{time_and_name[:handle_match.start()]}"
+                f"{time_and_name[handle_match.end():]}"
+            ).strip()
         parsed_time = _parse_time_and_name(time_and_name)
         if parsed_time is None:
             continue
@@ -406,6 +445,8 @@ def _parse_listing(output: bytes, parent_path: str) -> list[StorageItem]:
                 size_bytes=size,
                 modified_at=modified_at,
                 provider_type="MEGA",
+                object_id=object_id,
+                parent_object_id=parent_object_id,
             )
         )
     return items

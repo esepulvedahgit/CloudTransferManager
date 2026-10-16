@@ -67,6 +67,46 @@ async def test_manifest_batches_are_idempotent_and_track_directory_and_file_resu
 
 
 @pytest.mark.asyncio
+async def test_manifest_distinguishes_same_path_objects_and_keeps_first_assignment():
+    store = MemoryStore()
+    transfer = transfer_record(uuid.uuid4())
+    store.transfers[transfer.id] = transfer
+    entries = [
+        {
+            **manifest_entry("/folder/report.txt", is_dir=False, size_bytes=10),
+            "source_object_id": "H:First123",
+            "requested_destination_path": "/archive/report.txt",
+            "destination_path": "/archive/report.txt",
+        },
+        {
+            **manifest_entry("/folder/report.txt", is_dir=False, size_bytes=12),
+            "source_object_id": "H:Second12",
+            "requested_destination_path": "/archive/report.txt",
+            "destination_path": "/archive/report_01.txt",
+            "rename_reason": "NAME_COLLISION",
+        },
+    ]
+
+    assert await store.aadd_transfer_manifest_items(transfer.id, entries) == 2
+    changed_retry = {
+        **entries[0],
+        "destination_path": "/archive/report_99.txt",
+        "rename_reason": "NAME_COLLISION",
+    }
+    assert await store.aadd_transfer_manifest_items(transfer.id, [changed_retry]) == 0
+    items = await store.alist_transfer_manifest_items(
+        transfer.id,
+        statuses={"PENDING"},
+        limit=10,
+    )
+
+    assert [(item.source_object_id, item.destination_path) for item in items] == [
+        ("H:First123", "/archive/report.txt"),
+        ("H:Second12", "/archive/report_01.txt"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_memory_store_live_manifest_progress_does_not_count_failed_empty_files_as_copied():
     store = MemoryStore()
     transfer = transfer_record(uuid.uuid4())

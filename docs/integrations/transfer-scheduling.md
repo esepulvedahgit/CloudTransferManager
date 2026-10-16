@@ -17,16 +17,16 @@ Las transferencias programadas, exclusivas, dependientes o en espera no crean ta
 
 Las tareas futuras y en cola conservan en **Programaciones** las acciones disponibles para reprogramar o cancelar. Las ejecuciones activas también permanecen allí como filas de estado, sin una tarjeta de progreso; desde la sección se puede solicitar su cancelación. La sección pagina los trabajos activos y permite cargar páginas anteriores para conservar accesibles las acciones de cancelación aunque existan más de 200 tareas recientes. Cuando una ejecución termina, desaparece del indicador y pasa al historial con su estado definitivo. La UI recibe actualizaciones inmediatas por SSE y vuelve a consultar cada 15 segundos si se perdió un evento; el sondeo se pausa cuando la pestaña queda en segundo plano.
 
-Para migraciones SMB, el historial muestra los conteos reales del manifiesto (`copied`, `failed`, `skipped`) junto al avance en bytes. `files_completed` cuenta elementos procesados/resueltos y no se debe interpretar como cantidad de archivos copiados.
+El historial muestra los conteos del manifiesto común (`copied`, `failed`, `skipped`) junto al avance en bytes. Cada fila puede mostrar el nombre solicitado y el asignado. `files_completed` cuenta elementos resueltos y no se debe interpretar como cantidad de archivos copiados.
 
 Si Cloud Transfer Manager estuvo detenido cuando llegó la hora, Beat recupera el trabajo en el siguiente ciclo. La espera normal del dispatcher es de hasta 15 segundos, más el tiempo que demore en liberarse la capacidad o la dependencia.
 
 ## Modos de ejecución
 
-- **Automática (`AUTO`)**: respeta `TRANSFER_MAX_CONCURRENT`, los conflictos de lectura/escritura por conexión y el cupo de staging. Las copias directas compatibles pueden correr en paralelo.
+- **Automática (`AUTO`)**: respeta `TRANSFER_MAX_CONCURRENT`, los conflictos de lectura/escritura por conexión y el cupo de staging. Las transferencias nuevas de todos los proveedores usan staging por archivo y comparten su cupo; los trabajos históricos conservan la ruta de ejecución que corresponde a su política.
 - **Exclusiva (`EXCLUSIVE`)**: espera a que terminen los trabajos ya admitidos. Cuando llega a la cabeza de la cola, impide admitir trabajos posteriores hasta finalizar. Si se programa para el futuro, no bloquea la cola antes de su hora.
 
-Las transferencias SMB, las que usan MEGA y las conexiones Seafile API consumen el único cupo compartido de staging. Las transferencias directas compatibles pueden aprovechar los demás cupos automáticos.
+Las transferencias nuevas `KEEP_BOTH` de cualquier par consumen el cupo compartido de staging. Esto puede serializar transferencias simultáneas mientras un trabajo mantiene staging reservado.
 
 ## Dependencias
 

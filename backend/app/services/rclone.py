@@ -184,10 +184,10 @@ class RcloneRunner:
         paths = [self._validate_remote_path(path) for path in remote_paths]
         argv = [self.binary, command, *paths, "--config", config_path]
         if command == "copy":
-            if conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT"}:
+            if conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT", "KEEP_BOTH"}:
                 raise ValueError("Unsupported copy conflict policy")
             argv.extend(["--use-json-log", "--stats", "1s", "--stats-log-level", "NOTICE"])
-            if conflict_policy == "SKIP":
+            if conflict_policy in {"SKIP", "KEEP_BOTH"}:
                 argv.append("--ignore-existing")
             if create_empty_src_dirs:
                 argv.append("--create-empty-src-dirs")
@@ -368,7 +368,7 @@ class RcloneRunner:
         max_transfer_bytes: int | None = None,
         force_transfer: bool = False,
     ) -> list[str]:
-        if conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT"}:
+        if conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT", "KEEP_BOTH"}:
             raise ValueError("Unsupported copy conflict policy")
         command = [
             self.binary,
@@ -383,7 +383,7 @@ class RcloneRunner:
             "--stats-log-level",
             "NOTICE",
         ]
-        if conflict_policy == "SKIP":
+        if conflict_policy in {"SKIP", "KEEP_BOTH"}:
             command.append("--ignore-existing")
         if create_empty_src_dirs:
             command.append("--create-empty-src-dirs")
