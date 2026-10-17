@@ -214,3 +214,7 @@ La operación devuelve `204 No Content` al completarse, `404 Not Found` para UUI
   - `test_test_connection_endpoint`: Endpoint `/api/v1/connections/{id}/test` ejecuta y actualiza `last_tested_at`.
   - `test_archive_connection_preserves_transfer_history`: Archivar una conexión inactiva borra ciphertext y permisos, sin eliminar transferencias o eventos.
   - `test_archive_connection_rejects_active_transfers`: Una transferencia en cualquiera de los estados activos bloquea el archivado con `409`.
+
+### Formato MEGAcmd comprobado (2026-10-16)
+
+El listado largo real con `--show-handles` coloca `H:XXXXXXXX` entre fecha y nombre. El parser consume únicamente la columna y un separador, preservando espacios legítimos y Unicode. Los encabezados no son nodos; filas de nodos incompletas, tamaños/fechas inválidos o identidades mal formadas fallan con `MegaCmdListingError`. No se buscan identificadores dentro del nombre. La descarga por handle se verifica en staging privado: nombre exacto, archivo regular, sin symlinks ni salidas adicionales; el ejecutor compara el tamaño con el inventario. Una salida con nombre distinto produce error determinista, no se acepta por coincidencia de tamaño.

@@ -9,10 +9,13 @@ from app.main import TransferCreate, create_app
 from app.security.passwords import PasswordService
 from app.services.database_store import DatabaseStore
 from app.services.memory_store import MemoryStore, TransferRecord
+from app.services.source_inventory import InventoryProgress
+from app.services.transfer_evaluation import EvaluationClaim, EvaluationRecord
 from app.services.transfer_scheduling import (
     TransferReservation,
     admission_wait_reason,
     dependency_wait_reason,
+    evaluation_wait_reason,
     transfer_requires_staging,
 )
 from app.settings import Settings
@@ -137,6 +140,300 @@ def test_transfer_dependencies_only_open_after_success_including_warnings():
     assert dependency_wait_reason("CANCELLED") == "BLOCKED_PARENT_FAILED"
 
 
+def test_evaluation_wait_reason_distinguishes_pending_blocked_and_approved():
+    transfer_id = uuid.uuid4()
+    evaluation = EvaluationRecord(id=uuid.uuid4(), transfer_id=transfer_id, status="PENDING")
+
+    assert evaluation_wait_reason(None) is None
+    assert evaluation_wait_reason(evaluation) == "WAITING_EVALUATION"
+    evaluation.status = "EVALUATING"
+    assert evaluation_wait_reason(evaluation) == "WAITING_EVALUATION"
+    evaluation.status = "BLOCKED"
+    assert evaluation_wait_reason(evaluation) == "BLOCKED_EVALUATION"
+    evaluation.status = "ERROR"
+    assert evaluation_wait_reason(evaluation) == "BLOCKED_EVALUATION"
+    evaluation.status = "WAITING_PARENT"
+    assert evaluation_wait_reason(evaluation) == "WAITING_PARENT"
+    evaluation.status = "APPROVED"
+    assert evaluation_wait_reason(evaluation) is None
+
+
+@pytest.mark.asyncio
+async def test_database_dispatcher_keeps_pending_and_blocked_evaluations_in_programaciones(
+    tmp_path,
+):
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'evaluation-gate.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("evaluation-owner", "evaluation@example.test", "hash")
+    source = await store.acreate_connection("Drive A", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x")
+    destination = await store.acreate_connection(
+        "Drive B", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x"
+    )
+    scheduled_at = datetime.now(UTC) + timedelta(minutes=1)
+    transfer = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/source"],
+        "/destination",
+        scheduled_at=scheduled_at,
+    )
+    waiting = await store.adispatch_due_transfers(
+        scheduled_at + timedelta(seconds=1), max_concurrent=1
+    )
+    pending = await store.aget_transfer(transfer.id)
+    claim = (await store.aclaim_due_evaluations(scheduled_at + timedelta(seconds=1)))[0]
+    assert await store.afinish_evaluation(
+        claim,
+        status="BLOCKED",
+        progress=InventoryProgress(files_found=5001, count_complete=False),
+        error_code="TRANSFER_FILE_LIMIT_EXCEEDED",
+        message="La selección supera el límite.",
+        now=scheduled_at + timedelta(seconds=2),
+    )
+    blocked = await store.adispatch_due_transfers(
+        scheduled_at + timedelta(seconds=2), max_concurrent=1
+    )
+    current = await store.aget_transfer(transfer.id)
+    programaciones = await store.alist_transfers(pending_only=True)
+    await store.aclose()
+
+    assert waiting.admitted == []
+    assert pending is not None and pending.wait_reason == "WAITING_EVALUATION"
+    assert blocked.admitted == []
+    assert current is not None and current.wait_reason == "BLOCKED_EVALUATION"
+    assert transfer.id in {item.id for item in programaciones}
+
+
+@pytest.mark.asyncio
+async def test_approved_evaluation_allows_dispatch_when_schedule_is_due(tmp_path):
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'approved-evaluation.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("approved-owner", "approved@example.test", "hash")
+    source = await store.acreate_connection("Drive A", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x")
+    destination = await store.acreate_connection(
+        "Drive B", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x"
+    )
+    scheduled_at = datetime.now(UTC) + timedelta(minutes=1)
+    transfer = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/source"],
+        "/destination",
+        scheduled_at=scheduled_at,
+    )
+    claim = (await store.aclaim_due_evaluations(datetime.now(UTC)))[0]
+    assert await store.afinish_evaluation(
+        claim,
+        status="APPROVED",
+        progress=InventoryProgress(files_found=4180, count_complete=True),
+        error_code=None,
+        message=None,
+        now=datetime.now(UTC),
+    )
+
+    batch = await store.adispatch_due_transfers(
+        scheduled_at + timedelta(seconds=1), max_concurrent=1
+    )
+    await store.aclose()
+
+    assert [job.id for job in batch.admitted] == [transfer.id]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_transfer_waiting_for_evaluation_does_not_block_later_work(tmp_path):
+    from sqlalchemy import update
+
+    from app.models import TransferJob
+
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'exclusive-evaluation.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("exclusive-owner", "exclusive@example.test", "hash")
+    connections = [
+        await store.acreate_connection(
+            f"Drive {index}", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x"
+        )
+        for index in range(4)
+    ]
+    scheduled_at = datetime.now(UTC) + timedelta(minutes=1)
+    exclusive = await store.acreate_transfer(
+        user.id,
+        connections[0].id,
+        connections[1].id,
+        ["/exclusive"],
+        "/destination",
+        execution_mode="EXCLUSIVE",
+        scheduled_at=scheduled_at,
+    )
+    async with store.sessions() as session:
+        await session.execute(
+            update(TransferJob)
+            .where(TransferJob.id == exclusive.id)
+            .values(scheduled_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await session.commit()
+    compatible = await store.acreate_transfer(
+        user.id,
+        connections[2].id,
+        connections[3].id,
+        ["/compatible"],
+        "/destination",
+        conflict_policy="SKIP",
+    )
+
+    batch = await store.adispatch_due_transfers(datetime.now(UTC), max_concurrent=2)
+    waiting = await store.aget_transfer(exclusive.id)
+    await store.aclose()
+
+    assert exclusive.id not in {job.id for job in batch.admitted}
+    assert [job.id for job in batch.admitted] == [compatible.id]
+    assert waiting is not None and waiting.wait_reason == "WAITING_EVALUATION"
+
+
+@pytest.mark.asyncio
+async def test_changed_file_limit_invalidates_approval_and_starts_new_generation(tmp_path):
+    from sqlalchemy import update
+
+    from app.models import TransferEvaluation
+
+    store = DatabaseStore(
+        Settings(
+            database_url=f"sqlite+aiosqlite:///{tmp_path / 'changed-limit.sqlite'}",
+            transfer_max_files=2,
+        )
+    )
+    await store.create_schema()
+    user = await store.acreate_user("limit-owner", "limit@example.test", "hash")
+    source = await store.acreate_connection("Drive A", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x")
+    destination = await store.acreate_connection(
+        "Drive B", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x"
+    )
+    scheduled_at = datetime.now(UTC) + timedelta(minutes=1)
+    transfer = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/source"],
+        "/destination",
+        scheduled_at=scheduled_at,
+    )
+    async with store.sessions() as session:
+        await session.execute(
+            update(TransferEvaluation)
+            .where(TransferEvaluation.transfer_job_id == transfer.id)
+            .values(
+                status="APPROVED",
+                generation=3,
+                sequence=8,
+                files_found=3,
+                count_complete=True,
+                max_files=5000,
+            )
+        )
+        await session.commit()
+
+    batch = await store.adispatch_due_transfers(
+        scheduled_at + timedelta(seconds=1), max_concurrent=1
+    )
+    current = await store.aget_transfer(transfer.id)
+    await store.aclose()
+
+    assert batch.admitted == []
+    assert current is not None and current.evaluation is not None
+    assert current.evaluation.status == "PENDING"
+    assert current.evaluation.generation == 4
+    assert current.evaluation.sequence == 0
+    assert current.evaluation.files_found is None
+    assert current.evaluation.max_files == 2
+    assert current.wait_reason == "WAITING_EVALUATION"
+
+
+@pytest.mark.asyncio
+async def test_credential_change_blocks_before_reserving_copy_dispatch(tmp_path):
+    from sqlalchemy import update
+
+    from app.models import StorageConnection, TransferEvaluation
+
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'changed-credentials.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("credential-owner", "credential@example.test", "hash")
+    source = await store.acreate_connection("Drive A", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x")
+    destination = await store.acreate_connection(
+        "Drive B", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x"
+    )
+    scheduled_at = datetime.now(UTC) + timedelta(minutes=1)
+    transfer = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/source"],
+        "/destination",
+        scheduled_at=scheduled_at,
+    )
+    async with store.sessions() as session:
+        await session.execute(
+            update(TransferEvaluation)
+            .where(TransferEvaluation.transfer_job_id == transfer.id)
+            .values(status="APPROVED", files_found=4, count_complete=True)
+        )
+        await session.execute(
+            update(StorageConnection)
+            .where(StorageConnection.id == source.id)
+            .values(credential_version=StorageConnection.credential_version + 1)
+        )
+        await session.commit()
+
+    batch = await store.adispatch_due_transfers(
+        scheduled_at + timedelta(seconds=1), max_concurrent=1
+    )
+    current = await store.aget_transfer(transfer.id)
+    await store.aclose()
+
+    assert batch.admitted == []
+    assert current is not None and current.dispatch_token is None
+    assert current.wait_reason == "BLOCKED_CONNECTION_CHANGED"
+
+
+@pytest.mark.asyncio
+async def test_memory_dispatcher_gates_pending_evaluation_without_exclusive_barrier():
+    store = MemoryStore()
+    owner = store.add_user("memory-schedule", "memory-schedule@example.test", "hash")
+    source = store.create_connection("Source", "MOCK", owner.id)
+    destination = store.create_connection("Destination", "MOCK", owner.id)
+    now = datetime.now(UTC)
+    exclusive = store.create_transfer(
+        owner.id,
+        source.id,
+        destination.id,
+        ["/exclusive"],
+        "/destination",
+        scheduled_at=now + timedelta(minutes=1),
+        execution_mode="EXCLUSIVE",
+    )
+    compatible = store.create_transfer(
+        owner.id,
+        source.id,
+        destination.id,
+        ["/compatible"],
+        "/destination",
+        conflict_policy="SKIP",
+    )
+
+    batch = await store.adispatch_due_transfers(now + timedelta(minutes=2), max_concurrent=2)
+
+    assert [transfer.id for transfer in batch.admitted] == [compatible.id]
+    assert exclusive.wait_reason == "WAITING_EVALUATION"
+
+
 def test_staging_transfer_waits_for_the_single_staging_slot():
     active = [
         TransferReservation(
@@ -248,7 +545,7 @@ async def test_database_dispatcher_enforces_nextcloud_connection_capacity(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_catches_up_a_scheduled_transfer_after_its_due_time(tmp_path):
+async def test_dispatcher_keeps_due_scheduled_transfer_until_evaluation_completes(tmp_path):
     store = DatabaseStore(
         Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'catch-up.sqlite'}")
     )
@@ -272,10 +569,12 @@ async def test_dispatcher_catches_up_a_scheduled_transfer_after_its_due_time(tmp
     batch = await store.adispatch_due_transfers(
         scheduled_at + timedelta(seconds=1), max_concurrent=1
     )
+    current = await store.aget_transfer(transfer.id)
     await store.aclose()
 
-    assert [job.id for job in batch.admitted] == [transfer.id]
-    assert batch.admitted[0].dispatch_token is not None
+    assert batch.admitted == []
+    assert current is not None and current.dispatch_token is None
+    assert current.wait_reason == "WAITING_EVALUATION"
 
 
 @pytest.mark.asyncio
@@ -415,6 +714,16 @@ async def test_pending_transfer_can_be_reprogrammed_but_an_admitted_job_cannot(t
     assert updated.execution_mode == "EXCLUSIVE"
     assert updated.scheduled_at is not None
 
+    claim = (await store.aclaim_due_evaluations(datetime.now(UTC)))[0]
+    assert await store.afinish_evaluation(
+        claim,
+        status="APPROVED",
+        progress=InventoryProgress(files_found=1, count_complete=True),
+        error_code=None,
+        message=None,
+        now=datetime.now(UTC),
+    )
+
     claimed = (await store.adispatch_due_transfers(later, max_concurrent=1)).admitted[0]
     rejected_edit = await store.aupdate_transfer_schedule(
         transfer.id,
@@ -427,6 +736,175 @@ async def test_pending_transfer_can_be_reprogrammed_but_an_admitted_job_cannot(t
 
     assert claimed.dispatch_token is not None
     assert rejected_edit is None
+
+
+@pytest.mark.asyncio
+async def test_schedule_conversion_creates_evaluation_and_date_change_preserves_approval(tmp_path):
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'schedule-conversion.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("conversion-owner", "conversion@example.test", "hash")
+    source = await store.acreate_connection("Source", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x")
+    destination = await store.acreate_connection(
+        "Destination", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x"
+    )
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/source"], "/destination"
+    )
+    scheduled_at = datetime.now(UTC) + timedelta(hours=1)
+
+    converted = await store.aupdate_transfer_schedule(
+        transfer.id,
+        scheduled_at=scheduled_at,
+        schedule_timezone="UTC",
+        execution_mode="AUTO",
+        depends_on_transfer_id=None,
+    )
+    assert converted is not None and converted.evaluation is not None
+    assert converted.evaluation.status == "PENDING"
+
+    claim = (await store.aclaim_due_evaluations(datetime.now(UTC)))[0]
+    assert await store.afinish_evaluation(
+        claim,
+        status="APPROVED",
+        progress=InventoryProgress(files_found=4, count_complete=True),
+        error_code=None,
+        message=None,
+        now=datetime.now(UTC),
+    )
+    approved = await store.aget_transfer(transfer.id)
+    assert approved is not None and approved.evaluation is not None
+    next_date = scheduled_at + timedelta(hours=1)
+    rescheduled = await store.aupdate_transfer_schedule(
+        transfer.id,
+        scheduled_at=next_date,
+        schedule_timezone="America/Santiago",
+        execution_mode="AUTO",
+        depends_on_transfer_id=None,
+    )
+    without_date = await store.aupdate_transfer_schedule(
+        transfer.id,
+        scheduled_at=None,
+        schedule_timezone="UTC",
+        execution_mode="AUTO",
+        depends_on_transfer_id=None,
+    )
+    await store.aclose()
+
+    assert rescheduled is not None and rescheduled.evaluation is not None
+    assert rescheduled.evaluation.status == "APPROVED"
+    assert rescheduled.evaluation.generation == approved.evaluation.generation
+    assert without_date is not None and without_date.evaluation is not None
+    assert without_date.evaluation.status == "APPROVED"
+
+
+@pytest.mark.asyncio
+async def test_dependency_change_invalidates_approval_until_parent_succeeds(tmp_path):
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'changed-parent.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("changed-parent-owner", "changed-parent@example.test", "hash")
+    source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
+    parent = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/parent"], "/destination"
+    )
+    parent.status = "RUNNING"
+    await store.asave_transfer(parent)
+    child = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/child"],
+        "/destination",
+        scheduled_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    old_claim_token = uuid.uuid4()
+    async with store.sessions() as session:
+        from sqlalchemy import update
+
+        from app.models import TransferEvaluation
+
+        await session.execute(
+            update(TransferEvaluation)
+            .where(TransferEvaluation.transfer_job_id == child.id)
+            .values(
+                status="EVALUATING",
+                files_found=4,
+                count_complete=False,
+                generation=3,
+                claim_token=old_claim_token,
+                attempt_count=1,
+            )
+        )
+        await session.commit()
+
+    updated = await store.aupdate_transfer_schedule(
+        child.id,
+        scheduled_at=child.scheduled_at,
+        schedule_timezone="UTC",
+        execution_mode="AUTO",
+        depends_on_transfer_id=parent.id,
+    )
+    old_claim_write = await store.afinish_evaluation(
+        EvaluationClaim(child.id, 3, old_claim_token),
+        status="APPROVED",
+        progress=InventoryProgress(files_found=4, count_complete=True),
+        error_code=None,
+        message=None,
+        now=datetime.now(UTC),
+    )
+    waiting_claims = await store.aclaim_due_evaluations(datetime.now(UTC))
+    parent.status = "COMPLETED"
+    await store.asave_transfer(parent)
+    ready_claims = await store.aclaim_due_evaluations(datetime.now(UTC) + timedelta(seconds=1))
+    await store.aclose()
+
+    assert updated is not None and updated.evaluation is not None
+    assert updated.evaluation.generation == 4
+    assert updated.evaluation.status == "WAITING_PARENT"
+    assert updated.evaluation.files_found is None
+    assert old_claim_write is False
+    assert waiting_claims == []
+    assert len(ready_claims) == 1 and ready_claims[0].transfer_id == child.id
+
+
+@pytest.mark.asyncio
+async def test_removing_schedule_does_not_bypass_a_pending_evaluation(tmp_path):
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'removed-schedule.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("unscheduled-owner", "unscheduled@example.test", "hash")
+    source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
+    transfer = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/source"],
+        "/destination",
+        scheduled_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    updated = await store.aupdate_transfer_schedule(
+        transfer.id,
+        scheduled_at=None,
+        schedule_timezone="UTC",
+        execution_mode="AUTO",
+        depends_on_transfer_id=None,
+    )
+    batch = await store.adispatch_due_transfers(datetime.now(UTC), max_concurrent=1)
+    current = await store.aget_transfer(transfer.id)
+    await store.aclose()
+
+    assert updated is not None and updated.evaluation is not None
+    assert batch.admitted == []
+    assert current is not None and current.evaluation is not None
+    assert current.evaluation.status == "PENDING"
+    assert current.wait_reason == "WAITING_EVALUATION"
 
 
 @pytest.mark.asyncio
@@ -748,6 +1226,7 @@ async def test_background_only_returns_nonterminal_scheduled_transfers():
         "failed": 1,
         "skipped": 1,
         "pending": 1,
+        "renamed": 0,
     }
     assert paged_response.json()["total_count"] == len(background_specs)
     assert len(paged_response.json()["items"]) == 2

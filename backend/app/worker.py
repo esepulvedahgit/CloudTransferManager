@@ -19,6 +19,8 @@ from app.services.smtp_config import load_smtp_server_config
 from app.services.staging import (
     cleanup_orphaned_transfer_staging_areas as cleanup_staging_areas,
 )
+from app.services.transfer_evaluation import EvaluationClaim
+from app.services.transfer_evaluator import TransferEvaluator
 from app.services.transfer_executor import TransferExecutor
 from app.settings import get_settings
 
@@ -42,6 +44,8 @@ celery_app.conf.update(
         "app.worker.send_transfer_notification": {"queue": "notifications"},
         "app.worker.send_legacy_transfer_notification": {"queue": "notifications"},
         "app.worker.dispatch_pending_transfers": {"queue": "control"},
+        "app.worker.dispatch_pending_evaluations": {"queue": "control"},
+        "app.worker.run_transfer_evaluation": {"queue": "evaluations"},
         "app.worker.dispatch_pending_notifications": {"queue": "control"},
         "app.worker.cleanup_orphaned_staging_areas": {"queue": "transfers"},
         "app.worker.record_beat_heartbeat": {"queue": "control"},
@@ -54,6 +58,11 @@ celery_app.conf.update(
         },
         "dispatch-pending-transfers": {
             "task": "app.worker.dispatch_pending_transfers",
+            "schedule": 15.0,
+            "options": {"queue": "control"},
+        },
+        "dispatch-pending-evaluations": {
+            "task": "app.worker.dispatch_pending_evaluations",
             "schedule": 15.0,
             "options": {"queue": "control"},
         },
@@ -90,6 +99,9 @@ async def _execute_transfer(transfer_id: uuid.UUID, dispatch_token: uuid.UUID) -
     event_bus = RedisEventBus(redis_client)
 
     async def publish(record: Any) -> None:
+        record.manifest_summary = (await store.alist_transfer_manifest_summaries([record.id]))[
+            record.id
+        ]
         await store.asave_transfer(record)
         try:
             await store.aadd_transfer_event(
@@ -156,9 +168,9 @@ async def _execute_transfer(transfer_id: uuid.UUID, dispatch_token: uuid.UUID) -
             execution_task: asyncio.Task[None] | None = None
             try:
                 execution_task = asyncio.create_task(
-                    TransferExecutor(
-                        current_settings, store, publish, should_cancel
-                    ).execute(transfer_id)
+                    TransferExecutor(current_settings, store, publish, should_cancel).execute(
+                        transfer_id
+                    )
                 )
                 done, _pending = await asyncio.wait(
                     {heartbeat_task, execution_task},
@@ -166,9 +178,7 @@ async def _execute_transfer(transfer_id: uuid.UUID, dispatch_token: uuid.UUID) -
                 )
                 if execution_task not in done:
                     heartbeat_error = (
-                        heartbeat_task.exception()
-                        if not heartbeat_task.cancelled()
-                        else None
+                        heartbeat_task.exception() if not heartbeat_task.cancelled() else None
                     )
                     execution_task.cancel()
                     await asyncio.gather(execution_task, return_exceptions=True)
@@ -243,9 +253,7 @@ async def _dispatch_pending_transfers() -> int:
             if token is None:
                 continue
             try:
-                run_transfer.apply_async(
-                    args=[str(transfer.id), str(token)], queue="transfers"
-                )
+                run_transfer.apply_async(args=[str(transfer.id), str(token)], queue="transfers")
             except Exception:
                 await store.arelease_transfer_dispatch(transfer.id, token)
         return len(batch.admitted)
@@ -257,6 +265,84 @@ async def _dispatch_pending_transfers() -> int:
 @celery_app.task(name="app.worker.dispatch_pending_transfers")  # type: ignore[untyped-decorator]
 def dispatch_pending_transfers() -> int:
     return asyncio.run(_dispatch_pending_transfers())
+
+
+async def _execute_transfer_evaluation(
+    transfer_id: uuid.UUID,
+    generation: int,
+    claim_token: uuid.UUID,
+) -> None:
+    current_settings = get_settings()
+    store = DatabaseStore(current_settings)
+    redis_client = Redis.from_url(current_settings.redis_url, decode_responses=True)
+    event_bus = RedisEventBus(redis_client)
+
+    async def publish(record: Any) -> None:
+        try:
+            await event_bus.publish_progress(str(record.id), _event_payload(record))
+        except Exception as exc:
+            logger.warning(
+                "Evaluation progress publication failed",
+                extra={
+                    "transfer_id": str(record.id),
+                    "exception_type": type(exc).__name__,
+                },
+            )
+
+    try:
+        evaluator = TransferEvaluator(current_settings, store, publish)
+        await evaluator.execute(
+            EvaluationClaim(
+                transfer_id=transfer_id,
+                generation=generation,
+                claim_token=claim_token,
+            )
+        )
+    finally:
+        await event_bus.aclose()
+        await store.aclose()
+
+
+@celery_app.task(name="app.worker.run_transfer_evaluation")  # type: ignore[untyped-decorator]
+def run_transfer_evaluation(transfer_id: str, generation: int, claim_token: str) -> None:
+    asyncio.run(
+        _execute_transfer_evaluation(
+            uuid.UUID(transfer_id),
+            generation,
+            uuid.UUID(claim_token),
+        )
+    )
+
+
+async def _dispatch_pending_evaluations() -> int:
+    current_settings = get_settings()
+    store = DatabaseStore(current_settings)
+    now = datetime.now(UTC)
+    try:
+        claims = await store.aclaim_due_evaluations(now, limit=20)
+        for claim in claims:
+            try:
+                run_transfer_evaluation.apply_async(
+                    args=[str(claim.transfer_id), claim.generation, str(claim.claim_token)],
+                    queue="evaluations",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Evaluation task publication failed; its reservation will expire",
+                    extra={
+                        "transfer_id": str(claim.transfer_id),
+                        "generation": claim.generation,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+        return len(claims)
+    finally:
+        await store.aclose()
+
+
+@celery_app.task(name="app.worker.dispatch_pending_evaluations")  # type: ignore[untyped-decorator]
+def dispatch_pending_evaluations() -> int:
+    return asyncio.run(_dispatch_pending_evaluations())
 
 
 async def _record_beat_heartbeat() -> None:
@@ -286,9 +372,7 @@ async def _dispatch_pending_notifications() -> int:
                     args=[str(notification_id), str(dispatch_token)], queue="notifications"
                 )
             except Exception as exc:
-                await store.arelease_notification_dispatch(
-                    notification_id, now, dispatch_token
-                )
+                await store.arelease_notification_dispatch(notification_id, now, dispatch_token)
                 logger.warning(
                     "Notification queue publish failed",
                     extra={

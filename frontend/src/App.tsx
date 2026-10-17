@@ -52,6 +52,7 @@ import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-route
 import { z } from 'zod';
 import { apiRequest, ApiError } from './api';
 import DocumentationSection from './DocumentationSection';
+import ScheduledTransferEvaluation, { type TransferEvaluation } from './ScheduledTransferEvaluation';
 import './styles.css';
 
 type User = { id: string; username: string; email: string; role: 'ADMIN' | 'USER'; must_change_password?: boolean };
@@ -86,7 +87,7 @@ type StorageItem = {
   parent_object_id?: string | null;
 };
 type ItemPage = { items: StorageItem[]; next_cursor: string | null; total_count: number };
-type Transfer = {
+export type Transfer = {
   id: string;
   public_id: string;
   status: string;
@@ -115,9 +116,13 @@ type Transfer = {
   depends_on_transfer_id?: string | null;
   wait_reason?: string | null;
   can_edit_schedule?: boolean;
-  manifest_summary?: { copied: number; failed: number; skipped: number; pending: number };
+  evaluation?: TransferEvaluation;
+  manifest_summary?: { copied: number; failed: number; skipped: number; pending: number; renamed?: number };
 };
 type TransferListPage = { items: Transfer[]; total_count: number };
+type TransferCapabilities = {
+  max_files_by_source_provider: { default: number; SMB: number };
+};
 type TransferManifestItem = {
   id: string;
   source_path: string;
@@ -143,6 +148,19 @@ const successfulTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS'];
 const backgroundTransferStatuses = ['SCHEDULED', 'QUEUED', 'VALIDATING', 'RUNNING', 'RETRYING', 'CANCELLING'];
 const streamingTransferStatuses = ['VALIDATING', 'RUNNING', 'RETRYING', 'CANCELLING'];
 const terminalProgressDisplayMs = 3_000;
+const notRequiredEvaluation: TransferEvaluation = {
+  status: 'NOT_REQUIRED',
+  generation: 0,
+  sequence: 0,
+  files_found: null,
+  count_complete: false,
+  max_files: null,
+  started_at: null,
+  updated_at: null,
+  completed_at: null,
+  safe_error_code: null,
+  safe_message: null,
+};
 
 function isProgrammedBackgroundTransfer(transfer: Transfer): boolean {
   return backgroundTransferStatuses.includes(transfer.status) && Boolean(
@@ -153,21 +171,41 @@ function isProgrammedBackgroundTransfer(transfer: Transfer): boolean {
   );
 }
 
-function mergeTransferState(current: Transfer, incoming: Transfer): Transfer {
+export function mergeTransferState(current: Transfer, incoming: Transfer): Transfer {
+  const currentEvaluation = current.evaluation;
+  const incomingEvaluation = incoming.evaluation;
+  let latestEvaluation = currentEvaluation;
+  if (incomingEvaluation && !currentEvaluation) {
+    latestEvaluation = incomingEvaluation;
+  } else if (incomingEvaluation && currentEvaluation) {
+    if (
+      incomingEvaluation.generation > currentEvaluation.generation
+      || (
+        incomingEvaluation.generation === currentEvaluation.generation
+        && incomingEvaluation.sequence >= currentEvaluation.sequence
+      )
+    ) latestEvaluation = incomingEvaluation;
+  }
+
+  let merged: Transfer;
   const currentAttempt = current.attempt_count ?? 1;
   const incomingAttempt = incoming.attempt_count ?? 1;
-  if (incomingAttempt < currentAttempt) return current;
-  if (incomingAttempt > currentAttempt) return incoming;
-  const currentIsTerminal = terminalTransferStatuses.includes(current.status);
-  const incomingIsTerminal = terminalTransferStatuses.includes(incoming.status);
-  if (currentIsTerminal && !incomingIsTerminal) return current;
-  if (currentIsTerminal && incomingIsTerminal) return current;
-  if (
-    incoming.progress_percent < current.progress_percent
-    || incoming.files_completed < current.files_completed
-    || incoming.bytes_transferred < current.bytes_transferred
-  ) return current;
-  return incoming;
+  if (incomingAttempt < currentAttempt) merged = current;
+  else if (incomingAttempt > currentAttempt) merged = incoming;
+  else {
+    const currentIsTerminal = terminalTransferStatuses.includes(current.status);
+    const incomingIsTerminal = terminalTransferStatuses.includes(incoming.status);
+    if (currentIsTerminal && !incomingIsTerminal) merged = current;
+    else if (currentIsTerminal && incomingIsTerminal) merged = current;
+    else if (
+      incoming.progress_percent < current.progress_percent
+      || incoming.files_completed < current.files_completed
+      || incoming.bytes_transferred < current.bytes_transferred
+    ) merged = current;
+    else merged = incoming;
+  }
+  if (merged.evaluation === latestEvaluation) return merged;
+  return { ...merged, evaluation: latestEvaluation };
 }
 type LoginForm = { username_or_email: string; password: string };
 type ConnectionForm = {
@@ -1201,6 +1239,8 @@ function transferWaitReasonLabel(reason?: string | null): string | null {
   const labels: Record<string, string> = {
     WAITING_UNTIL: 'A la espera de la hora programada',
     WAITING_PARENT: 'A la espera de la transferencia padre',
+    WAITING_EVALUATION: 'Esperando que termine la evaluación de la selección',
+    BLOCKED_EVALUATION: 'Selección bloqueada por la evaluación previa',
     BLOCKED_PARENT_FAILED: 'Bloqueada: la transferencia padre no terminó correctamente',
     WAITING_CAPACITY: 'En cola: no hay un espacio de ejecución disponible',
     WAITING_EXCLUSIVE: 'En cola: espera a que terminen las otras transferencias',
@@ -1776,6 +1816,10 @@ function TransferWorkspace({
     queryKey: ['connections'],
     queryFn: () => apiRequest<{ items: Connection[] }>('/api/v1/connections'),
   });
+  const transferCapabilitiesQuery = useQuery({
+    queryKey: ['transfer-capabilities'],
+    queryFn: () => apiRequest<TransferCapabilities>('/api/v1/transfers/capabilities'),
+  });
   const transfersQuery = useQuery({
     queryKey: ['transfers'],
     queryFn: () => apiRequest<TransferListPage>('/api/v1/transfers?exclude_background=true&offset=0&page_size=50'),
@@ -1863,6 +1907,7 @@ function TransferWorkspace({
   const [scheduleParentId, setScheduleParentId] = useState('');
   const [scheduleError, setScheduleError] = useState('');
   const [transferFailure, setTransferFailure] = useState<{ transferId: string; message: string } | null>(null);
+  const [retryingEvaluationId, setRetryingEvaluationId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [noticeSeverity, setNoticeSeverity] = useState<'error' | 'info' | 'success' | 'warning'>('error');
   const [busy, setBusy] = useState(false);
@@ -1909,6 +1954,7 @@ function TransferWorkspace({
   ).values()]
     .filter((transfer) => (
       streamingTransferStatuses.includes(transfer.status)
+      || transfer.evaluation?.status === 'EVALUATING'
       || (transfer.status === 'QUEUED' && !isProgrammedBackgroundTransfer(transfer))
     ))
     .map((transfer) => `${transfer.id}:${transfer.status}`)
@@ -2195,7 +2241,9 @@ function TransferWorkspace({
       ));
       setScheduleDialogOpen(false);
       setSelectedItems(editingScheduleId ? selectedItems : []);
-      setNotice(editingScheduleId ? 'La transferencia se reprogramó.' : 'La transferencia quedó programada.');
+      setNotice(editingScheduleId
+        ? 'La transferencia se reprogramó.'
+        : 'Solicitud guardada; evaluando selección.');
       setNoticeSeverity('success');
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['transfers'] }),
@@ -2260,6 +2308,28 @@ function TransferWorkspace({
       setNoticeSeverity('error');
     } finally {
       setBusy(false);
+    }
+  };
+
+  const retryTransferEvaluation = async (transfer: Transfer) => {
+    setRetryingEvaluationId(transfer.id);
+    try {
+      await apiRequest<TransferEvaluation>(`/api/v1/transfers/${transfer.id}/evaluation`, {
+        method: 'POST',
+      });
+      setNotice('Se solicitó volver a evaluar la selección.');
+      setNoticeSeverity('info');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      ]);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo solicitar la evaluación.');
+      setNoticeSeverity('error');
+    } finally {
+      setRetryingEvaluationId(null);
     }
   };
 
@@ -2653,6 +2723,11 @@ function TransferWorkspace({
                         {transferWaitReasonLabel(transfer.wait_reason)}
                       </Typography>
                     )}
+                    <ScheduledTransferEvaluation
+                      evaluation={transfer.evaluation ?? notRequiredEvaluation}
+                      onRetry={() => void retryTransferEvaluation(transfer)}
+                      retrying={retryingEvaluationId === transfer.id}
+                    />
                   </Box>
                   <Stack className="scheduled-transfer-actions" direction="row" spacing={0.75}>
                     {editable && (
@@ -2846,7 +2921,7 @@ function TransferWorkspace({
               )}
               <LinearProgress variant={transfer.bytes_total ? 'determinate' : 'indeterminate'} value={transfer.progress_percent} sx={{ mt: 2, mb: 1 }} />
               <Typography variant="caption" color="text.secondary">
-                {formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)} · {transfer.files_completed}/{transfer.files_total} archivos
+                {formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)} · {transfer.conflict_policy === 'KEEP_BOTH' && connections.find((connection) => connection.id === transfer.source_connection_id)?.provider_type !== 'MOCK' ? `${transfer.manifest_summary?.copied ?? 0}/${transfer.files_total} copiados · ${transfer.manifest_summary?.failed ?? 0} con error · ${transfer.manifest_summary?.pending ?? transfer.files_total} pendientes` : `${transfer.files_completed}/${transfer.files_total} archivos`}
               </Typography>
               <Typography variant="caption" color="text.secondary" display="block">
                 {transfer.current_speed_bps === null ? 'Velocidad calculándose' : `${formatBytes(transfer.current_speed_bps)}/s`}
@@ -2942,8 +3017,8 @@ function TransferWorkspace({
                   <span>{destinationConnection?.name ?? 'Conexión no disponible'}</span>
                 </Box>
                 <Typography variant="caption" color="text.secondary" className="history-counts">
-                  {transfer.conflict_policy === 'KEEP_BOTH'
-                    ? `${transfer.files_completed} de ${transfer.files_total} archivos · ${transfer.warning_count ?? 0} nombres numerados · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
+                  {transfer.conflict_policy === 'KEEP_BOTH' && sourceConnection?.provider_type !== 'MOCK'
+                    ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${transfer.manifest_summary?.failed ?? 0} con error · ${transfer.manifest_summary?.skipped ?? 0} omitidos · ${transfer.manifest_summary?.pending ?? transfer.files_total} pendientes · ${transfer.manifest_summary?.renamed ?? 0} nombres numerados · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
                     : sourceConnection?.provider_type === 'SMB'
                     ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${transfer.manifest_summary?.failed ?? 0} con error · ${transfer.manifest_summary?.skipped ?? 0} omitidos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
                     : `${transfer.files_completed} de ${transfer.files_total} archivos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`}
@@ -3013,6 +3088,16 @@ function TransferWorkspace({
                 ? 'Actualiza cuándo debe ejecutarse y qué trabajos deben terminar antes.'
                 : `${selectedPaths.length} ${selectedPaths.length === 1 ? 'elemento' : 'elementos'} · ${sourceConnection?.name ?? 'Origen'} → ${destinationConnection?.name ?? 'Destino'}`}
             </Typography>
+            {transferCapabilitiesQuery.data && (
+              <Alert severity="info">
+                Se contará la selección en segundo plano. El límite es{' '}
+                {new Intl.NumberFormat('es-CL').format(
+                  sourceConnection?.provider_type === 'SMB'
+                    ? transferCapabilitiesQuery.data.max_files_by_source_provider.SMB
+                    : transferCapabilitiesQuery.data.max_files_by_source_provider.default,
+                )}{' '}archivos; el tiempo depende del tamaño de las carpetas y del proveedor.
+              </Alert>
+            )}
             <TextField
               label="Fecha y hora"
               type="datetime-local"

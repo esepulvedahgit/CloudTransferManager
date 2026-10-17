@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from app.providers.megacmd import MegaCmdProvider, MegaCmdSession
-from app.services.megacmd import MegaCmdError
+from app.services.megacmd import MegaCmdDownloadOutputMissingError, MegaCmdError
 
 LISTING = (
     "d--- - - 2026-10-10T12:30:00 directorio con espacios\n"
@@ -77,8 +77,8 @@ async def test_lists_directories_and_files_preserving_spaces_and_unicode(tmp_pat
 @pytest.mark.asyncio
 async def test_listing_keeps_mega_handles_separate_from_duplicate_names(tmp_path: Path):
     listing = (
-        b"---- 1 42 2026-10-09T08:15:00 History API.mp4 H:AbCd1234\n"
-        b"---- 1 43 2026-10-09T08:15:00 History API.mp4 H:EfGh5678\n"
+        b"---- 1 42 2026-10-09T08:15:00 H:AbCd1234 History API.mp4\n"
+        b"---- 1 43 2026-10-09T08:15:00 H:EfGh5678 History API.mp4\n"
     )
     page = await make_provider(tmp_path, ListingRunner(listing)).list_items("/")
 
@@ -226,6 +226,21 @@ async def test_session_reuses_login_and_cleans_private_home_after_file_operation
 
 
 @pytest.mark.asyncio
+async def test_download_missing_expected_output_is_sanitized_and_retryable(tmp_path: Path):
+    provider = make_provider(tmp_path, ListingRunner())
+
+    with pytest.raises(MegaCmdDownloadOutputMissingError) as error:
+        async with provider.open_session() as session:
+            await session.download_file("/private-folder/file.bin", tmp_path / "download")
+
+    assert error.value.retryable is True
+    assert error.value.return_code == 0
+    assert "private-folder" not in str(error.value)
+    assert "file.bin" not in str(error.value)
+    assert list((tmp_path / "download").iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_session_preserves_home_and_surfaces_failure_to_stop_daemon(tmp_path: Path):
     class QuitFailRunner(ListingRunner):
         fail_quit = True
@@ -323,3 +338,64 @@ async def test_session_finishes_teardown_before_propagating_task_cancellation(tm
 
     assert runner.calls == [("logout", []), ("quit", [])]
     assert session_home is not None and not session_home.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Docker Desktop Installer.exe",
+        " leading.txt",
+        "trailing.txt ",
+        "ñ H:AbCd1234.txt",
+        "x H:AbCd1234",
+    ],
+)
+async def test_real_handle_column_preserves_exact_name(tmp_path, name):
+    listing = f"----    1    619050928 2026-04-22T19:34:53 H:BgJAHTKa {name}\n".encode()
+    page = await make_provider(tmp_path, ListingRunner(listing)).list_items("/")
+    assert page.items[0].name == name
+    assert page.items[0].object_id == "H:BgJAHTKa"
+    assert page.items[0].path == "/" + name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "row",
+    [
+        b"---- 1 42",
+        b"---- 1 42 invalid-date file.txt",
+        b"---- 1 42 2026-04-22T19:34:53 H:invalid file.txt",
+    ],
+)
+async def test_invalid_node_row_rejects_inventory(tmp_path, row):
+    from app.services.megacmd import MegaCmdListingError
+
+    with pytest.raises(MegaCmdListingError):
+        await make_provider(tmp_path, ListingRunner(row)).list_items("/")
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_unexpected_file_and_symlink(tmp_path):
+    from app.services.megacmd import MegaCmdDownloadValidationError
+
+    class WrongFileRunner(ListingRunner):
+        async def run(self, action, arguments, **kwargs):
+            if action == "get":
+                (Path(arguments[1]) / "unexpected.txt").write_bytes(b"data")
+            return b"", b""
+
+    async with make_provider(tmp_path, WrongFileRunner()).open_session() as session:
+        with pytest.raises(MegaCmdDownloadValidationError):
+            await session.download_file("/expected.txt", tmp_path / "download")
+
+    class LinkRunner(ListingRunner):
+        async def run(self, action, arguments, **kwargs):
+            if action == "get":
+                (Path(arguments[1]) / "expected.txt").symlink_to(tmp_path / "outside")
+            return b"", b""
+
+    (tmp_path / "outside").write_bytes(b"data")
+    async with make_provider(tmp_path, LinkRunner()).open_session() as session:
+        with pytest.raises(MegaCmdDownloadValidationError):
+            await session.download_file("/expected.txt", tmp_path / "linked")

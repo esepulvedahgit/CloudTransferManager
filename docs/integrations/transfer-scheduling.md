@@ -11,6 +11,23 @@ Cloud Transfer Manager admite copias programadas una sola vez. La fecha se intro
 
 La sección recorre todas las páginas de trabajos pendientes y excluye las transferencias ya finalizadas.
 
+## Evaluación anticipada del conteo
+
+Al guardar una tarea con fecha futura, el sistema inicia un conteo de solo lectura en segundo plano. La tarea aparece enseguida en Programaciones con el estado del conteo; no se descargan archivos, no se crea el manifiesto de copia y no se reserva una posición de ejecución.
+
+- **Pendiente de evaluación:** todavía no se conoce la cantidad. No representa cero.
+- **Evaluando:** muestra un límite inferior de archivos encontrados y el máximo efectivo. Las carpetas no cuentan y las selecciones superpuestas no duplican archivos.
+- **Aprobada:** muestra el total, la hora en que terminó la evaluación y el máximo vigente.
+- **Bloqueada:** muestra el conteo parcial o completo, el límite y el motivo seguro. La tarea permanece en Programaciones y no se despacha al worker de copia.
+- **Error:** indica que no se pudo terminar el conteo. Se puede solicitar **Volver a evaluar** después de corregir la causa.
+- **Pendiente tras la tarea padre:** no se consulta el proveedor hasta que la transferencia padre termine correctamente.
+
+El conteo se limita a `TRANSFER_MAX_FILES` (por defecto 5000) en orígenes cloud y `SMB_TRANSFER_MAX_FILES` (por defecto 100000) en orígenes SMB. El sistema se detiene al encontrar el archivo límite+1 y comunica que el conteo es parcial. El tiempo depende del número de carpetas, la paginación y la respuesta del proveedor; después de 60 segundos se informa que la revisión continúa, sin prometer una hora de término.
+
+Si llega la fecha antes de que la evaluación se apruebe, la tarea conserva su horario y espera. Cambiar solo la fecha o el modo conserva la aprobación; cambiar la dependencia inicia una generación nueva. Convertir una tarea pendiente en programada crea la evaluación, y quitar la fecha más tarde no permite saltársela. Las tareas inmediatas sin evaluación anticipada conservan el preflight del worker de copia.
+
+El propietario o ADMIN puede solicitar una generación nueva con `POST /api/v1/transfers/{transfer_id}/evaluation`; requiere CSRF. Las solicitudes repetidas mientras una generación está pendiente o ejecutándose no duplican el trabajo. La aprobación comprueba el inventario actual del origen, pero no garantiza que el proveedor, la cuota o los permisos de escritura del destino sigan disponibles al ejecutarse.
+
 ## Seguimiento en segundo plano
 
 Las transferencias programadas, exclusivas, dependientes o en espera no crean tarjetas grandes de progreso ni aparecen en **Historial reciente** mientras sigan activas. El reloj pequeño del encabezado muestra cuántas hay en segundo plano. Al abrirlo, puedes revisar el motivo de espera o, cuando ya se ejecutan, los bytes transferidos y el porcentaje.
@@ -36,6 +53,15 @@ Los horarios no cambian la disponibilidad de la red. Para copiar desde un SMB, e
 
 ## Operación
 
-El despliegue Compose incluye `beat` y `control-worker`, sin puertos publicados y en la red interna. `beat` solicita revisar la cola cada 15 segundos; `control-worker` toma esos avisos y el dispatcher reserva los trabajos en PostgreSQL antes de publicarlos en la cola `transfers`. Mantén una sola instancia de Beat por despliegue.
+El despliegue Compose incluye `beat`, `control-worker` y `evaluation-worker`, sin puertos publicados. `beat` solicita revisar las colas cada 15 segundos; `control-worker` reserva los conteos en PostgreSQL y los publica en `evaluations`. El `evaluation-worker` corre con concurrencia uno, descifra credenciales de proveedores y hace únicamente inventario de solo lectura. Su salud se consulta en `/health/evaluations`; su ausencia no declara caída una copia ya en curso. Mantén una sola instancia de Beat por despliegue.
 
 El scheduler calcula la admisión usando `TRANSFER_MAX_CONCURRENT`, que debe coincidir con la concurrencia del worker `transfers` configurado en Compose. Los trabajos futuros y sus motivos permanecen en PostgreSQL durante reinicios. Si la red o las credenciales cambiaron, el trabajo queda en espera/bloqueado con un motivo visible; las credenciales se vuelven a validar justo antes de iniciar la ejecución.
+
+## Despliegue de la evaluación anticipada
+
+1. Respaldar PostgreSQL y abrir una ventana sin nuevas admisiones. Pausar Beat y `control-worker`, y esperar a que terminen las copias ya admitidas.
+2. Aplicar la migración `20261017_0013` con Alembic; el backfill solo crea evaluaciones para programaciones pendientes que todavía no reservaron ni iniciaron una copia.
+3. Desplegar API y los workers `transfers`, `control` y `evaluations` con la misma versión, manteniendo Beat detenido. Comprobar `/health/ready` y `/health/evaluations`.
+4. Iniciar una sola instancia de Beat y reanudar el despacho. Revisar una programación de prueba y confirmar que su conteo aparece en Programaciones antes de la hora de ejecución.
+
+Si se revierte la aplicación, conservar la tabla y columnas de evaluación. No ejecutar downgrade mientras existan evaluaciones en uso. No se requiere reiniciar PostgreSQL ni Redis para este cambio.

@@ -63,6 +63,7 @@ from app.services.smtp_config import (
     validate_smtp_host,
     validate_smtp_sender,
 )
+from app.services.transfer_evaluation import EvaluationConflictError
 from app.services.transfer_executor import TransferExecutor
 from app.settings import Settings, get_settings
 
@@ -496,6 +497,9 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         return data
 
     async def publish_transfer(record: TransferRecord) -> None:
+        record.manifest_summary = (
+            await app.state.store.alist_transfer_manifest_summaries([record.id])
+        )[record.id]
         await app.state.store.asave_transfer(record)
         event = transfer_event(record)
         try:
@@ -632,6 +636,30 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         except Exception as exc:
             raise HTTPException(
                 status_code=503, detail="Servicio de notificaciones no disponible"
+            ) from exc
+        return {"status": "ready"}
+
+    @app.get("/health/evaluations")
+    async def evaluations_health() -> dict[str, str]:
+        if config.app_env.lower() != "production":
+            return {"status": "not_required"}
+        try:
+            from app.worker import celery_app
+
+            inspector = celery_app.control.inspect(timeout=1)
+            active_queues = (
+                await asyncio.to_thread(inspector.active_queues) if inspector else None
+            )
+            evaluation_queue_ready = any(
+                isinstance(queue, dict) and queue.get("name") == "evaluations"
+                for queues in (active_queues or {}).values()
+                for queue in queues
+            )
+            if not evaluation_queue_ready:
+                raise RuntimeError("Evaluation queue has no active consumer")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail="Servicio de evaluación no disponible"
             ) from exc
         return {"status": "ready"}
 
@@ -1838,8 +1866,53 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             "recurrence": False,
             "execution_modes": ["AUTO", "EXCLUSIVE"],
             "max_parallel_transfers": config.transfer_max_concurrent,
+            "max_files_by_source_provider": {
+                "default": config.transfer_max_files,
+                "SMB": config.smb_transfer_max_files,
+            },
             "schedule_timezone_format": "IANA",
         }
+
+    @app.post(
+        "/api/v1/transfers/{transfer_id}/evaluation",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def request_transfer_evaluation(
+        transfer_id: uuid.UUID,
+        request: Request,
+        user: UserAccount = Depends(current_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        await visible_transfer(transfer_id, user)
+        try:
+            evaluation = await app.state.store.arequest_transfer_evaluation(
+                transfer_id, datetime.now(UTC)
+            )
+        except EvaluationConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        updated = await visible_transfer(transfer_id, user)
+        await publish_transfer(updated)
+        await audit_request(
+            request,
+            actor_user_id=user.id,
+            action="TRANSFER_EVALUATION_REQUESTED",
+            resource_type="transfer",
+            resource_id=str(transfer_id),
+            result="SUCCESS",
+            metadata={
+                "generation": evaluation.generation,
+                "status": evaluation.status,
+            },
+        )
+        if config.app_env.lower() == "production":
+            try:
+                from app.worker import dispatch_pending_evaluations
+
+                dispatch_pending_evaluations.delay()
+            except Exception:
+                pass
+        return cast(dict[str, Any], evaluation.public_dict())
 
     @app.patch("/api/v1/transfers/{transfer_id}")
     async def update_transfer_schedule(
@@ -1946,6 +2019,9 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         transfer_id: uuid.UUID, user: UserAccount = Depends(current_user)
     ) -> dict[str, Any]:
         record = await visible_transfer(transfer_id, user)
+        record.manifest_summary = (
+            await app.state.store.alist_transfer_manifest_summaries([record.id])
+        )[record.id]
         return record.public_dict()
 
     @app.get("/api/v1/transfers/{transfer_id}/events")
@@ -2103,6 +2179,9 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 # Subscribe first, then take a fresh snapshot. Any transition before the
                 # subscription is reflected in this read; later transitions are buffered.
                 snapshot = await visible_transfer(transfer_id, user)
+                snapshot.manifest_summary = (
+                    await app.state.store.alist_transfer_manifest_summaries([snapshot.id])
+                )[snapshot.id]
                 latest = transfer_event(snapshot)
                 yield f"data: {json.dumps(latest, separators=(',', ':'))}\n\n"
                 if snapshot.status in {

@@ -35,7 +35,7 @@ def allocate_available_name(
     base_name = original_name
     if max_component_bytes is not None and len(original_name.encode("utf-8")) > max_component_bytes:
         base_name = _fit_component(stem, "", extension, max_component_bytes)
-    if collision_key(base_name) not in occupied:
+    if collision_key(original_name) not in occupied and collision_key(base_name) not in occupied:
         return base_name
 
     number = 1

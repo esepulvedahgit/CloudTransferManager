@@ -25,6 +25,20 @@ async def test_sse_reloads_transfer_after_subscribing_to_avoid_lost_terminal_eve
     transfer = store.create_transfer(
         user.id, uuid.uuid4(), uuid.uuid4(), ["/source.txt"], "/backup"
     )
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": "/source.txt",
+                "destination_path": "/backup/source.txt",
+                "size_bytes": 12,
+            }
+        ],
+    )
+    manifest_row = (await store.alist_transfer_manifest_items(transfer.id))[0]
+    await store.aupdate_transfer_manifest_item(
+        transfer.id, manifest_row.id, status="FAILED", error_code="SOURCE_ITEM_NOT_FOUND"
+    )
     app = create_app(
         Settings(app_secret_key="test-secret-key", session_cookie_secure=False), store=store
     )
@@ -69,6 +83,10 @@ async def test_sse_reloads_transfer_after_subscribing_to_avoid_lost_terminal_eve
     assert len(frames) == 1
     assert '"status":"COMPLETED"' in frames[0]
     assert '"progress_percent":100.0' in frames[0]
+    assert (
+        '"manifest_summary":{"copied":0,"failed":1,"skipped":0,"pending":0,"renamed":0}'
+        in frames[0]
+    )
 
 
 @pytest.mark.asyncio

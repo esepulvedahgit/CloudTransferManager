@@ -281,7 +281,9 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 - SMB solo se admite como origen de migración; el API rechaza una conexión SMB como destino con `422`.
 - `scheduled_at` opcional acepta una fecha futura con offset; el servidor la normaliza a UTC. `schedule_timezone` debe ser una zona IANA y conserva la zona mostrada en la interfaz. Si no se envía `scheduled_at`, el trabajo queda en la cola normal.
 - `execution_mode` opcional admite `AUTO` (predeterminado) o `EXCLUSIVE`. `depends_on_transfer_id` es opcional y solo libera el trabajo cuando el padre finaliza correctamente, incluso con advertencias.
-- El worker aplica `TRANSFER_MAX_FILES` (predeterminado 5000), el límite opcional `TRANSFER_MAX_FILE_BYTES` (0 = sin límite fijo) y la reserva de staging antes de escribir en destino. Si el preflight falla, la transferencia pasa a `FAILED`; el usuario puede ver el mensaje seguro en `/api/v1/transfers/{transfer_id}/events`.
+- Una solicitud con fecha futura crea `evaluation` en estado `PENDING` dentro de la misma transacción. La evaluación recorre metadatos del origen antes de la hora programada, no descarga ni copia datos y no reserva capacidad de ejecución.
+- Si el conteo supera el límite configurado, la evaluación queda `BLOCKED` y la transferencia permanece en Programaciones sin reservar una copia. Las transferencias inmediatas conservan el preflight del worker; si falla, pasan a `FAILED`. En ambos casos se conserva la validación final al comenzar la copia.
+- El worker de copia aplica `TRANSFER_MAX_FILES` (predeterminado 5000), `SMB_TRANSFER_MAX_FILES` para orígenes SMB (predeterminado 100000), el límite opcional `TRANSFER_MAX_FILE_BYTES` (0 = sin límite fijo) y la reserva de staging antes de escribir en destino. Los errores se consultan en `/api/v1/transfers/{transfer_id}/events`.
 - **Request Body:**
 ```json
 {
@@ -312,27 +314,49 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
   "schedule_timezone": "America/Santiago",
   "execution_mode": "AUTO",
   "wait_reason": "WAITING_UNTIL",
+  "evaluation": {
+    "status": "PENDING",
+    "generation": 1,
+    "sequence": 0,
+    "files_found": null,
+    "count_complete": false,
+    "max_files": 5000,
+    "started_at": null,
+    "updated_at": null,
+    "completed_at": null,
+    "safe_error_code": null,
+    "safe_message": null
+  },
   "created_at": "2026-10-10T10:15:00Z"
 }
 ```
 
 ### `GET /api/v1/transfers/capabilities`
-- Informa si hay programación, recurrencia (por ahora `false`), modos de ejecución y capacidad global configurada.
+- Informa si hay programación, recurrencia (por ahora `false`), modos de ejecución, capacidad global y límites efectivos de archivos: `max_files_by_source_provider.default` para orígenes cloud y `max_files_by_source_provider.SMB` para orígenes SMB.
 
 ### `PATCH /api/v1/transfers/{transfer_id}`
 - Actualiza `scheduled_at`, `schedule_timezone`, `execution_mode` y `depends_on_transfer_id` mientras el trabajo siga `SCHEDULED` o `QUEUED` y todavía no tenga reserva de despacho.
 - Devuelve `409` si la transferencia ya fue admitida. Las fechas deben ser futuras; enviar `scheduled_at: null` la deja lista para ejecutarse al liberarse la cola.
-- `wait_reason` puede ser `WAITING_UNTIL`, `WAITING_PARENT`, `BLOCKED_PARENT_FAILED`, `WAITING_CAPACITY`, `WAITING_EXCLUSIVE`, `WAITING_CONNECTION`, `WAITING_STAGING`, `WAITING_CONNECTION_ACTIVE`, `WAITING_CONNECTION_ACCESS`, `WAITING_USER_ACTIVE` o `BLOCKED_CONNECTION_CHANGED`.
+- Al quitar la fecha se conserva cualquier evaluación creada. Cambiar solo hora o modo conserva la aprobación; cambiar la dependencia inicia una generación nueva y vuelve a contar.
+- `wait_reason` también puede ser `WAITING_EVALUATION` o `BLOCKED_EVALUATION`, además de `WAITING_UNTIL`, `WAITING_PARENT`, `BLOCKED_PARENT_FAILED`, `WAITING_CAPACITY`, `WAITING_EXCLUSIVE`, `WAITING_CONNECTION`, `WAITING_STAGING`, `WAITING_CONNECTION_ACTIVE`, `WAITING_CONNECTION_ACCESS`, `WAITING_USER_ACTIVE` o `BLOCKED_CONNECTION_CHANGED`.
 - `can_edit_schedule` indica si el trabajo aún admite reprogramación.
+
+### `POST /api/v1/transfers/{transfer_id}/evaluation`
+- Solicita una evaluación nueva para una transferencia pendiente. Requiere sesión del propietario o ADMIN y token CSRF.
+- Devuelve `202 Accepted` con el objeto público `evaluation`. Si ya está `PENDING`, `EVALUATING` o `WAITING_PARENT`, devuelve la generación vigente sin duplicarla.
+- Responde `409 Conflict` para una transferencia admitida, en ejecución o terminal, o si no tiene una evaluación anticipada.
+- El objeto público incluye `status`, `generation`, `sequence`, `files_found`, `count_complete`, `max_files`, fechas y mensaje/código seguro; nunca expone claim tokens, versiones de credenciales ni credenciales.
 
 ### `GET /api/v1/transfers/{transfer_id}/stream`
 - **Response `200 OK`:** `Content-Type: text/event-stream` emitiendo telemetría en tiempo real.
+- Cada snapshot y evento incluye el mismo objeto público `evaluation`; el cliente ordena sus cambios mediante `generation` y `sequence`, independientes del progreso de copia.
 
 ### `GET /api/v1/transfers`
 - Devuelve historial paginado con `offset` y `page_size`; ADMIN ve todas las transferencias y USER solo las propias.
 - `pending_only=true` limita la lista a estados `SCHEDULED` y `QUEUED`, para recorrer la cola completa por páginas.
 - `background_only=true` limita la lista a tareas administradas por **Programaciones** que sigan en estados no terminales: `SCHEDULED`, `QUEUED`, `VALIDATING`, `RUNNING`, `RETRYING` o `CANCELLING`. Una tarea pertenece a Programaciones cuando tiene `scheduled_at`, `wait_reason`, modo `EXCLUSIVE` o una transferencia padre (`depends_on_transfer_id`). La respuesta conserva `total_count` después de aplicar el filtro de propietario.
 - `exclude_background=true` omite únicamente esas tareas no terminales de Programaciones. Las transferencias terminales, incluidas las programadas, siguen disponibles en la lista general.
+- Las respuestas de creación, detalle, listado y SSE incluyen `evaluation`. Si no se requiere evaluación anticipada, el estado es `NOT_REQUIRED`. Un conteo nulo significa que la cantidad todavía se desconoce; solo `count_complete=true` confirma el total.
 - Cada elemento incluye `manifest_summary`: `copied` son archivos copiados y verificados, `failed` son archivos con error, `skipped` son archivos omitidos por conflicto y `pending` son archivos aún no resueltos. Los cuatro contadores excluyen entradas de directorio. En SMB, `files_completed` cuenta elementos resueltos y no equivale a `copied`.
 
 ### `GET /api/v1/transfers/{transfer_id}`
@@ -374,3 +398,7 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 ### `GET /health/notifications`
 - `200 OK` cuando hay un consumidor activo de la cola `notifications`; en entornos no productivos devuelve `not_required`.
 - `503 Service Unavailable` cuando la cola de correo no tiene un consumidor activo.
+
+### Resumen de manifiesto (extensión compatible, 2026-10-16)
+
+Los listados, detalle y eventos de progreso de transferencias incluyen `manifest_summary`: `{copied, failed, skipped, pending, renamed}` (enteros no negativos). El primer snapshot SSE lo incluye también para trabajos terminales. `renamed` cuenta nombres asignados por conflictos/límites, incluidos directorios; no equivale a `warning_count`. `files_completed` continúa contando elementos resueltos para compatibilidad. Los consumidores muestran copiados desde `manifest_summary.copied` y no declaran 100% con elementos sin copiar. No se agregan endpoints ni estados.

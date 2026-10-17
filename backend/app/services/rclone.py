@@ -52,6 +52,19 @@ class RcloneCommandError(RuntimeError):
         return any(marker in message for marker in self._retryable_markers)
 
     @property
+    def source_item_missing(self) -> bool:
+        message = self._stderr.decode("utf-8", errors="ignore").casefold()
+        return any(
+            marker in message
+            for marker in (
+                "no such file or directory",
+                "object not found",
+                "source file not found",
+                "not found",
+            )
+        )
+
+    @property
     def diagnostic_details(self) -> dict[str, list[int] | list[str]]:
         """Fixed diagnostic values only: never provider messages, URLs or credentials."""
         message = self._stderr.decode("utf-8", errors="ignore").casefold()

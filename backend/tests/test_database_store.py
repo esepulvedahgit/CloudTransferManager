@@ -151,8 +151,20 @@ async def test_database_store_aggregates_manifest_summaries_for_transfer_page(tm
     finally:
         await store.aclose()
 
-    assert summaries[transfer.id] == {"copied": 1, "failed": 1, "skipped": 1, "pending": 1}
-    assert summaries[missing_id] == {"copied": 0, "failed": 0, "skipped": 0, "pending": 0}
+    assert summaries[transfer.id] == {
+        "copied": 1,
+        "failed": 1,
+        "skipped": 1,
+        "pending": 1,
+        "renamed": 0,
+    }
+    assert summaries[missing_id] == {
+        "copied": 0,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "renamed": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -166,9 +178,7 @@ async def test_database_transfer_page_queries_only_requested_rows_and_returns_to
     await store.create_schema()
     user = await store.acreate_user("page-user", "page-user@example.test", "hash")
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
-    destination = await store.acreate_connection(
-        "Destination", "MOCK", user.id, uuid.uuid4(), b""
-    )
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
     transfers = [
         await store.acreate_transfer(
             user.id, source.id, destination.id, [f"/file-{index}"], "/archive"
@@ -182,9 +192,7 @@ async def test_database_transfer_page_queries_only_requested_rows_and_returns_to
 
     assert total == second_total == 5
     assert len(first_page) == len(second_page) == 2
-    assert {record.id for record in first_page}.isdisjoint(
-        {record.id for record in second_page}
-    )
+    assert {record.id for record in first_page}.isdisjoint({record.id for record in second_page})
     assert {record.id for record in first_page + second_page}.issubset(
         {record.id for record in transfers}
     )
@@ -201,9 +209,7 @@ async def test_database_store_lists_only_active_transfer_ids_for_staging_sweep(t
     await store.create_schema()
     user = await store.acreate_user("staging-owner", "staging-owner@example.test", "hash")
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
-    destination = await store.acreate_connection(
-        "Destination", "MOCK", user.id, uuid.uuid4(), b""
-    )
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
     active = await store.acreate_transfer(
         user.id, source.id, destination.id, ["/active"], "/archive"
     )
@@ -232,9 +238,7 @@ async def test_transfer_creation_and_audit_event_share_one_database_transaction(
     await store.create_schema()
     user = await store.acreate_user("atomic-audit", "atomic-audit@example.test", "hash")
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
-    destination = await store.acreate_connection(
-        "Destination", "MOCK", user.id, uuid.uuid4(), b""
-    )
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
     idempotency_key = uuid.uuid4()
     audit_event = {
         "ip_address": "192.0.2.20",
@@ -318,12 +322,14 @@ async def test_database_store_live_manifest_progress_does_not_count_failed_empty
     await store.asave_transfer(transfer)
     await store.aadd_transfer_manifest_items(
         transfer.id,
-        [{
-            "source_path": "/empty.bin",
-            "destination_path": "/Archive/empty.bin",
-            "is_dir": False,
-            "size_bytes": 0,
-        }],
+        [
+            {
+                "source_path": "/empty.bin",
+                "destination_path": "/Archive/empty.bin",
+                "is_dir": False,
+                "size_bytes": 0,
+            }
+        ],
     )
     item = (await store.alist_transfer_manifest_items(transfer.id))[0]
 
@@ -441,14 +447,10 @@ async def test_stale_transfer_save_cannot_undo_a_cancel_request(tmp_path):
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'cancel-race.sqlite'}")
     store = DatabaseStore(settings)
     await store.create_schema()
-    user = await store.acreate_user(
-        "cancel-owner", "cancel-owner@example.test", "hash", "ADMIN"
-    )
+    user = await store.acreate_user("cancel-owner", "cancel-owner@example.test", "hash", "ADMIN")
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
     destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
-    created = await store.acreate_transfer(
-        user.id, source.id, destination.id, ["/file"], "/copy"
-    )
+    created = await store.acreate_transfer(user.id, source.id, destination.id, ["/file"], "/copy")
     active = await store.aget_transfer(created.id)
     assert active is not None
     active.status = "RUNNING"
@@ -482,9 +484,7 @@ async def test_stale_transfer_save_cannot_replace_a_terminal_state(tmp_path):
     )
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
     destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
-    created = await store.acreate_transfer(
-        user.id, source.id, destination.id, ["/file"], "/copy"
-    )
+    created = await store.acreate_transfer(user.id, source.id, destination.id, ["/file"], "/copy")
     stale = await store.aget_transfer(created.id)
     completed = await store.aget_transfer(created.id)
     assert stale is not None
@@ -679,12 +679,8 @@ async def test_database_store_transfer_counter_is_unique_and_api_uses_persistent
             "destination_path": "/Backup",
         }
         idempotency_headers = {**headers, "Idempotency-Key": str(uuid.uuid4())}
-        first = await client.post(
-            "/api/v1/transfers", json=payload, headers=idempotency_headers
-        )
-        second = await client.post(
-            "/api/v1/transfers", json=payload, headers=idempotency_headers
-        )
+        first = await client.post("/api/v1/transfers", json=payload, headers=idempotency_headers)
+        second = await client.post("/api/v1/transfers", json=payload, headers=idempotency_headers)
         conflicting = await client.post(
             "/api/v1/transfers",
             json={**payload, "destination_path": "/Different"},
@@ -740,7 +736,7 @@ async def test_terminal_transfer_and_notification_intent_commit_together(tmp_pat
                     "SELECT status, transfer_attempt FROM transfer_notification_outbox "
                     "WHERE transfer_job_id = :transfer_id"
                 ),
-                    {"transfer_id": transfer.id.hex},
+                {"transfer_id": transfer.id.hex},
             )
         ).all()
     await store.aclose()
@@ -758,9 +754,7 @@ async def test_legacy_notification_materialization_creates_one_durable_outbox_re
     await store.create_schema()
     user = await store.acreate_user("legacy-notify", "legacy@example.test", "hash")
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
-    destination = await store.acreate_connection(
-        "Destination", "MOCK", user.id, uuid.uuid4(), b""
-    )
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
     transfer = await store.acreate_transfer(
         user.id,
         source.id,
@@ -808,9 +802,7 @@ async def test_notification_outbox_retries_from_postgres_state_and_hides_snapsho
     await store.create_schema()
     user = await store.acreate_user("notify-retry", "private@example.test", "hash")
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
-    destination = await store.acreate_connection(
-        "Destination", "MOCK", user.id, uuid.uuid4(), b""
-    )
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
     transfer = await store.acreate_transfer(
         user.id,
         source.id,
@@ -828,9 +820,7 @@ async def test_notification_outbox_retries_from_postgres_state_and_hides_snapsho
     assert len(dispatches) == 1
     notification_id, dispatch_token = dispatches[0]
     assert await store.adispatch_pending_notifications(now) == []
-    delivery_claim = await store.aclaim_notification_delivery(
-        notification_id, now, dispatch_token
-    )
+    delivery_claim = await store.aclaim_notification_delivery(notification_id, now, dispatch_token)
     assert delivery_claim is not None
     snapshot, claim_token = delivery_claim
     assert snapshot["recipient"] == user.email
@@ -873,9 +863,7 @@ async def test_notification_delivery_lease_fences_stale_worker_completion(tmp_pa
     await store.create_schema()
     user = await store.acreate_user("lease-user", "lease@example.test", "hash")
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
-    destination = await store.acreate_connection(
-        "Destination", "MOCK", user.id, uuid.uuid4(), b""
-    )
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
     transfer = await store.acreate_transfer(
         user.id, source.id, destination.id, ["/file"], "/archive", send_email_notification=True
     )
@@ -900,9 +888,7 @@ async def test_notification_delivery_lease_fences_stale_worker_completion(tmp_pa
         )
         is None
     )
-    await store.arelease_notification_dispatch(
-        notification_id, reclaimed_at, first_dispatch_token
-    )
+    await store.arelease_notification_dispatch(notification_id, reclaimed_at, first_dispatch_token)
     second_claim = await store.aclaim_notification_delivery(
         notification_id, reclaimed_at, second_dispatch_token
     )
@@ -1110,9 +1096,7 @@ async def test_postgres_rejects_stale_progress_after_cancel_and_terminal_state()
         f"stale-save-{suffix}", f"stale-save-{suffix}@example.test", "hash"
     )
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
-    destination = await store.acreate_connection(
-        "Destination", "MOCK", user.id, uuid.uuid4(), b""
-    )
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
     transfer = await store.acreate_transfer(
         user.id, source.id, destination.id, ["/file"], "/archive"
     )
@@ -1138,9 +1122,7 @@ async def test_postgres_rejects_stale_progress_after_cancel_and_terminal_state()
     async with store.sessions() as session:
         await session.execute(delete(TransferJob).where(TransferJob.id == transfer.id))
         await session.execute(
-            delete(StorageConnection).where(
-                StorageConnection.id.in_([source.id, destination.id])
-            )
+            delete(StorageConnection).where(StorageConnection.id.in_([source.id, destination.id]))
         )
         await session.execute(delete(User).where(User.id == user.id))
         await session.commit()
@@ -1195,9 +1177,7 @@ async def test_postgres_serializes_concurrent_removal_of_active_admins():
         async with store.sessions() as session:
             await session.execute(delete(User).where(User.id.in_([admin.id for admin in admins])))
             previous_rows = list(
-                (
-                    await session.scalars(select(User).where(User.id.in_(previous_admin_ids)))
-                ).all()
+                (await session.scalars(select(User).where(User.id.in_(previous_admin_ids)))).all()
             )
             for user in previous_rows:
                 user.role = "ADMIN"
@@ -1246,9 +1226,11 @@ async def test_postgres_deduplicates_concurrent_transfer_creation_by_idempotency
     finally:
         async with store.sessions() as session:
             await session.execute(delete(TransferJob).where(TransferJob.idempotency_key == key))
-            await session.execute(delete(StorageConnection).where(
-                StorageConnection.id.in_([source.id, destination.id])
-            ))
+            await session.execute(
+                delete(StorageConnection).where(
+                    StorageConnection.id.in_([source.id, destination.id])
+                )
+            )
             await session.execute(delete(User).where(User.id == user.id))
             await session.commit()
     await store.aclose()
@@ -1266,9 +1248,7 @@ async def test_postgres_notification_outbox_dispatch_and_delivery_claim_are_excl
         f"notification-race-{suffix}", f"notification-race-{suffix}@example.test", "hash"
     )
     source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
-    destination = await store.acreate_connection(
-        "Destination", "MOCK", user.id, uuid.uuid4(), b""
-    )
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
     transfer = await store.acreate_transfer(
         user.id,
         source.id,

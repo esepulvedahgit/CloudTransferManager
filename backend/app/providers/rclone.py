@@ -1,4 +1,3 @@
-import asyncio
 import json
 import re
 import uuid
@@ -97,8 +96,9 @@ class RcloneStorageProvider(StorageProvider):
         sort_by: str = "name",
         direction: str = "asc",
         search: str | None = None,
-        force_refresh: bool = False,
         parent_object_id: str | None = None,
+        *,
+        force_refresh: bool = False,
     ) -> PaginatedItems:
         del parent_object_id
         if not 1 <= page_size <= 200:
@@ -141,7 +141,13 @@ class RcloneStorageProvider(StorageProvider):
             modified = entry.get("ModTime")
             try:
                 modified_at = (
-                    datetime.fromisoformat(modified.replace("Z", "+00:00")) if modified else None
+                    (
+                        datetime.fromisoformat(modified.replace("Z", "+00:00"))
+                        if isinstance(modified, str)
+                        else None
+                    )
+                    if modified
+                    else None
                 )
             except (AttributeError, ValueError):
                 modified_at = None
@@ -151,7 +157,8 @@ class RcloneStorageProvider(StorageProvider):
                     path=item_path,
                     is_dir=bool(entry.get("IsDir", False)),
                     size_bytes=entry.get("Size")
-                    if isinstance(entry.get("Size"), int) and entry["Size"] >= 0 else None,
+                    if isinstance(entry.get("Size"), int) and entry["Size"] >= 0
+                    else None,
                     modified_at=modified_at,
                     mime_type=entry.get("MimeType")
                     if isinstance(entry.get("MimeType"), str)
@@ -159,9 +166,7 @@ class RcloneStorageProvider(StorageProvider):
                     provider_type=self.provider_type,
                     object_id=entry.get("ID") if isinstance(entry.get("ID"), str) else None,
                     parent_object_id=(
-                        entry.get("ParentID")
-                        if isinstance(entry.get("ParentID"), str)
-                        else None
+                        entry.get("ParentID") if isinstance(entry.get("ParentID"), str) else None
                     ),
                 )
             )
@@ -283,8 +288,9 @@ class RcloneGoogleDriveProvider(RcloneStorageProvider):
         sort_by: str = "name",
         direction: str = "asc",
         search: str | None = None,
-        force_refresh: bool = False,
         parent_object_id: str | None = None,
+        *,
+        force_refresh: bool = False,
     ) -> PaginatedItems:
         if parent_object_id is None:
             return await super().list_items(
@@ -294,7 +300,7 @@ class RcloneGoogleDriveProvider(RcloneStorageProvider):
                 sort_by,
                 direction,
                 search,
-                force_refresh,
+                force_refresh=force_refresh,
             )
         if not self._file_id_pattern.fullmatch(parent_object_id):
             raise ValueError("Invalid Google Drive folder ID")
@@ -311,9 +317,7 @@ class RcloneGoogleDriveProvider(RcloneStorageProvider):
         params: dict[str, str] = {
             "q": f"'{parent_object_id}' in parents and trashed = false",
             "pageSize": str(page_size),
-            "fields": (
-                "nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)"
-            ),
+            "fields": ("nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)"),
             "orderBy": "name",
             "supportsAllDrives": "true",
             "includeItemsFromAllDrives": "true",
@@ -352,7 +356,11 @@ class RcloneGoogleDriveProvider(RcloneStorageProvider):
             size = _google_size(entry.get("size"))
             modified = entry.get("modifiedTime")
             try:
-                modified_at = datetime.fromisoformat(modified.replace("Z", "+00:00"))
+                modified_at = (
+                    datetime.fromisoformat(modified.replace("Z", "+00:00"))
+                    if isinstance(modified, str)
+                    else None
+                )
             except (AttributeError, ValueError):
                 modified_at = None
             items.append(
@@ -370,12 +378,14 @@ class RcloneGoogleDriveProvider(RcloneStorageProvider):
             )
         if search:
             items = [item for item in items if search.casefold() in item.name.casefold()]
-        if sort_by == "size":
-            sort_key = lambda item: item.size_bytes or 0
-        elif sort_by == "modified_at":
-            sort_key = lambda item: item.modified_at.timestamp() if item.modified_at else 0.0
-        else:
-            sort_key = lambda item: item.name.casefold()
+
+        def sort_key(item: StorageItem) -> str | int | float:
+            if sort_by == "size":
+                return item.size_bytes or 0
+            if sort_by == "modified_at":
+                return item.modified_at.timestamp() if item.modified_at else 0.0
+            return item.name.casefold()
+
         directories = sorted(
             (item for item in items if item.is_dir),
             key=sort_key,
@@ -413,7 +423,11 @@ class RcloneGoogleDriveProvider(RcloneStorageProvider):
         mime_type = entry.get("mimeType")
         modified = entry.get("modifiedTime")
         try:
-            modified_at = datetime.fromisoformat(modified.replace("Z", "+00:00"))
+            modified_at = (
+                datetime.fromisoformat(modified.replace("Z", "+00:00"))
+                if isinstance(modified, str)
+                else None
+            )
         except (AttributeError, ValueError):
             modified_at = None
         parents = entry.get("parents")
@@ -459,12 +473,11 @@ class RcloneGoogleDriveProvider(RcloneStorageProvider):
             "application/vnd.google-apps."
         )
         if is_export:
+            assert isinstance(mime_type, str)
             export_type = self._export_mime_types.get(mime_type)
             if export_type is None:
                 raise GoogleDriveApiError(415)
-            request_url = (
-                f"https://www.googleapis.com/drive/v3/files/{object_id}/export"
-            )
+            request_url = f"https://www.googleapis.com/drive/v3/files/{object_id}/export"
             params = {"mimeType": export_type}
         else:
             request_url = f"https://www.googleapis.com/drive/v3/files/{object_id}"
@@ -544,8 +557,7 @@ class RcloneGoogleDriveProvider(RcloneStorageProvider):
         client_secret = self.credentials.get("client_secret")
         refresh_token = self.credentials.get("refresh_token")
         if not all(
-            isinstance(value, str) and value
-            for value in (client_id, client_secret, refresh_token)
+            isinstance(value, str) and value for value in (client_id, client_secret, refresh_token)
         ):
             raise GoogleDriveApiError(401)
         try:
@@ -573,7 +585,11 @@ class RcloneGoogleDriveProvider(RcloneStorageProvider):
         if not isinstance(access_token, str) or not access_token:
             raise GoogleDriveApiError(502)
         try:
-            lifetime = max(60, min(int(expires_in), 3600))
+            lifetime = (
+                max(60, min(int(expires_in), 3600))
+                if isinstance(expires_in, (str, int, float))
+                else 3600
+            )
         except (TypeError, ValueError):
             lifetime = 3600
         self._api_access_token = access_token

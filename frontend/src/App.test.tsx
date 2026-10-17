@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, waitForElementToBeRemoved, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import App from './App';
+import App, { mergeTransferState, type Transfer } from './App';
+import type { TransferEvaluation } from './ScheduledTransferEvaluation';
 
 function jsonResponse(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -183,6 +184,62 @@ describe('Cloud Transfer Manager', () => {
     expect(await screen.findByText(/2 copiados · 1 con error · 3 omitidos/)).toBeVisible();
     expect(screen.getByText('99%')).toBeVisible();
     expect(document.querySelector('[aria-label="Avance 99 por ciento"]')).toBeVisible();
+    expect(screen.queryByText('100%')).not.toBeInTheDocument();
+    expect(screen.queryByText(/4 de 6 archivos/)).not.toBeInTheDocument();
+  });
+
+  it('shows KEEP_BOTH failures and numbered names separately', async () => {
+    const transfer = {
+      id: 'smb-history-1',
+      public_id: 'TRF-2026-000205',
+      status: 'FAILED',
+      conflict_policy: 'KEEP_BOTH',
+      warning_count: 99,
+      progress_percent: 99.99,
+      files_total: 6,
+      files_completed: 4,
+      bytes_total: 4096,
+      bytes_transferred: 3072,
+      current_item: null,
+      average_speed_bps: null,
+      current_speed_bps: null,
+      source_connection_id: 'nas',
+      destination_connection_id: 'cloud',
+      source_paths: ['/STORAGE'],
+      destination_path: '/Archive',
+      manifest_summary: { copied: 2, failed: 1, skipped: 3, pending: 0, renamed: 7 },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) {
+        return jsonResponse({ items: [
+          { id: 'nas', name: 'NAS local', provider_type: 'SMB' },
+          { id: 'cloud', name: 'MEGA', provider_type: 'MEGA' },
+        ] });
+      }
+      if (isTransferCollectionRequest(path)) {
+        return path.includes('background_only=true') || path.includes('pending_only=true')
+          ? jsonResponse({ items: [], total_count: 0 })
+          : jsonResponse({ items: [transfer], total_count: 1 });
+      }
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+
+    expect(await screen.findByText(/2 copiados · 1 con error · 3 omitidos/)).toBeVisible();
+    expect(screen.getByText('99%')).toBeVisible();
+    expect(document.querySelector('[aria-label="Avance 99 por ciento"]')).toBeVisible();
+    expect(screen.getByText(/7 nombres numerados/)).toBeVisible();
+    expect(screen.queryByText(/99 nombres numerados/)).not.toBeInTheDocument();
     expect(screen.queryByText('100%')).not.toBeInTheDocument();
     expect(screen.queryByText(/4 de 6 archivos/)).not.toBeInTheDocument();
   });
@@ -432,6 +489,117 @@ describe('Cloud Transfer Manager', () => {
       expect.objectContaining({ method: 'POST' }),
     ));
     expect(screen.getByText('Se solicitó cancelar la transferencia.')).toBeVisible();
+  });
+
+  it('shows a blocked count in Programaciones and lets the user request another evaluation', async () => {
+    const evaluation: TransferEvaluation = {
+      status: 'BLOCKED', generation: 1, sequence: 4, files_found: 5001,
+      count_complete: false, max_files: 5000, started_at: '2026-10-17T10:00:00Z',
+      updated_at: '2026-10-17T10:01:00Z', completed_at: '2026-10-17T10:01:00Z',
+      safe_error_code: 'TRANSFER_FILE_LIMIT_EXCEEDED', safe_message: 'Divide la selección.',
+    };
+    let latestEvaluation = evaluation;
+    const transfer = {
+      id: 'scheduled-evaluation-row',
+      public_id: 'TRF-2026-000208',
+      status: 'QUEUED',
+      progress_percent: 0,
+      files_completed: 0,
+      files_total: 0,
+      bytes_transferred: 0,
+      bytes_total: 0,
+      current_item: null,
+      average_speed_bps: null,
+      current_speed_bps: null,
+      source_connection_id: 'source',
+      destination_connection_id: 'destination',
+      destination_path: '/Archive',
+      scheduled_at: '2026-10-20T12:00:00Z',
+      execution_mode: 'AUTO',
+      depends_on_transfer_id: null,
+      wait_reason: 'BLOCKED_EVALUATION',
+      evaluation,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path.endsWith('/transfers/capabilities')) {
+        return jsonResponse({ max_files_by_source_provider: { default: 5000, SMB: 100000 } });
+      }
+      if (path.endsWith(`/transfers/${transfer.id}/evaluation`) && init?.method === 'POST') {
+        latestEvaluation = {
+          ...evaluation, status: 'PENDING', generation: 2, sequence: 0,
+          files_found: null, count_complete: false, safe_message: null,
+        };
+        return jsonResponse(latestEvaluation, 202);
+      }
+      if (isTransferCollectionRequest(path)) {
+        const current = { ...transfer, evaluation: latestEvaluation };
+        if (path.includes('background_only=true')) return jsonResponse({ items: [current], total_count: 1 });
+        if (path.includes('pending_only=true')) return jsonResponse({ items: [current], total_count: 1 });
+        return jsonResponse({ items: [], total_count: 0 });
+      }
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('tab', { name: 'Programaciones' }));
+
+    const row = await screen.findByText(transfer.public_id);
+    expect(row.closest('.scheduled-transfer-row')).toBeInTheDocument();
+    expect(screen.getByText(/al menos 5\.001 archivos · límite 5\.000/i)).toBeVisible();
+    expect(screen.getByText('Divide la selección.')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Cancelar' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Volver a evaluar' }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/transfers/${transfer.id}/evaluation`,
+      expect.objectContaining({ method: 'POST' }),
+    ));
+    expect(await screen.findByText(/Solicitud guardada|Se solicitó volver a evaluar/i)).toBeVisible();
+    expect(await screen.findByText(/Pendiente de evaluación · cantidad todavía desconocida/i)).toBeVisible();
+    expect(screen.getByText(transfer.public_id).closest('.scheduled-transfer-row')).toBeInTheDocument();
+  });
+
+  it('orders evaluation snapshots by generation and sequence separately from copy progress', () => {
+    const current: Transfer = {
+      id: 'merge-transfer', public_id: 'TRF-2026-000209', status: 'RUNNING',
+      progress_percent: 50, files_completed: 4, files_total: 8,
+      bytes_transferred: 400, bytes_total: 800, current_item: null,
+      average_speed_bps: null, current_speed_bps: null,
+      destination_connection_id: 'destination', destination_path: '/',
+      evaluation: {
+        status: 'EVALUATING', generation: 2, sequence: 5, files_found: 100,
+        count_complete: false, max_files: 5000, started_at: null, updated_at: null,
+        completed_at: null, safe_error_code: null, safe_message: null,
+      },
+    };
+    const stale = mergeTransferState(current, {
+      ...current,
+      progress_percent: 10,
+      bytes_transferred: 50,
+      evaluation: { ...current.evaluation!, sequence: 4, files_found: 50 },
+    });
+    const newGeneration = mergeTransferState(current, {
+      ...current,
+      progress_percent: 10,
+      files_completed: 0,
+      bytes_transferred: 0,
+      evaluation: { ...current.evaluation!, generation: 3, sequence: 0, files_found: 0 },
+    });
+
+    expect(stale.evaluation?.files_found).toBe(100);
+    expect(stale.bytes_transferred).toBe(400);
+    expect(newGeneration.evaluation?.files_found).toBe(0);
+    expect(newGeneration.bytes_transferred).toBe(400);
   });
 
   it('loads older active transfers after the first 200 scheduled background jobs', async () => {

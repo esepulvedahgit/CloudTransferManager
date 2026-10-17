@@ -555,6 +555,10 @@ button, input { font: inherit; }
 .scheduled-transfer-meta .MuiTypography-root { display: flex; align-items: baseline; gap: 6px; }
 .scheduled-transfer-meta span { color: #77869a; }
 .scheduled-wait-reason { display: block; margin-top: 6px; color: #52637a; }
+.scheduled-evaluation { display: grid; gap: 4px; margin-top: 9px; padding: 9px 11px; border: 1px solid #dce7f2; border-radius: 10px; background: #f6f9fc; }
+.scheduled-evaluation .MuiTypography-root { overflow-wrap: anywhere; }
+.scheduled-evaluation-delay { margin-top: 3px; padding: 5px 10px; }
+.scheduled-evaluation-delay .MuiAlert-message { padding: 2px 0; font-size: 12px; }
 .scheduled-transfer-actions { flex-wrap: wrap; justify-content: flex-end; }
 
 @media (max-width: 1024px) {

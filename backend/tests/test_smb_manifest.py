@@ -100,10 +100,10 @@ async def test_manifest_distinguishes_same_path_objects_and_keeps_first_assignme
         limit=10,
     )
 
-    assert [(item.source_object_id, item.destination_path) for item in items] == [
+    assert {(item.source_object_id, item.destination_path) for item in items} == {
         ("H:First123", "/archive/report.txt"),
         ("H:Second12", "/archive/report_01.txt"),
-    ]
+    }
 
 
 @pytest.mark.asyncio
@@ -163,8 +163,15 @@ async def test_memory_store_aggregates_file_manifest_summaries_without_directori
         "failed": 1,
         "skipped": 1,
         "pending": 1,
+        "renamed": 0,
     }
-    assert summaries[missing_id] == {"copied": 0, "failed": 0, "skipped": 0, "pending": 0}
+    assert summaries[missing_id] == {
+        "copied": 0,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "renamed": 0,
+    }
 
 
 @pytest.mark.asyncio

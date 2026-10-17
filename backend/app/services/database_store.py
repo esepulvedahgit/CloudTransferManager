@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import uuid
 from collections.abc import AsyncIterator
@@ -5,11 +7,12 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, delete, func, or_, select, text, update
+from sqlalchemy import and_, case, delete, exists, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import aliased
 
 from app.models import (
     AuditEvent,
@@ -17,6 +20,7 @@ from app.models import (
     SMTPSettings,
     StorageConnection,
     TransferCounter,
+    TransferEvaluation,
     TransferEvent,
     TransferJob,
     TransferManifestItem,
@@ -36,12 +40,20 @@ from app.services.memory_store import (
     TransferRecord,
     UserAccount,
 )
+from app.services.source_inventory import InventoryProgress
+from app.services.transfer_evaluation import (
+    EvaluationClaim,
+    EvaluationConflictError,
+    EvaluationRecord,
+    restart_evaluation,
+)
 from app.services.transfer_progress import smb_manifest_progress_percent
 from app.services.transfer_scheduling import (
     DispatchBatch,
     TransferReservation,
     admission_wait_reason,
     dependency_wait_reason,
+    evaluation_wait_reason,
     transfer_requires_staging,
 )
 from app.settings import Settings, get_settings
@@ -62,6 +74,7 @@ _TRANSFER_STATUS_RANK = {
     "FAILED": 5,
 }
 _NOTIFICATION_LEASE_SECONDS = 300
+_EVALUATION_LEASE_SECONDS = 60
 
 
 class DatabaseStore:
@@ -69,6 +82,7 @@ class DatabaseStore:
 
     def __init__(self, settings: Settings | None = None) -> None:
         config = settings or get_settings()
+        self.settings = config
         self.engine = create_async_engine(config.resolved_database_url(), pool_pre_ping=True)
         self.sessions: async_sessionmaker[AsyncSession] = async_sessionmaker(
             self.engine, expire_on_commit=False
@@ -126,9 +140,7 @@ class DatabaseStore:
         async with self.sessions() as session:
             async with session.begin():
                 transfer = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == transfer_id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
                 )
                 if transfer is not None:
                     await self._ensure_notification_outbox(session, transfer)
@@ -249,11 +261,7 @@ class DatabaseStore:
                     .where(TransferNotificationOutbox.id == notification_id)
                     .with_for_update()
                 )
-                if (
-                    row is not None
-                    and row.status == "SENDING"
-                    and row.claim_token == claim_token
-                ):
+                if row is not None and row.status == "SENDING" and row.claim_token == claim_token:
                     row.status = "SENT"
                     row.claimed_at = None
                     row.claim_token = None
@@ -276,11 +284,7 @@ class DatabaseStore:
                     .where(TransferNotificationOutbox.id == notification_id)
                     .with_for_update()
                 )
-                if (
-                    row is None
-                    or row.status != "SENDING"
-                    or row.claim_token != claim_token
-                ):
+                if row is None or row.status != "SENDING" or row.claim_token != claim_token:
                     return
                 row.claimed_at = None
                 row.claim_token = None
@@ -500,6 +504,9 @@ class DatabaseStore:
             created_at=row.created_at,
             started_at=row.started_at,
             completed_at=row.completed_at,
+            evaluation=(
+                EvaluationRecord.from_row(row.evaluation) if row.evaluation is not None else None
+            ),
         )
 
     @staticmethod
@@ -669,9 +676,7 @@ class DatabaseStore:
                             )
                         ).all()
                     )
-                row = await session.scalar(
-                    select(User).where(User.id == user_id).with_for_update()
-                )
+                row = await session.scalar(select(User).where(User.id == user_id).with_for_update())
                 if row is None:
                     return None, False
                 removes_admin = (
@@ -959,6 +964,31 @@ class DatabaseStore:
                         created_at=datetime.now(UTC),
                     )
                     session.add(row)
+                    evaluation_row: TransferEvaluation | None = None
+                    if scheduled_at is not None and scheduled_at > datetime.now(UTC):
+                        is_smb_source = by_id[source_connection_id].provider_type == "SMB"
+                        evaluation_row = TransferEvaluation(
+                            id=uuid.uuid4(),
+                            transfer_job_id=row.id,
+                            status="PENDING",
+                            generation=1,
+                            sequence=0,
+                            count_complete=False,
+                            max_files=(
+                                self.settings.smb_transfer_max_files
+                                if is_smb_source
+                                else self.settings.transfer_max_files
+                            ),
+                            source_credential_version=by_id[
+                                source_connection_id
+                            ].credential_version,
+                            destination_credential_version=by_id[
+                                destination_connection_id
+                            ].credential_version,
+                            attempt_count=0,
+                        )
+                        row.evaluation = evaluation_row
+                        session.add(evaluation_row)
                     await session.flush()
                     if audit_event is not None:
                         event_metadata = dict(audit_event.get("metadata") or {})
@@ -991,12 +1021,462 @@ class DatabaseStore:
                 recovered.idempotent_replay = True
                 return recovered
             await session.refresh(row)
-            return self._transfer(row)
+            transfer = self._transfer(row)
+            if evaluation_row is not None:
+                transfer.evaluation = EvaluationRecord.from_row(evaluation_row)
+            return transfer
+
+    async def arequest_transfer_evaluation(
+        self, transfer_id: uuid.UUID, now: datetime
+    ) -> EvaluationRecord:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                transfer = await session.scalar(
+                    select(TransferJob)
+                    .where(TransferJob.id == transfer_id)
+                    .with_for_update()
+                )
+                if (
+                    transfer is None
+                    or transfer.status not in {"SCHEDULED", "QUEUED"}
+                    or transfer.dispatch_token is not None
+                    or transfer.execution_started_at is not None
+                    or transfer.cancel_requested_at is not None
+                ):
+                    raise EvaluationConflictError(
+                        "Solo se puede reevaluar una transferencia pendiente de ejecución."
+                    )
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == transfer_id)
+                    .with_for_update()
+                )
+                if evaluation is None:
+                    raise EvaluationConflictError(
+                        "Esta transferencia no tiene una evaluación anticipada para repetir."
+                    )
+                if evaluation.status in {"PENDING", "EVALUATING", "WAITING_PARENT"}:
+                    return EvaluationRecord.from_row(evaluation)
+
+                restart_evaluation(evaluation, now=now)
+                parent_wait = None
+                if transfer.depends_on_transfer_id is not None:
+                    parent = await session.get(TransferJob, transfer.depends_on_transfer_id)
+                    parent_wait = dependency_wait_reason(
+                        parent.status if parent is not None else "FAILED"
+                    )
+                if parent_wait is not None:
+                    evaluation.status = "WAITING_PARENT"
+                    evaluation.sequence = 1
+                    evaluation.safe_error_code = (
+                        "BLOCKED_PARENT_FAILED"
+                        if parent_wait == "BLOCKED_PARENT_FAILED"
+                        else None
+                    )
+                    evaluation.safe_message = (
+                        "La transferencia padre debe completarse correctamente "
+                        "antes de evaluar esta selección."
+                    )
+                    transfer.wait_reason = parent_wait
+                else:
+                    transfer.wait_reason = "WAITING_EVALUATION"
+                return EvaluationRecord.from_row(evaluation)
 
     async def aget_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
         async with self.sessions() as session:
             row = await session.get(TransferJob, transfer_id)
             return self._transfer(row) if row else None
+
+    async def alist_transfer_evaluations(
+        self, transfer_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, EvaluationRecord]:
+        if not transfer_ids:
+            return {}
+        async with self.sessions() as session:
+            rows = await session.scalars(
+                select(TransferEvaluation).where(
+                    TransferEvaluation.transfer_job_id.in_(transfer_ids)
+                )
+            )
+            return {row.transfer_job_id: EvaluationRecord.from_row(row) for row in rows}
+
+    @staticmethod
+    def _evaluation_claim_matches(
+        evaluation: TransferEvaluation,
+        transfer: TransferJob | None,
+        claim: EvaluationClaim,
+    ) -> bool:
+        return bool(
+            transfer is not None
+            and evaluation.status == "EVALUATING"
+            and evaluation.generation == claim.generation
+            and evaluation.claim_token == claim.claim_token
+            and transfer.status in {"SCHEDULED", "QUEUED"}
+            and transfer.dispatch_token is None
+            and transfer.execution_started_at is None
+            and transfer.cancel_requested_at is None
+        )
+
+    async def aclaim_due_evaluations(
+        self,
+        now: datetime,
+        *,
+        limit: int = 1,
+    ) -> list[EvaluationClaim]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        now = now.astimezone(UTC)
+        stale_before = now - timedelta(seconds=_EVALUATION_LEASE_SECONDS)
+        claims: list[EvaluationClaim] = []
+        parent = aliased(TransferJob)
+        parent_succeeded = exists(
+            select(parent.id).where(
+                parent.id == TransferJob.depends_on_transfer_id,
+                parent.status.in_({"COMPLETED", "COMPLETED_WITH_WARNINGS"}),
+            )
+        )
+        async with self.sessions() as session:
+            async with session.begin():
+                rows = list(
+                    await session.scalars(
+                        select(TransferEvaluation)
+                        .join(
+                            TransferJob,
+                            TransferJob.id == TransferEvaluation.transfer_job_id,
+                        )
+                        .where(
+                            or_(
+                                and_(
+                                    TransferEvaluation.status == "PENDING",
+                                    or_(
+                                        TransferEvaluation.retry_at.is_(None),
+                                        TransferEvaluation.retry_at <= now,
+                                    ),
+                                ),
+                                and_(
+                                    TransferEvaluation.status == "EVALUATING",
+                                    or_(
+                                        TransferEvaluation.heartbeat_at.is_(None),
+                                        TransferEvaluation.heartbeat_at <= stale_before,
+                                    ),
+                                ),
+                                and_(
+                                    TransferEvaluation.status == "WAITING_PARENT",
+                                    parent_succeeded,
+                                ),
+                            )
+                        )
+                        .order_by(TransferEvaluation.updated_at, TransferEvaluation.id)
+                        .limit(min(limit, 100))
+                        .with_for_update(skip_locked=True)
+                    )
+                )
+                for evaluation in rows:
+                    transfer = await session.scalar(
+                        select(TransferJob)
+                        .where(TransferJob.id == evaluation.transfer_job_id)
+                        .with_for_update()
+                    )
+                    if (
+                        transfer is None
+                        or transfer.status not in {"SCHEDULED", "QUEUED"}
+                        or transfer.dispatch_token is not None
+                        or transfer.execution_started_at is not None
+                        or transfer.cancel_requested_at is not None
+                    ):
+                        evaluation.claim_token = None
+                        evaluation.heartbeat_at = None
+                        continue
+
+                    if transfer.depends_on_transfer_id is not None:
+                        parent_transfer = await session.get(
+                            TransferJob, transfer.depends_on_transfer_id
+                        )
+                        parent_wait = dependency_wait_reason(
+                            parent_transfer.status if parent_transfer is not None else "FAILED"
+                        )
+                        if parent_wait is not None:
+                            safe_error_code = (
+                                "BLOCKED_PARENT_FAILED"
+                                if parent_wait == "BLOCKED_PARENT_FAILED"
+                                else None
+                            )
+                            safe_message = (
+                                "La transferencia padre debe completarse correctamente "
+                                "antes de evaluar esta selección."
+                            )
+                            if evaluation.status != "WAITING_PARENT":
+                                restart_evaluation(evaluation, now=now)
+                                evaluation.status = "WAITING_PARENT"
+                                evaluation.safe_error_code = safe_error_code
+                                evaluation.safe_message = safe_message
+                                evaluation.sequence = 1
+                            elif (
+                                evaluation.safe_error_code != safe_error_code
+                                or evaluation.safe_message != safe_message
+                                or transfer.wait_reason != parent_wait
+                            ):
+                                evaluation.safe_error_code = safe_error_code
+                                evaluation.safe_message = safe_message
+                                evaluation.sequence += 1
+                                evaluation.updated_at = now
+                            transfer.wait_reason = parent_wait
+                            continue
+                        if evaluation.status == "WAITING_PARENT":
+                            restart_evaluation(evaluation, now=now)
+                            transfer.wait_reason = "WAITING_EVALUATION"
+                    elif evaluation.status == "WAITING_PARENT":
+                        restart_evaluation(evaluation, now=now)
+                        transfer.wait_reason = "WAITING_EVALUATION"
+
+                    owner = await session.get(User, transfer.requested_by)
+                    if owner is None or not owner.is_active:
+                        transfer.wait_reason = "WAITING_USER_ACTIVE"
+                        continue
+                    source = await session.get(StorageConnection, transfer.source_connection_id)
+                    destination = await session.get(
+                        StorageConnection, transfer.destination_connection_id
+                    )
+                    if (
+                        source is None
+                        or destination is None
+                        or source.deleted_at is not None
+                        or destination.deleted_at is not None
+                        or source.status != "ACTIVE"
+                        or destination.status != "ACTIVE"
+                    ):
+                        transfer.wait_reason = "WAITING_CONNECTION_ACTIVE"
+                        continue
+                    if (
+                        source.credential_version != transfer.source_credential_version
+                        or destination.credential_version != transfer.destination_credential_version
+                        or (
+                            evaluation.source_credential_version is not None
+                            and evaluation.source_credential_version
+                            != source.credential_version
+                        )
+                        or (
+                            evaluation.destination_credential_version is not None
+                            and evaluation.destination_credential_version
+                            != destination.credential_version
+                        )
+                    ):
+                        evaluation.status = "BLOCKED"
+                        evaluation.safe_error_code = "BLOCKED_CONNECTION_CHANGED"
+                        evaluation.safe_message = (
+                            "Una conexión o sus credenciales cambiaron. "
+                            "Solicita una nueva evaluación."
+                        )
+                        evaluation.completed_at = now
+                        evaluation.retry_at = None
+                        evaluation.claim_token = None
+                        evaluation.heartbeat_at = None
+                        evaluation.sequence += 1
+                        evaluation.updated_at = now
+                        transfer.wait_reason = "BLOCKED_CONNECTION_CHANGED"
+                        continue
+                    if owner.role != "ADMIN":
+                        granted = set(
+                            (
+                                await session.scalars(
+                                    select(UserConnectionGrant.connection_id).where(
+                                        UserConnectionGrant.user_id == owner.id,
+                                        UserConnectionGrant.connection_id.in_(
+                                            [source.id, destination.id]
+                                        ),
+                                    )
+                                )
+                            ).all()
+                        )
+                        if any(
+                            not connection.is_global
+                            and connection.id not in granted
+                            for connection in (source, destination)
+                        ):
+                            transfer.wait_reason = "WAITING_CONNECTION_ACCESS"
+                            continue
+
+                    maximum_files = (
+                        self.settings.smb_transfer_max_files
+                        if source.provider_type == "SMB"
+                        else self.settings.transfer_max_files
+                    )
+                    if evaluation.max_files != maximum_files:
+                        restart_evaluation(
+                            evaluation,
+                            now=now,
+                            max_files=maximum_files,
+                        )
+                        transfer.wait_reason = "WAITING_EVALUATION"
+                        continue
+
+                    if evaluation.status == "EVALUATING" and session.bind is not None:
+                        if session.bind.dialect.name == "postgresql":
+                            connection = await session.connection()
+                            lock_key = self._transfer_lock_key(transfer.id)
+                            lock_available = bool(
+                                await connection.scalar(
+                                    text("SELECT pg_try_advisory_lock(:lock_key)"),
+                                    {"lock_key": lock_key},
+                                )
+                            )
+                            if not lock_available:
+                                continue
+                            await connection.execute(
+                                text("SELECT pg_advisory_unlock(:lock_key)"),
+                                {"lock_key": lock_key},
+                            )
+
+                    if evaluation.attempt_count >= 3:
+                        evaluation.status = "ERROR"
+                        evaluation.safe_error_code = "EVALUATION_ATTEMPTS_EXHAUSTED"
+                        evaluation.safe_message = (
+                            "No se pudo completar la evaluación tras tres intentos."
+                        )
+                        evaluation.completed_at = now
+                        evaluation.retry_at = None
+                        evaluation.claim_token = None
+                        evaluation.heartbeat_at = None
+                        evaluation.sequence += 1
+                        evaluation.updated_at = now
+                        transfer.wait_reason = "BLOCKED_EVALUATION"
+                        continue
+
+                    claim_token = uuid.uuid4()
+                    evaluation.status = "EVALUATING"
+                    evaluation.claim_token = claim_token
+                    evaluation.attempt_count += 1
+                    evaluation.started_at = evaluation.started_at or now
+                    evaluation.updated_at = now
+                    evaluation.heartbeat_at = now
+                    evaluation.retry_at = None
+                    evaluation.sequence += 1
+                    transfer.wait_reason = "WAITING_EVALUATION"
+                    claims.append(
+                        EvaluationClaim(
+                            transfer_id=transfer.id,
+                            generation=evaluation.generation,
+                            claim_token=claim_token,
+                        )
+                    )
+        return claims
+
+    async def aheartbeat_evaluation(self, claim: EvaluationClaim, now: datetime) -> bool:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == claim.transfer_id)
+                    .with_for_update()
+                )
+                transfer = await session.scalar(
+                    select(TransferJob)
+                    .where(TransferJob.id == claim.transfer_id)
+                    .with_for_update()
+                )
+                if (
+                    evaluation is None
+                    or transfer is None
+                    or not self._evaluation_claim_matches(evaluation, transfer, claim)
+                ):
+                    return False
+                evaluation.heartbeat_at = now
+                return True
+
+    async def asave_evaluation_progress(
+        self, claim: EvaluationClaim, progress: InventoryProgress, now: datetime
+    ) -> bool:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == claim.transfer_id)
+                    .with_for_update()
+                )
+                transfer = await session.scalar(
+                    select(TransferJob)
+                    .where(TransferJob.id == claim.transfer_id)
+                    .with_for_update()
+                )
+                if evaluation is None or not self._evaluation_claim_matches(
+                    evaluation, transfer, claim
+                ):
+                    return False
+                if (
+                    evaluation.files_found == progress.files_found
+                    and evaluation.count_complete == progress.count_complete
+                ):
+                    return True
+                evaluation.files_found = progress.files_found
+                evaluation.count_complete = progress.count_complete
+                evaluation.sequence += 1
+                evaluation.updated_at = now
+                return True
+
+    async def afinish_evaluation(
+        self,
+        claim: EvaluationClaim,
+        *,
+        status: str,
+        progress: InventoryProgress,
+        error_code: str | None,
+        message: str | None,
+        now: datetime,
+        retry_at: datetime | None = None,
+    ) -> bool:
+        if status not in {"PENDING", "APPROVED", "BLOCKED", "ERROR", "WAITING_PARENT"}:
+            raise ValueError("Invalid evaluation completion status")
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == claim.transfer_id)
+                    .with_for_update()
+                )
+                transfer = await session.scalar(
+                    select(TransferJob)
+                    .where(TransferJob.id == claim.transfer_id)
+                    .with_for_update()
+                )
+                if (
+                    evaluation is None
+                    or transfer is None
+                    or not self._evaluation_claim_matches(evaluation, transfer, claim)
+                ):
+                    return False
+                evaluation.status = status
+                evaluation.files_found = progress.files_found
+                evaluation.count_complete = progress.count_complete
+                evaluation.safe_error_code = error_code
+                evaluation.safe_message = message
+                evaluation.retry_at = retry_at.astimezone(UTC) if retry_at is not None else None
+                evaluation.completed_at = (
+                    now if status in {"APPROVED", "BLOCKED", "ERROR"} else None
+                )
+                evaluation.claim_token = None
+                evaluation.heartbeat_at = None
+                evaluation.sequence += 1
+                evaluation.updated_at = now
+                if status == "APPROVED":
+                    scheduled_at = transfer.scheduled_at
+                    if scheduled_at is not None and scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=UTC)
+                    transfer.wait_reason = (
+                        "WAITING_UNTIL"
+                        if scheduled_at is not None and scheduled_at > now
+                        else None
+                    )
+                elif status in {"BLOCKED", "ERROR"}:
+                    transfer.wait_reason = "BLOCKED_EVALUATION"
+                elif status == "WAITING_PARENT":
+                    transfer.wait_reason = "WAITING_PARENT"
+                else:
+                    transfer.wait_reason = "WAITING_EVALUATION"
+                return True
 
     async def aget_transfer_by_idempotency(
         self,
@@ -1071,8 +1551,7 @@ class DatabaseStore:
                         select(TransferJob).where(
                             TransferJob.status.in_({"QUEUED", *active_statuses}),
                             TransferJob.execution_started_at.is_not(None),
-                            TransferJob.execution_heartbeat_at
-                            < now - timedelta(seconds=60),
+                            TransferJob.execution_heartbeat_at < now - timedelta(seconds=60),
                         )
                     )
                 )
@@ -1162,11 +1641,17 @@ class DatabaseStore:
                         transfer.destination_connection_id,
                     )
                 }
-                connection_rows = list(
-                    await session.scalars(
-                        select(StorageConnection).where(StorageConnection.id.in_(connection_ids))
+                connection_rows = (
+                    list(
+                        await session.scalars(
+                            select(StorageConnection).where(
+                                StorageConnection.id.in_(connection_ids)
+                            )
+                        )
                     )
-                ) if connection_ids else []
+                    if connection_ids
+                    else []
+                )
                 connections = {connection.id: connection for connection in connection_rows}
 
                 active = [
@@ -1175,9 +1660,7 @@ class DatabaseStore:
                         source_connection_id=transfer.source_connection_id,
                         destination_connection_id=transfer.destination_connection_id,
                         execution_mode=transfer.execution_mode,
-                        uses_staging=self._transfer_uses_staging(
-                            transfer, connections
-                        ),
+                        uses_staging=self._transfer_uses_staging(transfer, connections),
                         uses_nextcloud=self._transfer_uses_nextcloud(transfer, connections),
                     )
                     for transfer in running
@@ -1206,10 +1689,62 @@ class DatabaseStore:
                         parent = await session.get(TransferJob, transfer.depends_on_transfer_id)
                         parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
                         if parent_wait is not None:
+                            evaluation = transfer.evaluation
+                            if evaluation is not None and evaluation.status != "WAITING_PARENT":
+                                restart_evaluation(evaluation, now=now)
+                                evaluation.status = "WAITING_PARENT"
+                                evaluation.safe_error_code = (
+                                    "BLOCKED_PARENT_FAILED"
+                                    if parent_wait == "BLOCKED_PARENT_FAILED"
+                                    else None
+                                )
+                                evaluation.safe_message = (
+                                    "La transferencia padre debe completarse correctamente "
+                                    "antes de evaluar esta selección."
+                                )
+                                evaluation.sequence = 1
+                            elif evaluation is not None and (
+                                evaluation.safe_error_code
+                                != (
+                                    "BLOCKED_PARENT_FAILED"
+                                    if parent_wait == "BLOCKED_PARENT_FAILED"
+                                    else None
+                                )
+                                or evaluation.safe_message
+                                != "La transferencia padre debe completarse correctamente "
+                                "antes de evaluar esta selección."
+                            ):
+                                evaluation.safe_error_code = (
+                                    "BLOCKED_PARENT_FAILED"
+                                    if parent_wait == "BLOCKED_PARENT_FAILED"
+                                    else None
+                                )
+                                evaluation.safe_message = (
+                                    "La transferencia padre debe completarse correctamente "
+                                    "antes de evaluar esta selección."
+                                )
+                                evaluation.sequence += 1
+                                evaluation.updated_at = now
                             if transfer.wait_reason != parent_wait:
                                 transfer.wait_reason = parent_wait
                                 changed_ids.add(transfer.id)
+                            if evaluation is not None:
+                                changed_ids.add(transfer.id)
                             continue
+                        if (
+                            transfer.evaluation is not None
+                            and transfer.evaluation.status == "WAITING_PARENT"
+                        ):
+                            restart_evaluation(transfer.evaluation, now=now)
+                            transfer.wait_reason = "WAITING_EVALUATION"
+                            changed_ids.add(transfer.id)
+                    elif (
+                        transfer.evaluation is not None
+                        and transfer.evaluation.status == "WAITING_PARENT"
+                    ):
+                        restart_evaluation(transfer.evaluation, now=now)
+                        transfer.wait_reason = "WAITING_EVALUATION"
+                        changed_ids.add(transfer.id)
 
                     owner = await session.get(User, transfer.requested_by)
                     if owner is None or not owner.is_active:
@@ -1266,6 +1801,31 @@ class DatabaseStore:
                                 changed_ids.add(transfer.id)
                             continue
 
+                    evaluation = transfer.evaluation
+                    if evaluation is not None:
+                        maximum_files = (
+                            self.settings.smb_transfer_max_files
+                            if source.provider_type == "SMB"
+                            else self.settings.transfer_max_files
+                        )
+                        if evaluation.max_files != maximum_files:
+                            restart_evaluation(
+                                evaluation,
+                                now=now,
+                                max_files=maximum_files,
+                            )
+                            transfer.wait_reason = "WAITING_EVALUATION"
+                            changed_ids.add(transfer.id)
+                            continue
+                        evaluation_wait = evaluation_wait_reason(
+                            EvaluationRecord.from_row(evaluation)
+                        )
+                        if evaluation_wait is not None:
+                            if transfer.wait_reason != evaluation_wait:
+                                transfer.wait_reason = evaluation_wait
+                                changed_ids.add(transfer.id)
+                            continue
+
                     if exclusive_barrier:
                         reason = "WAITING_EXCLUSIVE"
                     else:
@@ -1308,13 +1868,17 @@ class DatabaseStore:
                     if transfer.execution_mode == "EXCLUSIVE":
                         exclusive_barrier = True
 
-                rows = list(
-                    await session.scalars(
-                        select(TransferJob).where(
-                            TransferJob.id.in_(changed_ids | set(admitted_ids))
+                rows = (
+                    list(
+                        await session.scalars(
+                            select(TransferJob).where(
+                                TransferJob.id.in_(changed_ids | set(admitted_ids))
+                            )
                         )
                     )
-                ) if changed_ids or admitted_ids else []
+                    if changed_ids or admitted_ids
+                    else []
+                )
                 rows_by_id = {row.id: row for row in rows}
                 admitted = [self._transfer(rows_by_id[item_id]) for item_id in admitted_ids]
                 changed = [
@@ -1382,6 +1946,12 @@ class DatabaseStore:
         depends_on_transfer_id: uuid.UUID | None,
     ) -> TransferRecord | None:
         now = datetime.now(UTC)
+        if scheduled_at is not None:
+            scheduled_at = (
+                scheduled_at.replace(tzinfo=UTC)
+                if scheduled_at.tzinfo is None
+                else scheduled_at.astimezone(UTC)
+            )
         async with self.sessions() as session:
             async with session.begin():
                 if session.bind is not None and session.bind.dialect.name == "postgresql":
@@ -1401,6 +1971,7 @@ class DatabaseStore:
                 )
                 if row is None:
                     return None
+                dependency_changed = row.depends_on_transfer_id != depends_on_transfer_id
                 if depends_on_transfer_id == transfer_id:
                     raise ValueError("Una transferencia no puede depender de sí misma.")
                 seen: set[uuid.UUID] = set()
@@ -1420,6 +1991,66 @@ class DatabaseStore:
                 due_later = scheduled_at is not None and scheduled_at > now
                 row.status = "SCHEDULED" if due_later else "QUEUED"
                 row.wait_reason = "WAITING_UNTIL" if due_later else None
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == transfer_id)
+                    .with_for_update()
+                )
+                evaluation_created = False
+                if evaluation is None and scheduled_at is not None:
+                    source = await session.get(StorageConnection, row.source_connection_id)
+                    maximum_files = (
+                        self.settings.smb_transfer_max_files
+                        if source is not None and source.provider_type == "SMB"
+                        else self.settings.transfer_max_files
+                    )
+                    evaluation = TransferEvaluation(
+                        id=uuid.uuid4(),
+                        transfer_job_id=row.id,
+                        status="PENDING",
+                        generation=1,
+                        sequence=0,
+                        count_complete=False,
+                        max_files=maximum_files,
+                        source_credential_version=row.source_credential_version,
+                        destination_credential_version=row.destination_credential_version,
+                        attempt_count=0,
+                    )
+                    session.add(evaluation)
+                    evaluation_created = True
+                if evaluation is not None:
+                    row.evaluation = evaluation
+
+                if dependency_changed and evaluation is not None:
+                    if not evaluation_created:
+                        restart_evaluation(evaluation, now=now)
+                    parent_wait = None
+                    if depends_on_transfer_id is not None:
+                        parent = await session.get(TransferJob, depends_on_transfer_id)
+                        parent_wait = dependency_wait_reason(
+                            parent.status if parent is not None else "FAILED"
+                        )
+                    if parent_wait is not None:
+                        evaluation.status = "WAITING_PARENT"
+                        evaluation.sequence = 1
+                        evaluation.safe_error_code = (
+                            "BLOCKED_PARENT_FAILED"
+                            if parent_wait == "BLOCKED_PARENT_FAILED"
+                            else None
+                        )
+                        evaluation.safe_message = (
+                            "La transferencia padre debe completarse correctamente "
+                            "antes de evaluar esta selección."
+                        )
+                        row.wait_reason = parent_wait
+                    elif evaluation_created:
+                        row.wait_reason = (
+                            "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
+                        )
+                    else:
+                        row.wait_reason = (
+                            "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
+                        )
                 await session.flush()
                 return self._transfer(row)
 
@@ -1430,9 +2061,7 @@ class DatabaseStore:
         async with self.sessions() as session:
             async with session.begin():
                 row = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == transfer_id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
                 )
                 if row is None or row.status in {
                     "COMPLETED",
@@ -1442,10 +2071,7 @@ class DatabaseStore:
                 }:
                     return None, False
                 row.cancel_requested_at = now
-                if (
-                    row.status in {"QUEUED", "SCHEDULED"}
-                    and row.execution_started_at is None
-                ):
+                if row.status in {"QUEUED", "SCHEDULED"} and row.execution_started_at is None:
                     row.status = "CANCELLED"
                     row.completed_at = now
                     row.wait_reason = None
@@ -1704,10 +2330,7 @@ class DatabaseStore:
         )
         async with self.sessions() as session:
             total = int(
-                await session.scalar(
-                    select(func.count(TransferJob.id)).where(*criteria)
-                )
-                or 0
+                await session.scalar(select(func.count(TransferJob.id)).where(*criteria)) or 0
             )
             statement = (
                 select(TransferJob)
@@ -1723,9 +2346,7 @@ class DatabaseStore:
         async with self.sessions() as session:
             async with session.begin():
                 row = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == transfer.id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == transfer.id).with_for_update()
                 )
                 if row is None or row.status in _TERMINAL_TRANSFER_STATUSES:
                     return
@@ -1781,9 +2402,7 @@ class DatabaseStore:
                                 "transfer_job_id": transfer_id,
                                 "source_path": source_path,
                                 "source_object_id": (
-                                    source_object_id
-                                    if isinstance(source_object_id, str)
-                                    else None
+                                    source_object_id if isinstance(source_object_id, str) else None
                                 ),
                                 "destination_path": str(entry["destination_path"]),
                                 "requested_destination_path": str(
@@ -2081,7 +2700,7 @@ class DatabaseStore:
         self, transfer_ids: list[uuid.UUID]
     ) -> dict[uuid.UUID, dict[str, int]]:
         summaries = {
-            transfer_id: {"copied": 0, "failed": 0, "skipped": 0, "pending": 0}
+            transfer_id: {"copied": 0, "failed": 0, "skipped": 0, "pending": 0, "renamed": 0}
             for transfer_id in transfer_ids
         }
         if not transfer_ids:
@@ -2092,32 +2711,35 @@ class DatabaseStore:
                 await session.execute(
                     select(
                         TransferManifestItem.transfer_job_id,
-                        func.sum(
-                            case((TransferManifestItem.status == "COPIED", 1), else_=0)
-                        ).label("copied"),
-                        func.sum(
-                            case((TransferManifestItem.status == "FAILED", 1), else_=0)
-                        ).label("failed"),
+                        func.sum(case((TransferManifestItem.status == "COPIED", 1), else_=0)).label(
+                            "copied"
+                        ),
+                        func.sum(case((TransferManifestItem.status == "FAILED", 1), else_=0)).label(
+                            "failed"
+                        ),
                         func.sum(
                             case((TransferManifestItem.status == "SKIPPED", 1), else_=0)
                         ).label("skipped"),
                         func.sum(
                             case((TransferManifestItem.status == "PENDING", 1), else_=0)
                         ).label("pending"),
+                        func.sum(
+                            case((TransferManifestItem.rename_reason.is_not(None), 1), else_=0)
+                        ).label("renamed"),
                     )
                     .where(
                         TransferManifestItem.transfer_job_id.in_(transfer_ids),
-                        TransferManifestItem.is_dir.is_(False),
                     )
                     .group_by(TransferManifestItem.transfer_job_id)
                 )
             ).all()
-        for transfer_id, copied, failed, skipped, pending in rows:
+        for transfer_id, copied, failed, skipped, pending, renamed in rows:
             summaries[transfer_id] = {
                 "copied": int(copied or 0),
                 "failed": int(failed or 0),
                 "skipped": int(skipped or 0),
                 "pending": int(pending or 0),
+                "renamed": int(renamed or 0),
             }
         return summaries
 

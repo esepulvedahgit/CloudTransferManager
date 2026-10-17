@@ -11,6 +11,7 @@ import app.worker as worker
 from app.security.credentials import CredentialCipher
 from app.services.memory_store import MemoryStore, SMTPSettingsRecord
 from app.services.smtp_config import SMTPServerConfig
+from app.services.transfer_evaluation import EvaluationClaim
 from app.settings import Settings
 from app.worker import celery_app
 
@@ -25,6 +26,50 @@ def test_transfer_tasks_and_notifications_use_separate_worker_queues():
     assert worker.send_transfer_notification.max_retries is None
 
     assert celery_app.conf.broker_transport_options["visibility_timeout"] >= 24 * 60 * 60
+
+
+def test_evaluation_tasks_use_a_dedicated_queue_and_beat_dispatch_cycle():
+    assert celery_app.conf.task_routes["app.worker.run_transfer_evaluation"]["queue"] == (
+        "evaluations"
+    )
+    assert celery_app.conf.task_routes["app.worker.dispatch_pending_evaluations"]["queue"] == (
+        "control"
+    )
+    assert celery_app.conf.beat_schedule["dispatch-pending-evaluations"]["schedule"] == 15.0
+    assert (
+        celery_app.conf.beat_schedule["dispatch-pending-evaluations"]["options"]["queue"]
+        == "control"
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluation_dispatcher_claims_then_publishes_to_evaluation_queue(monkeypatch):
+    transfer_id = uuid.uuid4()
+    claim = EvaluationClaim(transfer_id, 4, uuid.uuid4())
+    published = []
+
+    class EvaluationStore:
+        async def aclaim_due_evaluations(self, _now, *, limit):
+            assert limit == 20
+            return [claim]
+
+        async def aclose(self):
+            return None
+
+    class EvaluationTask:
+        def apply_async(self, *, args, queue):
+            published.append((args, queue))
+
+    monkeypatch.setattr(worker, "get_settings", lambda: Settings())
+    monkeypatch.setattr(worker, "DatabaseStore", lambda _settings: EvaluationStore())
+    monkeypatch.setattr(worker, "run_transfer_evaluation", EvaluationTask())
+
+    dispatched = await worker._dispatch_pending_evaluations()
+
+    assert dispatched == 1
+    assert published == [
+        ([str(transfer_id), 4, str(claim.claim_token)], "evaluations")
+    ]
 
 
 def test_persistent_dispatcher_runs_on_a_separate_control_queue_every_15_seconds():

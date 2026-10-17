@@ -1,6 +1,6 @@
 # Estado de implementación
 
-**Revisión del repositorio: 2026-10-16.** Este documento resume lo que existe en el código y separa esa evidencia de la validación que depende de CI, credenciales o redes de una instalación.
+**Revisión del repositorio: 2026-10-17.** Este documento resume lo que existe en el código y separa esa evidencia de la validación que depende de CI, credenciales o redes de una instalación.
 
 ## Estado por área
 
@@ -10,18 +10,18 @@
 | Conexiones y credenciales | Implementado | Administración, asignación privada, OAuth de Google, cifrado AES-GCM y respuestas públicas sin credenciales. El archivado es lógico y rechaza conexiones con trabajos activos. Véanse `backend/app/main.py`, `backend/app/security/credentials.py` y las migraciones. |
 | Proveedores | Implementado con validación externa | MEGA usa MEGAcmd; Google Drive usa Rclone/OAuth; Seafile ofrece adaptadores Rclone o API explícito; la UI usa SMB/NAS como origen; Nextcloud usa Rclone WebDAV con URL y credenciales administradas por conexión. Cada instalación necesita sus credenciales, permisos y rutas de red. La compatibilidad de Seafile API se acota inicialmente a CE 13.x. Nextcloud requiere prueba real por instalación antes de activarlo. |
 | Explorador | Implementado | Navegación, búsqueda, selección múltiple y destino por carpeta existente; paneles coordinados en escritorio y pasos separados en pantallas estrechas. No hay creación manual de carpetas desde la UI. Véanse `frontend/src/App.tsx` y `docs/specs/03-file-explorer-spec.md`. |
-| Transferencias | Implementado en código; migración y validación pendientes | Las transferencias nuevas usan `KEEP_BOTH` global, inventario por identidad, asignación de nombres `_01`, `_02`, manifiesto común y staging por archivo. Rclone no reemplaza objetos existentes; Seafile API solicita `replace=false`; los resultados de escritura ambiguos solo se aceptan tras reconciliar SHA-256. La reanudación manual se amplía a trabajos nuevos con manifiesto. La migración `20261016_0012` aún no está aplicada y no se han validado estas rutas contra servicios reales. |
-| Programaciones | Implementado | Ejecuciones futuras de una sola vez, zonas IANA, modos `AUTO`/`EXCLUSIVE`, dependencias y despacho durable vía PostgreSQL, Celery Beat y `control-worker`. No hay recurrencia. Detalle en `docs/integrations/transfer-scheduling.md`. |
+| Transferencias | Implementado en código; migración y validación pendientes | Las transferencias nuevas usan `KEEP_BOTH` global, inventario por identidad, asignación de nombres `_01`, `_02`, manifiesto común y staging por archivo. Rclone no reemplaza objetos existentes; Seafile API solicita `replace=false`; los resultados de escritura ambiguos solo se aceptan tras reconciliar SHA-256. La reanudación manual se amplía a trabajos nuevos con manifiesto. Las migraciones `20261016_0012` y `20261017_0013` aún no están aplicadas y no se han validado estas rutas contra servicios reales. |
+| Programaciones | Implementado en código; despliegue pendiente | Ejecuciones futuras de una sola vez, zonas IANA, modos `AUTO`/`EXCLUSIVE`, dependencias y despacho durable vía PostgreSQL, Celery Beat y `control-worker`. Las tareas programadas muestran conteo parcial/completo y motivo de espera en Programaciones; evaluaciones bloqueadas no reservan copias y el dispatcher mantiene el preflight final. Compose incluye `evaluation-worker` aislado y `/health/evaluations` separado de readiness. La migración `20261017_0013` y el despliegue coordinado aún están pendientes; no hay validación con proveedores reales. Detalle en `docs/integrations/transfer-scheduling.md`. |
 | Progreso e historial | Implementado | SSE sobre Redis en despliegue, reconciliación monotónica entre SSE, polling e historial, paginación SQL y resultados por archivo para manifiestos SMB. Véanse `docs/specs/05-realtime-telemetry-spec.md` y el contrato API. |
 | Auditoría y SMTP | Implementado con límite por confirmar | Registro de eventos, sanitización, configuración/prueba SMTP desde Administración, secretos SMTP cifrados y outbox transaccional por intento terminal. La creación de transferencias y su evento de auditoría comparten transacción; el envío usa worker/cola aislados, tokens de despacho y de intento, reintentos durables y vista ADMIN de estados sin correo del destinatario. `/health/notifications` vigila el worker sin degradar readiness de copias. SMTP no garantiza exactamente una entrega si el proceso cae tras la aceptación remota. La aplicación escribe auditoría append-only, pero su inmutabilidad no está impuesta por trigger/permisos de PostgreSQL. |
-| Despliegue y CI | Implementado | Compose incluye proxy, frontend, backend, workers separados para transferencias, control y notificaciones, PostgreSQL y Redis; solo el proxy publica puertos. Hay límites de recursos, logs rotativos, Docker Secrets, `tmpfs` para secretos/configuración Rclone y CI con PostgreSQL para pruebas de concurrencia y escaneo Trivy de las imágenes de backend, frontend y respaldo. El resultado del workflow corresponde a cada commit y PR. |
+| Despliegue y CI | Implementado en configuración; despliegue pendiente | Compose incluye proxy, frontend, backend, workers separados para transferencias, control, evaluación y notificaciones, PostgreSQL y Redis; solo el proxy publica puertos. El worker de evaluación usa cola propia, concurrencia uno, salida controlada a proveedores, secretos mínimos y límites de CPU/memoria/PIDs. `/health/evaluations` reporta esa capacidad sin degradar la salud de copias activas. Hay logs rotativos, Docker Secrets, `tmpfs` para secretos/configuración Rclone y CI con PostgreSQL para pruebas de concurrencia y escaneo Trivy de las imágenes de backend, frontend y respaldo. La configuración Compose no implica que se haya desplegado en la instalación. |
 
 ## Capacidades añadidas después del alcance inicial
 
 - Migración de carpetas desde SMB/NAS a MEGA, Google Drive o Seafile, con manifiesto por archivo y reanudación controlada.
 - Seafile mediante Rclone o API directa seleccionada por conexión; no hay fallback silencioso entre adaptadores.
 - Nextcloud mediante WebDAV/Rclone con registro desde la UI y límites conservadores de concurrencia, ancho de banda y timeout. Véase `docs/integrations/nextcloud-compatibility.md`.
-- Programación única, modos de admisión, dependencias y vista de trabajos en segundo plano.
+- Programación única, modos de admisión, dependencias y vista de trabajos en segundo plano con evaluación anticipada, conteo recuperable y bloqueo previo al despacho por límite.
 - Administración de conexiones privadas y archivado lógico sin borrar referencias históricas.
 - Configuración SMTP desde Administración y menú de cuenta que agrupa administración, cambio de contraseña y cierre de sesión.
 - CI de backend/frontend y análisis Trivy de repositorio, configuración e imágenes.
@@ -72,7 +72,15 @@ Antes de declarar una versión lista para una instalación concreta, falta regis
 5. Si SMB debe ser estrictamente solo origen, validar ese límite también en `POST /api/v1/transfers`: la UI filtra SMB del selector de destino, pero el endpoint no comprueba el tipo de proveedor destino.
 6. Registrar la cobertura de los 30 criterios de aceptación como implementada, verificada en CI, validada contra proveedor real o pendiente, sin mezclar esas categorías.
 
-Esta revisión fue documental y de lectura del código. No ejecutó la suite ni hizo conexiones a proveedores reales; por eso no afirma que el último PR o una instalación específica hayan pasado esas comprobaciones.
+La evidencia local de esta revisión no equivale a un resultado de CI sobre un commit ni valida una instalación concreta. El alcance de las pruebas y los límites de proveedor/despliegue quedan registrados abajo.
+
+## Evidencia de validación (2026-10-17)
+
+- Backend: `pytest -v --tb=short`: **486 pasaron, 9 omitidas**. Se ejecutaron además los archivos de persistencia y store con PostgreSQL 16 desechable: **41 pasaron**, incluidas las carreras de reserva/recovery. La base temporal no publicó puertos ni usó volúmenes persistentes.
+- Calidad backend: `ruff check .` pasó; `mypy app` no encontró problemas en 44 archivos.
+- Frontend: `npm test`: **53 pasaron**; `npm run lint` y `npm run build` pasaron. Vite reportó avisos de anotaciones de comentarios en dependencias `zod`, sin impedir el build.
+- Compose: `docker compose config --quiet` y `scripts/check_compose_network.py` pasaron; el worker de evaluación no expone puertos y mantiene su cola separada.
+- Alcance de la evidencia: se probaron proveedores simulados y SQLite/PostgreSQL desechables. No se aplicó la migración `20261017_0013` a la base de la instalación, no se recrearon servicios activos y no se hicieron copias con cuentas reales. La ejecución de la migración y el despliegue coordinado siguen pendientes.
 
 ## Fases del plan original
 

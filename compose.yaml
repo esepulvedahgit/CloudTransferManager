@@ -191,6 +191,54 @@ services:
     networks:
       - ctm_internal
 
+  evaluation-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${EVALUATION_WORKER_CPU_LIMIT:-1.00}"
+          memory: "${EVALUATION_WORKER_MEMORY_LIMIT:-768M}"
+          pids: 256
+    healthcheck:
+      disable: true
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+        "--queues=evaluations",
+      ]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/ctm-secrets/postgres_password
+      MASTER_ENCRYPTION_KEY_FILE: /run/ctm-secrets/master_key
+      MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
+      SMB_ALLOWED_TARGETS: ${SMB_ALLOWED_TARGETS:-}
+      SMB_INTERACTIVE_TIMEOUT_SECONDS: ${SMB_INTERACTIVE_TIMEOUT_SECONDS:-30}
+      SMB_TRANSFER_MAX_FILES: ${SMB_TRANSFER_MAX_FILES:-100000}
+    secrets:
+      - postgres_password
+      - master_key
+    tmpfs:
+      - /run/ctm-secrets:mode=0700,size=1m
+      - /var/lib/cloud-transfer/tmp:mode=0700,size=64m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+      - provider_egress
+
   notification-worker:
     build:
       context: ./backend

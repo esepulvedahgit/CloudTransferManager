@@ -40,13 +40,15 @@ Definir la topología de contenedores, la gestión de volúmenes persistentes, l
                                           +-------- worker --------+
 ```
 
+El servicio `evaluation-worker` consume la cola Celery `evaluations` con concurrencia uno. Está conectado a `ctm_internal` y `provider_egress`, necesita PostgreSQL, Redis y `master_key` para consultar proveedores, y usa almacenamiento efímero privado para sus configuraciones. No publica puertos y tiene límites configurables de CPU y memoria, además del límite de procesos. El `control-worker` reserva evaluaciones y las publica; no recibe `master_key` ni accede a proveedores.
+
 ### Invariante de Red:
 - Uvicorn usa explícitamente `--loop asyncio`: MEGAcmd con login por stdin se bloquea bajo uvloop en este despliegue. No dejar la selección del event loop en `auto`.
 - Nginx enruta exactamente `/api/v1/transfers` al backend para GET/POST, sin agregar una barra ni redirigir. El prefijo `/api/v1/transfers/` conserva el streaming SSE sin buffering. La regresión se verifica con `docker compose exec -T --user ctm backend python < scripts/check_transfer_proxy.py`.
 - El reverse proxy usa el resolver DNS de Docker con resolución dinámica para backend y frontend; al recrear esos contenedores, Nginx actualiza sus IP sin reiniciar el proxy.
 - La imagen del worker incluye también Rclone para Google Drive.
 - Solo el servicio `reverse-proxy` expone puertos al exterior del host Docker; estos se publican explícitamente sobre `0.0.0.0` para acceso desde otros equipos de la red.
-- `postgres`, `redis`, `backend`, `worker`, `control-worker` y `beat` residen en `ctm_internal` sin mapeo de puertos al host. El worker de transferencias conserva salida hacia proveedores; el worker de control solo necesita PostgreSQL y Redis.
+- `postgres`, `redis`, `backend`, `worker`, `control-worker`, `evaluation-worker`, `notification-worker` y `beat` residen en `ctm_internal` sin mapeo de puertos al host. Los workers de transferencias y evaluación conservan salida hacia proveedores; los workers de control solo necesitan PostgreSQL y Redis.
 - `control-worker` consume la cola `control` y despacha reservas persistidas; `beat` solicita el despacho cada 15 segundos. Mantener una sola instancia de Beat por despliegue. Un advisory lock de PostgreSQL protege el despacho aunque coincidan una petición HTTP y un tick de Beat.
 - `reverse-proxy` también se conecta a la red dedicada `ctm_proxy_edge` (bridge no interno). Docker Engine 29 no materializa los puertos publicados para contenedores conectados únicamente a una red `internal`; mantener `ctm_internal` aislada evita dar salida externa a los servicios privados.
 - `0.0.0.0` escucha en todas las interfaces del host, no restringe el origen a la LAN. La restricción LAN-only depende del firewall del host y de no configurar reenvío de esos puertos en el router.
@@ -96,6 +98,7 @@ volumes:
   - Presencia y ejecutabilidad de los clientes MEGAcmd requeridos para login, listado, cuota, descarga, subida y cierre de sesión.
   - Capacidad de agendar tareas en workers Celery.
 - `GET /health/notifications`: Supervisa de forma independiente el consumidor de correo. Su estado no retira la API de transferencias de servicio porque las notificaciones son opcionales.
+- `GET /health/evaluations`: Supervisa por separado al consumidor de la cola `evaluations`. Si no está disponible, indica que las evaluaciones nuevas están en espera, sin declarar caída una copia que ya se ejecuta ni degradar `/health/ready`.
 
 ---
 
@@ -126,6 +129,8 @@ TRANSFER_STAGING_MARGIN_PERCENT=20
 TRANSFER_TEMP_PATH=/var/lib/cloud-transfer/tmp
 TRANSFER_STAGING_PATH=/var/lib/cloud-transfer/staging
 TRANSFER_MAX_RETRIES=5
+EVALUATION_WORKER_CPU_LIMIT=1.00
+EVALUATION_WORKER_MEMORY_LIMIT=768M
 SMTP_HOST=
 SMTP_PORT=587
 SMTP_USERNAME=
@@ -137,3 +142,7 @@ SESSION_MAX_AGE_SECONDS=28800
 ```
 
 Los archivos reales se generan con `scripts/setup-local-secrets.sh`; este ejemplo no contiene sus valores. Compose suministra `MASTER_ENCRYPTION_KEY_FILE=/run/ctm-secrets/master_key` al backend y a los workers que necesitan descifrar credenciales. El catálogo completo y las reglas de cambio de rutas/temporales están en `README.md`.
+
+### Despliegue de la corrección de transferencias
+
+Respaldar PostgreSQL y etiquetar imágenes de contenedores actuales antes de reconstruir. Detener Beat/control-worker y suspender consumo de nuevas transferencias; esperar a que no haya trabajos activos antes de recrear. Construir backend, worker, beat, control-worker, notification-worker y frontend. Recrear con `--no-deps` backend, worker, notification-worker y frontend; conservar PostgreSQL, Redis y volúmenes. Verificar readiness, proxy, identidad de imágenes y copia real acotada antes de levantar Beat/control-worker. Ante fallo crítico, dejar despacho detenido y recrear usando las etiquetas guardadas (no restaurar la BD sobre datos nuevos).

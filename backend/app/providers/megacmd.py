@@ -19,7 +19,15 @@ from app.providers.base import (
     StorageQuota,
 )
 from app.providers.mock import MockStorageProvider
-from app.services.megacmd import CancelCheck, LineCallback, MegaCmdError, MegaCmdRunner
+from app.services.megacmd import (
+    CancelCheck,
+    LineCallback,
+    MegaCmdDownloadOutputMissingError,
+    MegaCmdDownloadValidationError,
+    MegaCmdError,
+    MegaCmdListingError,
+    MegaCmdRunner,
+)
 
 _QUOTA_LINE = re.compile(
     r"USED STORAGE:\s*([\d.]+(?:\s*[A-Za-z]+)?)"
@@ -205,8 +213,7 @@ class MegaCmdSession:
             (
                 item
                 for item in result.items
-                if item.path == normalized
-                and (object_id is None or item.object_id == object_id)
+                if item.path == normalized and (object_id is None or item.object_id == object_id)
             ),
             None,
         )
@@ -238,8 +245,14 @@ class MegaCmdSession:
             should_cancel=should_cancel,
         )
         local_file = destination / safe_remote_path.rsplit("/", 1)[-1]
+        if local_file.is_symlink():
+            raise MegaCmdDownloadValidationError("MEGA produjo un enlace simbólico")
         if not local_file.is_file():
-            raise RuntimeError("MEGAcmd no creó el archivo descargado esperado")
+            if any(destination.iterdir()):
+                raise MegaCmdDownloadValidationError("MEGA produjo una salida inesperada")
+            raise MegaCmdDownloadOutputMissingError()
+        if any(child != local_file for child in destination.iterdir()):
+            raise MegaCmdDownloadValidationError("MEGA produjo múltiples salidas")
         return local_file
 
     async def upload_file(
@@ -409,34 +422,34 @@ def _parse_listing(
         if not line.strip():
             continue
         fields = line.lstrip().split(maxsplit=3)
+        if not fields or fields[0].upper() == "FLAGS" or fields[0].startswith("/"):
+            continue
         if len(fields) != 4:
+            if fields[0].startswith(("-", "d")):
+                raise MegaCmdListingError("Fila MEGA incompleta")
             continue
         flags, _version, raw_size, time_and_name = fields
-        # Column titles and absolute directory headings are not nodes. Match
-        # their first column, never the filename (a real NAME must survive).
-        if flags.upper() == "FLAGS" or flags.startswith("/"):
-            continue
-        handle_match = re.search(r"(?<!\S)H:[A-Za-z0-9_-]{8}(?!\S)", time_and_name)
-        object_id = handle_match.group(0) if handle_match is not None else None
-        if handle_match is not None:
-            time_and_name = (
-                f"{time_and_name[:handle_match.start()]}"
-                f"{time_and_name[handle_match.end():]}"
-            ).strip()
         parsed_time = _parse_time_and_name(time_and_name)
-        if parsed_time is None:
-            continue
+        if parsed_time is None or parsed_time[0] is None:
+            raise MegaCmdListingError("Fecha MEGA inválida")
         modified_at, name = parsed_time
+        object_id = None
+        # In the long listing the handle is a column BEFORE the name. Consume
+        # exactly its separator: whitespace inside the actual name is data.
+        if name.startswith("H:"):
+            handle, separator, remainder = name.partition(" ")
+            if not separator or not re.fullmatch(r"H:[A-Za-z0-9_-]{8}", handle):
+                raise MegaCmdListingError("Identidad MEGA inválida")
+            object_id, name = handle, remainder
         if not name.strip() or name in {".", ".."} or "/" in name or "\\" in name:
-            continue
+            raise MegaCmdListingError("Nombre MEGA inválido")
         try:
             path = MockStorageProvider.normalize_path(f"{parent_path.rstrip('/')}/{name}")
         except ValueError:
-            continue
-        try:
-            size = int(raw_size) if raw_size.isdigit() else None
-        except ValueError:
-            size = None
+            raise MegaCmdListingError("Ruta MEGA inválida") from None
+        size = int(raw_size) if raw_size.isdigit() else None
+        if not flags.lower().startswith("d") and size is None:
+            raise MegaCmdListingError("Tamaño MEGA inválido")
         items.append(
             StorageItem(
                 name=name,

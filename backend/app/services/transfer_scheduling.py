@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.services.memory_store import TransferRecord
+from app.services.transfer_evaluation import EvaluationRecord
 
 SUCCESSFUL_PARENT_STATUSES = frozenset({"COMPLETED", "COMPLETED_WITH_WARNINGS"})
 FAILED_PARENT_STATUSES = frozenset({"FAILED", "CANCELLED"})
@@ -29,6 +30,18 @@ def dependency_wait_reason(parent_status: str | None) -> str | None:
     if parent_status in FAILED_PARENT_STATUSES:
         return "BLOCKED_PARENT_FAILED"
     return "WAITING_PARENT"
+
+
+def evaluation_wait_reason(evaluation: EvaluationRecord | None) -> str | None:
+    if evaluation is None or evaluation.status in {"APPROVED", "NOT_REQUIRED"}:
+        return None
+    if evaluation.status in {"PENDING", "EVALUATING"}:
+        return "WAITING_EVALUATION"
+    if evaluation.status in {"BLOCKED", "ERROR"}:
+        return "BLOCKED_EVALUATION"
+    if evaluation.status == "WAITING_PARENT":
+        return "WAITING_PARENT"
+    return "WAITING_EVALUATION"
 
 
 def transfer_requires_staging(

@@ -64,6 +64,27 @@ class MegaCmdCommandError(MegaCmdError):
         return self._retryable
 
 
+class MegaCmdDownloadOutputMissingError(MegaCmdError):
+    """The MEGAcmd client exited successfully without creating the downloaded file."""
+
+    return_code = 0
+
+    @property
+    def retryable(self) -> bool:
+        return True
+
+    def __init__(self) -> None:
+        super().__init__("MEGAcmd terminó sin crear el archivo descargado esperado")
+
+
+class MegaCmdListingError(MegaCmdError):
+    """A node row cannot be interpreted without risking an incomplete inventory."""
+
+
+class MegaCmdDownloadValidationError(MegaCmdError):
+    """The downloaded output has an unexpected name or unsafe filesystem type."""
+
+
 class MegaCmdCancelledError(MegaCmdError):
     pass
 

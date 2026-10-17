@@ -42,9 +42,25 @@ Proporcionar una experiencia fluida y transparente en la interfaz web mostrando 
   "current_item": "/Proyectos/video_demo.mp4",
   "error_count": 0,
   "attempt_count": 1,
+  "manifest_summary": {"copied": 12, "failed": 0, "skipped": 0, "pending": 8, "renamed": 1},
+  "evaluation": {
+    "status": "EVALUATING",
+    "generation": 1,
+    "sequence": 3,
+    "files_found": 3200,
+    "count_complete": false,
+    "max_files": 5000,
+    "started_at": "2026-10-10T10:14:00Z",
+    "updated_at": "2026-10-10T10:15:32Z",
+    "completed_at": null,
+    "safe_error_code": null,
+    "safe_message": null
+  },
   "timestamp": "2026-10-10T10:15:32Z"
 }
 ```
+
+El primer frame es un snapshot tomado después de suscribirse al bus e incluye `manifest_summary`, incluso cuando la transferencia ya terminó. Los frames de progreso posteriores incluyen el mismo resumen actualizado.
 
 ### Reglas de Presentación en la UI:
 - **Total Desconocido:** Si el proveedor no puede reportar el total de bytes o archivos de antemano, mostrar una barra indeterminada animada, indicando los bytes y archivos transferidos hasta el momento.
@@ -56,6 +72,7 @@ Proporcionar una experiencia fluida y transparente en la interfaz web mostrando 
 - **Persistencia en Segundo Plano:** Cerrar o refrescar la pestaña del navegador **NUNCA** cancela el trabajo en ejecución. Al volver a abrir la página, el frontend se suscribe nuevamente al stream y recupera el estado.
 - **Cierre del progreso terminal:** Al terminar una transferencia, mostrar su estado final durante 3 segundos, refrescar el historial y la carpeta destino y después retirar la tarjeta de progreso activo. El registro permanece en el historial.
 - **Transferencias programadas:** Los trabajos con fecha programada, dependencia, modo exclusivo o motivo de espera permanecen en **Programaciones** y no ocupan las tarjetas grandes de progreso ni el historial mientras sigan activos. Un indicador compacto del encabezado muestra el total y abre un panel con el motivo de espera o los bytes/progreso actual. Las acciones para reprogramar y cancelar permanecen en **Programaciones**, cuya lista pagina trabajos activos para que los más antiguos no desaparezcan detrás de páginas recientes.
+- **Evaluación anticipada:** El snapshot, listado y eventos incluyen el DTO público de evaluación. El conteo de archivos se presenta aparte del avance de copia. El frontend combina `generation` y `sequence` para ignorar eventos atrasados; una cantidad menor se acepta cuando empieza una generación nueva. El polling de 15 segundos recupera el último estado persistido tras perder SSE o recargar la página.
 - **Suscripción y recuperación:** El cliente abre SSE para transferencias activas, incluidas las programadas que ya comenzaron. Al llegar a estado terminal, quita el trabajo del indicador y actualiza el historial. Las listas de historial, programadas y segundo plano se recuperan cada 15 segundos mientras la pestaña está visible; el polling se pausa en pestañas de fondo. Así, una terminalización cuyo evento SSE se perdió aparece en el historial en el siguiente ciclo de recuperación.
 - **Conteo SMB en historial:** Para transferencias SMB, presentar los contadores agregados del manifiesto (`copied`, `failed`, `skipped`) junto a los bytes. `files_completed` es un conteo de elementos resueltos y no debe rotularse como número de copias exitosas.
 

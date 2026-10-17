@@ -8,8 +8,14 @@ from pathlib import Path
 import pytest
 
 from app.providers.base import PaginatedItems, StorageItem
+from app.providers.rclone import GoogleDriveApiError
+from app.providers.seafile_api import SeafileApiError
 from app.security.credentials import CredentialCipher
-from app.services.megacmd import MegaCmdCancelledError, MegaCmdCommandError
+from app.services.megacmd import (
+    MegaCmdCancelledError,
+    MegaCmdCommandError,
+    MegaCmdDownloadOutputMissingError,
+)
 from app.services.memory_store import MemoryStore
 from app.services.rclone import RcloneCancelledError, RcloneCommandError, RcloneRunner
 from app.services.transfer_executor import TransferExecutor
@@ -102,7 +108,8 @@ class FakeStorage:
         self.upload_attempts = 0
         self.created_directories: list[str] = []
 
-    async def get_item(self, path: str):
+    async def get_item(self, path: str, **kwargs):
+        del kwargs
         return self.items.get(path)
 
     async def list_items(self, path: str, cursor=None, page_size=200, **kwargs):
@@ -156,8 +163,10 @@ class FakeMegaSession:
             and self.provider.download_attempts == 1
         ):
             raise MegaCmdCommandError(7, b"temporary failure")
-        if self.provider.failure and self.provider.failure.startswith("mega_download") and (
-            self.provider.failure != "mega_download_transient_once"
+        if (
+            self.provider.failure
+            and self.provider.failure.startswith("mega_download")
+            and (self.provider.failure != "mega_download_transient_once")
         ):
             if self.provider.failure.endswith("cancel"):
                 raise MegaCmdCancelledError("cancelled")
@@ -175,9 +184,7 @@ class FakeMegaSession:
             and self.provider.upload_attempts == 1
         ):
             remote_path = f"{remote_folder.rstrip('/')}/{local_file.name}"
-            self.provider.items[remote_path] = _item(
-                remote_path, size=0, provider="MEGA"
-            )
+            self.provider.items[remote_path] = _item(remote_path, size=0, provider="MEGA")
             raise MegaCmdCommandError(7, b"temporary failure")
         if (
             self.provider.failure == "mega_upload_transient_once"
@@ -233,7 +240,7 @@ class LocalCopyRunner:
         if kwargs.get("line_callback"):
             await kwargs["line_callback"](
                 '{"level":"notice","msg":"Transferred: '
-                f'{self.progress_bytes} B / {self.progress_bytes} B, 100%, '
+                f"{self.progress_bytes} B / {self.progress_bytes} B, 100%, "
                 '1 KiB/s, ETA 0s"}'
             )
 
@@ -278,6 +285,7 @@ def _cross_provider_executor(
     destination_items: list[StorageItem] | None = None,
     source_paths: list[str] | None = None,
     runner: LocalCopyRunner | None = None,
+    conflict_policy: str = "KEEP_BOTH",
 ):
     store = MemoryStore()
     requester = store.add_user("operator", "operator@example.test", "hash")
@@ -294,6 +302,7 @@ def _cross_provider_executor(
         source_paths or ["/source"],
         "/backup",
     )
+    transfer.conflict_policy = conflict_policy
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'unused.sqlite'}",
         transfer_temp_path=str(tmp_path / "rclone-config"),
@@ -330,6 +339,7 @@ async def test_nextcloud_transfer_uses_a_scoped_rclone_profile(tmp_path, monkeyp
     )
     executor, transfer, _providers, _runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="NEXTCLOUD",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/source.txt", size=4, provider="NEXTCLOUD")],
@@ -362,6 +372,7 @@ async def test_worker_runs_nextcloud_transfer_without_environment_configuration(
     runner = ProgressRunner()
     executor, transfer, _providers, runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="NEXTCLOUD",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/source.txt", size=4, provider="NEXTCLOUD")],
@@ -383,6 +394,7 @@ async def test_worker_runs_nextcloud_transfer_without_environment_configuration(
 async def test_nextcloud_timeout_has_a_specific_sanitized_failure_code(tmp_path, monkeypatch):
     executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="NEXTCLOUD",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/source.txt", size=4, provider="NEXTCLOUD")],
@@ -413,10 +425,10 @@ def _nested_tree(provider_type: str, sizes: tuple[int, int] = (2, 3)) -> list[St
 async def test_mega_to_drive_preserves_nested_paths_deduplicates_and_cleans_each_file(tmp_path):
     executor, transfer, providers, runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
-        source_items=_nested_tree("MEGA")
-        + [_item("/source/empty", is_dir=True, provider="MEGA")],
+        source_items=_nested_tree("MEGA") + [_item("/source/empty", is_dir=True, provider="MEGA")],
         source_paths=["/source", "/source/sub/b.txt", "//source//"],
     )
 
@@ -455,6 +467,7 @@ async def test_mega_to_drive_preserves_nested_paths_deduplicates_and_cleans_each
 async def test_mega_to_drive_preserves_an_empty_selected_folder(tmp_path):
     executor, transfer, providers, runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
         source_items=[
@@ -483,6 +496,7 @@ async def test_drive_to_mega_preserves_nested_paths_and_skips_existing_destinati
     existing = _item("/backup/source/sub/b.txt", size=3, provider="MEGA")
     executor, transfer, providers, runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="GOOGLE_DRIVE",
         destination_type="MEGA",
         source_items=_nested_tree("GOOGLE_DRIVE")
@@ -524,6 +538,7 @@ async def test_drive_to_mega_preserves_nested_paths_and_skips_existing_destinati
 async def test_seafile_rclone_to_mega_preserves_selected_folder_and_empty_directories(tmp_path):
     executor, transfer, providers, _runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="SEAFILE",
         destination_type="MEGA",
         source_items=_nested_tree("SEAFILE")
@@ -556,6 +571,7 @@ async def test_rclone_to_rclone_copies_selected_folder_into_named_destination(tm
     ]
     executor, transfer, providers, runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="GOOGLE_DRIVE",
         destination_type="GOOGLE_DRIVE",
         source_items=source_items,
@@ -583,6 +599,7 @@ async def test_rclone_to_rclone_does_not_complete_when_destination_size_differs(
     runner = ProgressRunner(destination_size_override=2)
     executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="OVERWRITE_IF_DIFFERENT",
         source_type="GOOGLE_DRIVE",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=4, provider="GOOGLE_DRIVE")],
@@ -606,6 +623,7 @@ async def test_rclone_to_rclone_rejects_unknown_size_when_size_limit_is_enabled(
     runner = ProgressRunner()
     executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="GOOGLE_DRIVE",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=None, provider="GOOGLE_DRIVE")],
@@ -628,6 +646,7 @@ async def test_rclone_to_rclone_rejects_file_larger_than_configured_limit(tmp_pa
     runner = ProgressRunner()
     executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="GOOGLE_DRIVE",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=1025, provider="GOOGLE_DRIVE")],
@@ -649,6 +668,7 @@ async def test_rclone_to_rclone_rejects_file_larger_than_configured_limit(tmp_pa
 async def test_retry_event_uses_current_file_attempt_not_transfer_maximum(tmp_path):
     executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=1, provider="MEGA")],
@@ -671,6 +691,7 @@ async def test_rclone_retry_limit_means_five_retries_after_initial_attempt(tmp_p
     runner = ProgressRunner(copy_failure_count=6)
     executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="GOOGLE_DRIVE",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=4, provider="GOOGLE_DRIVE")],
@@ -716,6 +737,7 @@ async def test_cross_provider_failures_and_cancellation_always_clean_staging(
     runner = LocalCopyRunner(tmp_path / "staging")
     executor, transfer, providers, _runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type=source_type,
         destination_type=destination_type,
         source_items=[_item("/file.txt", size=1, provider=source_type)],
@@ -740,10 +762,11 @@ async def test_cross_provider_failures_and_cancellation_always_clean_staging(
 
 
 @pytest.mark.asyncio
-async def test_mega_to_drive_retries_transient_copy_with_fresh_staging(tmp_path):
+async def test_mega_to_drive_does_not_repeat_an_unverified_upload(tmp_path):
     runner = LocalCopyRunner(tmp_path / "staging")
     executor, transfer, providers, _runner, snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="KEEP_BOTH",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=1, provider="MEGA")],
@@ -759,25 +782,25 @@ async def test_mega_to_drive_retries_transient_copy_with_fresh_staging(tmp_path)
     executor.sleep = no_delay
     await executor.execute(transfer.id)
 
-    assert transfer.status == "COMPLETED"
-    assert runner.upload_attempts == 2
-    assert transfer.attempt_count == 2
+    assert transfer.status == "FAILED"
+    assert runner.upload_attempts == 1
+    assert transfer.attempt_count == 1
     assert transfer.error_count == 1
-    assert any(snapshot["status"] == "RETRYING" for snapshot in snapshots)
-    assert any(
-        event["event_type"] == "RETRY_SCHEDULED"
-        for event in await store.alist_transfer_events(transfer.id)
-    )
-    assert len(runner.active_areas) == 2
+    assert not any(snapshot["status"] == "RETRYING" for snapshot in snapshots)
+    events = await store.alist_transfer_events(transfer.id)
+    failure = _failure_diagnostic(events, "DESTINATION_STATE_UNCERTAIN")
+    assert failure["technical_details"]["provider_stage"] == "DESTINATION_UPLOAD"
+    assert len(runner.active_areas) == 1
     assert all(len(areas) == 1 for areas in runner.active_areas)
     assert list(Path(executor.settings.transfer_staging_path).iterdir()) == []
-    assert providers[transfer.source_connection_id].download_attempts == 2
+    assert providers[transfer.source_connection_id].download_attempts == 1
 
 
 @pytest.mark.asyncio
 async def test_mega_download_retries_classified_transient_command_error(tmp_path):
     executor, transfer, providers, _runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=1, provider="MEGA")],
@@ -810,6 +833,7 @@ async def test_drive_to_mega_does_not_retry_after_ambiguous_remote_upload(
 ):
     executor, transfer, providers, runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="KEEP_BOTH",
         source_type="GOOGLE_DRIVE",
         destination_type="MEGA",
         source_items=[_item("/file.txt", size=1, provider="GOOGLE_DRIVE")],
@@ -950,6 +974,7 @@ async def test_google_native_export_is_staged_once_and_verified_by_content(
     runner = ExportRunner(tmp_path / "staging")
     executor, transfer, _providers, _runner, snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="GOOGLE_DRIVE",
         destination_type="NEXTCLOUD",
         source_items=[_item("/document.docx", size=None, provider="GOOGLE_DRIVE")],
@@ -969,7 +994,12 @@ async def test_google_native_export_is_staged_once_and_verified_by_content(
 
         executor.should_cancel = cancel_after_export
     await executor.execute(transfer.id)
-    assert runner.exports == 1
+    assert runner.exports == (0 if existing else 1)
+    if existing:
+        assert transfer.status == "COMPLETED_WITH_WARNINGS"
+        assert runner.upload_attempts == 0
+        assert transfer.bytes_transferred == 0
+        return
     assert list((tmp_path / "staging").iterdir()) == []
     if cancel:
         assert transfer.status == "CANCELLED"
@@ -1000,6 +1030,7 @@ async def test_direct_copy_reports_nextcloud_filename_rejection(tmp_path):
     runner = ProgressRunner()
     executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="GOOGLE_DRIVE",
         destination_type="NEXTCLOUD",
         source_items=[_item("/source", size=383, provider="GOOGLE_DRIVE")],
@@ -1025,6 +1056,7 @@ async def test_folder_progress_uses_preflight_bytes_when_rclone_total_grows(tmp_
 
     executor, transfer, _providers, runner, snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="GOOGLE_DRIVE",
         destination_type="NEXTCLOUD",
         source_items=[
@@ -1063,6 +1095,7 @@ async def test_google_nextcloud_rejects_long_names_before_copy(tmp_path):
     name = "é" * 128 + ".txt"
     executor, transfer, _providers, runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="GOOGLE_DRIVE",
         destination_type="NEXTCLOUD",
         source_items=[_item("/" + name, size=383, provider="GOOGLE_DRIVE")],
@@ -1102,7 +1135,10 @@ async def test_multi_path_progress_aggregates_each_path_without_regressing(tmp_p
         ),
     )
     destination = store.create_connection(
-        "Destination", "GOOGLE_DRIVE", requester.id, destination_id,
+        "Destination",
+        "GOOGLE_DRIVE",
+        requester.id,
+        destination_id,
         cipher.encrypt(
             destination_id,
             {"client_id": "client", "client_secret": "secret", "refresh_token": "token"},
@@ -1127,9 +1163,9 @@ async def test_multi_path_progress_aggregates_each_path_without_regressing(tmp_p
             eta = 0 if local_progress == 100 else 90
             await kwargs["line_callback"](
                 '{"level":"notice","msg":"Transferred: '
-                f'{bytes_transferred} B / {bytes_total} B, {local_progress}%, '
+                f"{bytes_transferred} B / {bytes_total} B, {local_progress}%, "
                 f'10 B/s, ETA {eta}s\\nTransferred: 1 / 1, 100%"'
-                '}'
+                "}"
             )
             return b"", b""
 
@@ -1163,7 +1199,8 @@ async def test_multi_path_progress_aggregates_each_path_without_regressing(tmp_p
     second_path_snapshot = next(
         snapshot
         for snapshot in snapshots
-        if snapshot["status"] == "RUNNING" and snapshot["current_speed_bps"] is not None
+        if snapshot["status"] == "RUNNING"
+        and snapshot["current_speed_bps"] is not None
         and snapshot["bytes_transferred"] == 110
     )
     assert second_path_snapshot["estimated_remaining_seconds"] == 90
@@ -1291,6 +1328,16 @@ async def test_transfer_failure_records_sanitized_correlated_diagnostics(tmp_pat
 @pytest.mark.asyncio
 async def test_inventory_keeps_distinct_source_objects_with_the_same_path(tmp_path):
     store = MemoryStore()
+    requester = store.add_user("inventory-owner", "inventory@example.test", "hash")
+    source_connection = store.create_connection("Source", "MEGA", requester.id)
+    destination_connection = store.create_connection("Destination", "GOOGLE_DRIVE", requester.id)
+    transfer = store.create_transfer(
+        requester.id,
+        source_connection.id,
+        destination_connection.id,
+        ["/folder"],
+        "/backup",
+    )
 
     async def publish(record):
         await store.asave_transfer(record)
@@ -1328,7 +1375,10 @@ async def test_inventory_keeps_distinct_source_objects_with_the_same_path(tmp_pa
 
     executor = TransferExecutor(Settings(), store, publish, never_cancel)
     files, _directories = await executor._collect_files(
-        DuplicateNameProvider(), ["/folder"], include_selected_folder=True
+        DuplicateNameProvider(),
+        ["/folder"],
+        transfer_record=transfer,
+        include_selected_folder=True,
     )
 
     assert [item.object_id for item, _relative in files] == ["H:First123", "H:Second12"]
@@ -1369,6 +1419,7 @@ async def test_failure_diagnostic_has_safe_stage_file_and_attempt_context(tmp_pa
 async def test_preflight_file_limit_fails_before_creating_destination_directories(tmp_path):
     executor, transfer, providers, runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
         source_items=[
@@ -1392,6 +1443,7 @@ async def test_preflight_file_limit_fails_before_creating_destination_directorie
 async def test_staging_preflight_rejects_unknown_file_sizes_before_destination_writes(tmp_path):
     executor, transfer, _providers, runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/unknown.bin", size=None, provider="MEGA")],
@@ -1410,6 +1462,7 @@ async def test_staging_preflight_rejects_unknown_file_sizes_before_destination_w
 async def test_staged_file_size_must_match_source_metadata_before_upload(tmp_path, monkeypatch):
     executor, transfer, providers, runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=4, provider="MEGA")],
@@ -1435,6 +1488,7 @@ async def test_staged_file_size_must_match_source_metadata_before_upload(tmp_pat
 async def test_rclone_upload_is_not_counted_complete_until_destination_size_matches(tmp_path):
     executor, transfer, providers, runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=4, provider="MEGA")],
@@ -1461,6 +1515,7 @@ async def test_rclone_upload_is_not_counted_complete_until_destination_size_matc
 async def test_transfer_progress_does_not_exceed_source_size(tmp_path):
     executor, transfer, _providers, runner, _snapshots, _store = _cross_provider_executor(
         tmp_path,
+        conflict_policy="SKIP",
         source_type="MEGA",
         destination_type="GOOGLE_DRIVE",
         source_items=[_item("/file.txt", size=4, provider="MEGA")],
@@ -1491,18 +1546,17 @@ async def test_keep_both_transfer_versions_an_existing_destination_name(tmp_path
     assert "/backup/source_01.txt" in providers[transfer.destination_connection_id].items
     assert runner.uploaded[0][0].name == "source_01.txt"
     assert transfer.status == "COMPLETED_WITH_WARNINGS"
-    manifest = await store.alist_transfer_manifest_items(
-        transfer.id, statuses={"COPIED"}
-    )
+    manifest = await store.alist_transfer_manifest_items(transfer.id, statuses={"COPIED"})
     assert manifest[0].requested_destination_path == "/backup/source.txt"
     assert manifest[0].destination_path == "/backup/source_01.txt"
     assert manifest[0].rename_reason == "NAME_CONFLICT"
 
 
 @pytest.mark.asyncio
-async def test_versioned_transfer_reads_manifest_beyond_first_page(tmp_path):
+@pytest.mark.parametrize("item_count", [201, 2001])
+async def test_versioned_transfer_reads_manifest_beyond_first_page(tmp_path, item_count):
     source_items = [_item("/source", is_dir=True, provider="GOOGLE_DRIVE")]
-    for index in range(201):
+    for index in range(item_count):
         folder = f"/source/folder-{index:03}"
         source_items.extend(
             [
@@ -1529,14 +1583,14 @@ async def test_versioned_transfer_reads_manifest_beyond_first_page(tmp_path):
         manifest.extend(page)
         cursor_id = page[-1].id
     assert transfer.status == "COMPLETED"
-    assert transfer.files_total == 201
-    assert transfer.bytes_total == 201
-    assert transfer.files_completed == 201
-    assert len(runner.uploaded) == 201
-    assert len(manifest) == 201
+    assert transfer.files_total == item_count
+    assert transfer.bytes_total == item_count
+    assert transfer.files_completed == item_count
+    assert len(runner.uploaded) == item_count
+    assert len(manifest) == item_count
     assert all(
         f"/backup/source/folder-{index:03}/file-{index:03}.txt" in destination.items
-        for index in range(201)
+        for index in range(item_count)
     )
 
 
@@ -1598,16 +1652,13 @@ async def test_versioned_transfer_preserves_assignments_across_manifest_pages(tm
     assert transfer.files_total == 201
     assert transfer.bytes_total == 201
     assert all(
-        f"/backup/retained-root/retained-{index:03}/file-{index:03}.txt"
-        in destination.items
+        f"/backup/retained-root/retained-{index:03}/file-{index:03}.txt" in destination.items
         for index in range(201)
     )
 
 
 @pytest.mark.asyncio
-async def test_versioned_mega_failure_has_sanitized_command_diagnostics(
-    tmp_path, monkeypatch
-):
+async def test_versioned_mega_failure_has_sanitized_command_diagnostics(tmp_path, monkeypatch):
     executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
         tmp_path,
         source_type="MEGA",
@@ -1689,3 +1740,393 @@ async def test_mega_upload_is_not_retried_when_destination_verification_fails(
     assert transfer.status == "FAILED"
     assert mega_destination.upload_attempts == 1
     assert failure["technical_details"]["provider_stage"] == "DESTINATION_VERIFY"
+
+
+@pytest.mark.asyncio
+async def test_mega_source_missing_output_retries_once_before_upload(tmp_path, monkeypatch):
+    executor, transfer, providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=[_item("/source.bin", size=4, provider="MEGA")],
+        source_paths=["/source.bin"],
+    )
+    executor.settings.transfer_max_retries = 5
+    source = providers[transfer.source_connection_id]
+    original_download = FakeMegaSession.download_file
+    attempts = 0
+
+    async def missing_once(self, remote_path, destination_dir, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            self.provider.download_attempts += 1
+            raise MegaCmdDownloadOutputMissingError()
+        return await original_download(self, remote_path, destination_dir, **kwargs)
+
+    async def no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(FakeMegaSession, "download_file", missing_once)
+    executor.sleep = no_delay
+    await executor.execute(transfer.id)
+
+    events = await store.alist_transfer_events(transfer.id)
+    assert transfer.status == "COMPLETED"
+    assert source.download_attempts == 2
+    assert runner.upload_attempts == 1
+    assert transfer.attempt_count == 2
+    retry_events = [event for event in events if event["event_type"] == "RETRY_SCHEDULED"]
+    assert len(retry_events) == 1
+    assert retry_events[0]["provider_error_code"] == "MEGACMD_DOWNLOAD_OUTPUT_MISSING"
+    assert retry_events[0]["technical_details"]["provider_stage"] == "SOURCE_DOWNLOAD"
+    assert retry_events[0]["technical_details"]["expected_output_created"] is False
+
+
+@pytest.mark.asyncio
+async def test_mega_source_missing_output_stops_after_one_retry_with_diagnostics(
+    tmp_path, monkeypatch
+):
+    executor, transfer, providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=[_item("/source.bin", size=4, provider="MEGA")],
+        source_paths=["/source.bin"],
+    )
+    executor.settings.transfer_max_retries = 5
+    source = providers[transfer.source_connection_id]
+
+    async def always_missing(self, remote_path, destination_dir, **kwargs):
+        self.provider.download_attempts += 1
+        raise MegaCmdDownloadOutputMissingError()
+
+    async def no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(FakeMegaSession, "download_file", always_missing)
+    executor.sleep = no_delay
+    await executor.execute(transfer.id)
+
+    events = await store.alist_transfer_events(transfer.id)
+    failure = _failure_diagnostic(events, "MEGACMD_DOWNLOAD_OUTPUT_MISSING")
+    details = failure["technical_details"]
+    assert transfer.status == "FAILED"
+    assert source.download_attempts == 2
+    assert runner.upload_attempts == 0
+    assert transfer.attempt_count == 2
+    assert details["provider_stage"] == "SOURCE_DOWNLOAD"
+    assert details["return_code"] == 0
+    assert details["retryable"] is True
+    assert details["expected_output_created"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_type", ["MEGA", "GOOGLE_DRIVE", "SEAFILE", "NEXTCLOUD", "SMB"])
+async def test_safe_source_failure_continues_and_resume_skips_copied(
+    tmp_path, monkeypatch, source_type
+):
+    items = [
+        _item("/a.bin", size=4, provider=source_type),
+        _item("/b.bin", size=4, provider=source_type),
+    ]
+    executor, transfer, providers, runner, snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type=source_type,
+        destination_type="SEAFILE",
+        source_items=items,
+        source_paths=[i.path for i in items],
+    )
+    original = executor._download_versioned_source
+    calls = []
+
+    async def disappear(record, connection, source, item, area, **kwargs):
+        calls.append(item.path)
+        if item.path == "/a.bin":
+            raise FileNotFoundError("source disappeared")
+        return await original(record, connection, source, item, area, **kwargs)
+
+    monkeypatch.setattr(executor, "_download_versioned_source", disappear)
+    await executor.execute(transfer.id)
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert calls == ["/a.bin", "/b.bin"]
+    assert counts["copied"] == 1 and counts["failed"] == 1
+    assert transfer.status == "FAILED"
+    assert transfer.bytes_transferred == 4 and transfer.progress_percent < 100
+    monkeypatch.setattr(executor, "_download_versioned_source", original)
+    await store.aresume_transfer(transfer.id)
+    await executor.execute(transfer.id)
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert counts["copied"] == 2 and counts["failed"] == 0
+    assert runner.upload_attempts == 2
+    assert transfer.status == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_repeated_safe_failure_stops_after_three_files(tmp_path, monkeypatch):
+    items = [_item(f"/{n}.bin", size=0, provider="MEGA") for n in range(5)]
+    executor, transfer, _, _, _, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=items,
+        source_paths=[i.path for i in items],
+    )
+
+    async def disappear(*args, **kwargs):
+        raise FileNotFoundError("source disappeared")
+
+    monkeypatch.setattr(executor, "_download_versioned_source", disappear)
+    await executor.execute(transfer.id)
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert counts["failed"] == 3 and counts["pending"] == 2
+    assert transfer.progress_percent < 100
+    events = await store.alist_transfer_events(transfer.id)
+    _failure_diagnostic(events, "TRANSFER_REPEATED_FILE_FAILURE")
+
+
+@pytest.mark.asyncio
+async def test_mega_manifest_with_corrupt_path_requires_new_transfer(tmp_path):
+    item = _item("/actual.bin", size=4, provider="MEGA")
+    item.object_id = "H:AbCd1234"
+    executor, transfer, _, runner, _, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=[item],
+        source_paths=[item.path],
+    )
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": "/ actual.bin",
+                "source_object_id": item.object_id,
+                "destination_path": "/backup/ actual.bin",
+                "is_dir": False,
+                "size_bytes": 4,
+            }
+        ],
+    )
+    await executor.execute(transfer.id)
+    assert transfer.status == "FAILED"
+    assert runner.upload_attempts == 0
+    _failure_diagnostic(
+        await store.alist_transfer_events(transfer.id), "MEGA_MANIFEST_REBUILD_REQUIRED"
+    )
+
+
+@pytest.mark.asyncio
+async def test_summary_counts_renames_separately_from_file_failures(tmp_path, monkeypatch):
+    items = [_item("/a.bin", size=4, provider="MEGA"), _item("/b.bin", size=4, provider="MEGA")]
+    executor, transfer, _, _, _, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=items,
+        source_paths=[i.path for i in items],
+        destination_items=[_item("/backup/a.bin", size=4, provider="SEAFILE")],
+    )
+    original = executor._download_versioned_source
+
+    async def disappear(record, connection, source, item, area, **kwargs):
+        if item.path == "/b.bin":
+            raise FileNotFoundError()
+        return await original(record, connection, source, item, area, **kwargs)
+
+    monkeypatch.setattr(executor, "_download_versioned_source", disappear)
+    await executor.execute(transfer.id)
+    summary = (await store.alist_transfer_manifest_summaries([transfer.id]))[transfer.id]
+    assert summary["renamed"] == 1
+    assert summary["copied"] == 1 and summary["failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_success_resets_consecutive_safe_failures(tmp_path, monkeypatch):
+    items = [_item(f"/{n}.bin", size=1, provider="MEGA") for n in range(5)]
+    executor, transfer, _, _, _, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=items,
+        source_paths=[i.path for i in items],
+    )
+    original = executor._download_versioned_source
+
+    async def download(record, connection, source, item, area, **kwargs):
+        if item.path != "/2.bin":
+            raise FileNotFoundError()
+        return await original(record, connection, source, item, area, **kwargs)
+
+    monkeypatch.setattr(executor, "_download_versioned_source", download)
+    await executor.execute(transfer.id)
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert counts["copied"] == 1 and counts["failed"] == 4 and counts["pending"] == 0
+    assert transfer.status == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_reconciled_copy_resets_consecutive_safe_failures(tmp_path, monkeypatch):
+    items = [_item(f"/{name}.bin", size=1, provider="MEGA") for name in "abcde"]
+    executor, transfer, providers, _, _, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=items,
+        source_paths=[item.path for item in items],
+    )
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": item.path,
+                "destination_path": f"/backup/{item.name}",
+                "size_bytes": item.size_bytes,
+            }
+            for item in items
+        ],
+    )
+    rows = await store.alist_transfer_manifest_items(transfer.id, statuses={"PENDING"})
+    row_c = next(row for row in rows if row.source_path == "/c.bin")
+    await store.amark_transfer_manifest_item_started(
+        transfer.id, row_c.id, destination_existed_before=False
+    )
+    providers[transfer.destination_connection_id].items["/backup/c.bin"] = _item(
+        "/backup/c.bin", size=1, provider="SEAFILE"
+    )
+    monkeypatch.setattr(executor, "_reconcile_versioned_destination", lambda *args: _async_true())
+    original = executor._download_versioned_source
+
+    async def download(record, connection, source, item, area, **kwargs):
+        if item.path != "/c.bin":
+            raise FileNotFoundError("source disappeared")
+        return await original(record, connection, source, item, area, **kwargs)
+
+    monkeypatch.setattr(executor, "_download_versioned_source", download)
+    await executor.execute(transfer.id)
+
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert counts["copied"] == 1
+    assert counts["failed"] == 4
+    assert counts["pending"] == 0
+    assert transfer.status == "FAILED"
+
+
+async def _async_true():
+    return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_type", "provider_error", "remove_source", "continues"),
+    [
+        ("GOOGLE_DRIVE", GoogleDriveApiError(404), True, True),
+        ("GOOGLE_DRIVE", GoogleDriveApiError(403), True, False),
+        ("SEAFILE", SeafileApiError(404), True, True),
+        ("SEAFILE", SeafileApiError(404), False, False),
+        ("NEXTCLOUD", RcloneCommandError(3, b"No such file or directory"), True, True),
+        ("NEXTCLOUD", RcloneCommandError(3, b"No such file or directory"), False, False),
+        ("NEXTCLOUD", RcloneCommandError(3, b"Permission denied"), True, False),
+    ],
+)
+async def test_typed_source_errors_continue_only_after_missing_item_confirmation(
+    tmp_path, monkeypatch, source_type, provider_error, remove_source, continues
+):
+    items = [
+        _item("/a.bin", size=1, provider=source_type),
+        _item("/b.bin", size=1, provider=source_type),
+    ]
+    if source_type == "GOOGLE_DRIVE":
+        items[0].object_id = "google-file-id"
+        items[0].parent_object_id = "google-parent-id"
+    executor, transfer, providers, runner, _, store = _cross_provider_executor(
+        tmp_path,
+        source_type=source_type,
+        destination_type="SEAFILE",
+        source_items=items,
+        source_paths=[item.path for item in items],
+    )
+    source = providers[transfer.source_connection_id]
+    original = executor._download_versioned_source
+    calls = []
+
+    async def download(record, connection, provider, item, area, **kwargs):
+        calls.append(item.path)
+        if item.path == "/a.bin":
+            if remove_source:
+                source.items.pop(item.path, None)
+            raise provider_error
+        return await original(record, connection, provider, item, area, **kwargs)
+
+    monkeypatch.setattr(executor, "_download_versioned_source", download)
+    await executor.execute(transfer.id)
+
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert transfer.status == "FAILED"
+    assert counts["failed"] == 1
+    assert counts["copied"] == (1 if continues else 0)
+    assert counts["pending"] == (0 if continues else 1)
+    assert calls == (["/a.bin", "/b.bin"] if continues else ["/a.bin"])
+    assert runner.upload_attempts == (1 if continues else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unknown", "network", "size"])
+async def test_versioned_failure_scope_is_conservative(tmp_path, monkeypatch, failure):
+    items = [_item(f"/{n}.bin", size=4, provider="MEGA") for n in range(2)]
+    executor, transfer, _, runner, _, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=items,
+        source_paths=[i.path for i in items],
+    )
+    executor.settings.transfer_max_retries = 0
+    original = executor._download_versioned_source
+
+    async def download(record, connection, source, item, area, **kwargs):
+        if item.path == "/0.bin":
+            if failure == "unknown":
+                raise RuntimeError("unexpected")
+            if failure == "network":
+                raise MegaCmdCommandError(7, b"temporary failure")
+            local = area / item.name
+            local.write_bytes(b"x")
+            return local
+        return await original(record, connection, source, item, area, **kwargs)
+
+    monkeypatch.setattr(executor, "_download_versioned_source", download)
+    await executor.execute(transfer.id)
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert transfer.status == "FAILED"
+    assert counts["copied"] == (1 if failure == "size" else 0)
+    assert counts["pending"] == (0 if failure == "size" else 1)
+    assert runner.upload_attempts == (1 if failure == "size" else 0)
+
+
+@pytest.mark.asyncio
+async def test_corrupt_selected_mega_root_has_manifest_rebuild_diagnostic(tmp_path):
+    item = _item("/actual.bin", size=4, provider="MEGA")
+    executor, transfer, _, runner, _, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=[item],
+        source_paths=["/ actual.bin"],
+    )
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": "/ actual.bin",
+                "destination_path": "/backup/ actual.bin",
+                "is_dir": False,
+                "size_bytes": 4,
+            }
+        ],
+    )
+    await executor.execute(transfer.id)
+    assert runner.upload_attempts == 0
+    _failure_diagnostic(
+        await store.alist_transfer_events(transfer.id), "MEGA_MANIFEST_REBUILD_REQUIRED"
+    )

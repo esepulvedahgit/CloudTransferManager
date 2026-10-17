@@ -89,6 +89,8 @@ Las transferencias nuevas de todos los proveedores se inventarían y ejecutan po
 
 Una transferencia programada pasa por `SCHEDULED` hasta `scheduled_at`, luego se vuelve `QUEUED` y sigue la máquina existente. `QUEUED` también representa trabajos bloqueados por capacidad, dependencia, conexión o staging; `wait_reason` explica el motivo.
 
+Las tareas con fecha futura tienen un registro durable de evaluación anticipada. Sus estados `PENDING`, `EVALUATING`, `APPROVED`, `BLOCKED`, `ERROR` y `WAITING_PARENT` son independientes de la máquina de copia. El dispatcher no reserva una copia hasta `APPROVED`; las pendientes usan `WAITING_EVALUATION` y los resultados bloqueados usan `BLOCKED_EVALUATION`, sin cambiar la tarea a `FAILED`. La evaluación comparte el inventario de solo lectura con el ejecutor y nunca crea manifiesto, descarga contenido ni reserva staging. Al comenzar la copia, el ejecutor valida de nuevo el origen.
+
 ### Estados y Semántica:
 
 - `SCHEDULED`: Espera su fecha de inicio. Beat recupera fechas vencidas después de una interrupción.
@@ -119,6 +121,7 @@ Una transferencia programada pasa por `SCHEDULED` hasta `scheduled_at`, luego se
   - Timeouts de red y desconexiones de socket.
   - Respuestas HTTP 429 (Rate Limit / Quota transitoria).
   - Respuestas HTTP 5xx temporales del proveedor.
+- Si `mega-get` termina sin crear el archivo local esperado, el fallo se identifica como `MEGACMD_DOWNLOAD_OUTPUT_MISSING`, registra `SOURCE_DOWNLOAD`, código de salida 0 y `expected_output_created=false`, y se reintenta como máximo una vez. Este reintento ocurre antes de iniciar la escritura en destino y no excede el límite global configurado.
 - Se aplican a los pasos de lectura/descarga y copia Drive de cada archivo MEGA↔Drive. MEGAcmd clasifica el fallo a partir de su salida internamente, pero no expone esa salida en errores ni logs. Los eventos de reintento indican el próximo intento del archivo actual.
 - Para Seafile API, los timeouts/desconexiones y HTTP 408, 429 o 5xx configurados como transitorios se reintentan dentro del límite global. Las cargas reanudan desde el offset reportado por Seafile; una subida API a destino solo se declara completada tras verificar su SHA-256 de lectura posterior. Errores de autenticación y otros 4xx no se reintentan como fallos transitorios.
 - En trabajos históricos Seafile API con `SKIP`, el worker solicita `replace=false` y verifica la ruta y el SHA-256 que devuelve el servidor. Las nuevas transferencias también solicitan `replace=false` y fallan si el proveedor no crea exactamente la ruta asignada.
@@ -216,3 +219,13 @@ CREATE INDEX ix_transfer_dispatch ON transfer_jobs(status, scheduled_at, created
   - `test_ephemeral_config_deleted_on_exception`: Verifica que el archivo temporal se borre incluso si el subproceso falla con excepción.
 - **Integración:**
   - `test_celery_task_cancel_terminates_subprocess`: Enviar cancelación termina el proceso Rclone y pasa el estado a `CANCELLED`.
+
+## Corrección y recuperación por archivo (2026-10-16)
+
+El flujo KEEP_BOTH usa resultados internos `COPIED`, `FAILED_SAFE` y `STOPPED`. Un archivo ausente permite continuar solo si el proveedor confirma su ausencia: Google Drive se vuelve a consultar por ID y padre; Seafile API consulta la ruta en su directorio; Rclone vuelve a listar el padre sin caché y comprueba ruta/ID. Los 401/403, errores de red, permisos y comprobaciones inconclusas detienen el trabajo. Un tamaño cambiado y la salida MEGA ausente tras un reintento adicional pueden continuar antes de comenzar la escritura remota y tras limpiar staging. Errores desconocidos, autenticación/cuota, falta de espacio, limpieza fallida y proveedor indisponible detienen el trabajo. Tres fallos seguros consecutivos con el mismo código y etapa detienen con `TRANSFER_REPEATED_FILE_FAILURE`; una copia verificada o reconciliada por SHA-256 reinicia la cuenta. Si quedan fallidos o pendientes, termina FAILED y debajo de 100%, incluso con archivos vacíos. Reanudar omite COPIED y conserva asignaciones.
+
+Una vez iniciada una subida de destino, no se repite automáticamente ante una excepción de Rclone, Seafile o MEGAcmd, incluso si todavía no aparece el objeto remoto. El worker busca el destino asignado y compara tamaño y SHA-256; si no puede demostrar que la escritura terminó correctamente, marca `DESTINATION_STATE_UNCERTAIN` (o `MEGA_DESTINATION_STATE_UNCERTAIN`) y se detiene. Así evita duplicar o sobrescribir datos por consistencia eventual o una respuesta perdida.
+
+Un manifiesto MEGA previo cuyas identidades/rutas difieran del inventario actual se rechaza antes de escribir con `MEGA_MANIFEST_REBUILD_REQUIRED`. No se reparan nombres históricos automáticamente: se crea una nueva transferencia seleccionando de nuevo por identificador. Las carpetas creadas anteriormente se conservan.
+
+Los eventos incluyen etapa (`SOURCE_DOWNLOAD`, `DESTINATION_UPLOAD`, `DESTINATION_VERIFY`), proveedor, intento y escritura iniciada. Los diagnósticos Rclone conservan códigos/categorías HTTP acotados, nunca stderr crudo. REST/SSE incluyen `manifest_summary` con `copied`, `failed`, `skipped`, `pending`, `renamed`; también se adjunta al primer snapshot SSE, incluso si ya es terminal. `renamed` cuenta asignaciones de archivos y carpetas. `files_completed` conserva su semántica histórica de elementos resueltos. La UI de proveedores reales usa el resumen para no presentar fallidos como copiados; MOCK sigue simulando progreso.

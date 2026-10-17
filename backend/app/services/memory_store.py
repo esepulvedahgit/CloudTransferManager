@@ -1,17 +1,33 @@
+from __future__ import annotations
+
+import asyncio
 import hashlib
 import uuid
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from app.security.sanitize import sanitize_data
+from app.services.transfer_evaluation import (
+    EvaluationClaim,
+    EvaluationConflictError,
+    EvaluationRecord,
+    not_required_evaluation,
+    restart_evaluation,
+)
 from app.services.transfer_progress import smb_manifest_progress_percent
+from app.settings import Settings
 
 ACTIVE_TRANSFER_STATUSES = frozenset(
     {"SCHEDULED", "QUEUED", "VALIDATING", "RUNNING", "RETRYING", "CANCELLING"}
 )
 _NOTIFICATION_LEASE_SECONDS = 300
+_EVALUATION_LEASE_SECONDS = 60
+
+if TYPE_CHECKING:
+    from app.services.source_inventory import InventoryProgress
 
 
 class ConnectionInUseError(ValueError):
@@ -128,9 +144,16 @@ class TransferRecord:
     completed_at: datetime | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     idempotent_replay: bool = False
+    manifest_summary: dict[str, int] | None = None
+    evaluation: EvaluationRecord | None = None
 
     def public_dict(self) -> dict[str, Any]:
         return {
+            **(
+                {"manifest_summary": self.manifest_summary}
+                if self.manifest_summary is not None
+                else {}
+            ),
             "id": str(self.id),
             "public_id": self.public_id,
             "status": self.status,
@@ -159,6 +182,9 @@ class TransferRecord:
                 str(self.depends_on_transfer_id) if self.depends_on_transfer_id else None
             ),
             "wait_reason": self.wait_reason,
+            "evaluation": (
+                self.evaluation.public_dict() if self.evaluation else not_required_evaluation()
+            ),
             "can_edit_schedule": (
                 self.status in {"SCHEDULED", "QUEUED"}
                 and self.dispatch_token is None
@@ -219,7 +245,8 @@ def is_programmed_background_transfer(transfer: TransferRecord) -> bool:
 class MemoryStore:
     """In-memory repository for the mock vertical slice and isolated tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or Settings()
         self.users: dict[uuid.UUID, UserAccount] = {}
         self.connections: dict[uuid.UUID, ConnectionRecord] = {}
         self._connection_credential_fingerprints: dict[uuid.UUID, bytes] = {}
@@ -231,6 +258,8 @@ class MemoryStore:
         self.transfer_manifest_items: dict[tuple[uuid.UUID, str], TransferManifestItemRecord] = {}
         self.transfer_idempotency: dict[tuple[uuid.UUID, uuid.UUID], tuple[str, uuid.UUID]] = {}
         self.audit_events: list[dict[str, Any]] = []
+        self._evaluation_claim_lock = asyncio.Lock()
+        self._transfer_execution_locks: dict[uuid.UUID, asyncio.Lock] = {}
 
     async def acheck(self) -> bool:
         return True
@@ -372,6 +401,30 @@ class MemoryStore:
             depends_on_transfer_id=depends_on_transfer_id,
             wait_reason="WAITING_UNTIL" if is_scheduled else None,
         )
+        if is_scheduled:
+            source_connection = self.connections.get(source_connection_id)
+            destination_connection = self.connections.get(destination_connection_id)
+            is_smb_source = bool(
+                source_connection is not None and source_connection.provider_type == "SMB"
+            )
+            record.evaluation = EvaluationRecord(
+                id=uuid.uuid4(),
+                transfer_id=record.id,
+                status="PENDING",
+                max_files=(
+                    self.settings.smb_transfer_max_files
+                    if is_smb_source
+                    else self.settings.transfer_max_files
+                ),
+                source_credential_version=(
+                    source_connection.credential_version if source_connection is not None else None
+                ),
+                destination_credential_version=(
+                    destination_connection.credential_version
+                    if destination_connection is not None
+                    else None
+                ),
+            )
         self.transfers[record.id] = record
         return record
 
@@ -457,8 +510,7 @@ class MemoryStore:
     ) -> UserAccount | None:
         user = self.users.get(user_id)
         if user is None or (
-            expected_password_hash is not None
-            and user.password_hash != expected_password_hash
+            expected_password_hash is not None and user.password_hash != expected_password_hash
         ):
             return None
         user.password_hash = password_hash
@@ -598,8 +650,367 @@ class MemoryStore:
         self._connection_credential_fingerprints[connection.id] = connection.encrypted_credentials
         self.connections[connection.id] = connection
 
+    async def arequest_transfer_evaluation(
+        self, transfer_id: uuid.UUID, now: datetime
+    ) -> EvaluationRecord:
+        from app.services.transfer_scheduling import dependency_wait_reason
+
+        now = now.astimezone(UTC)
+        async with self._evaluation_claim_lock:
+            transfer = self.transfers.get(transfer_id)
+            if (
+                transfer is None
+                or transfer.status not in {"SCHEDULED", "QUEUED"}
+                or transfer.dispatch_token is not None
+                or transfer.execution_started_at is not None
+                or transfer.cancel_requested_at is not None
+            ):
+                raise EvaluationConflictError(
+                    "Solo se puede reevaluar una transferencia pendiente de ejecución."
+                )
+            evaluation = transfer.evaluation
+            if evaluation is None:
+                raise EvaluationConflictError(
+                    "Esta transferencia no tiene una evaluación anticipada para repetir."
+                )
+            if evaluation.status in {"PENDING", "EVALUATING", "WAITING_PARENT"}:
+                return evaluation
+
+            restart_evaluation(evaluation, now=now)
+            parent_wait = None
+            if transfer.depends_on_transfer_id is not None:
+                parent = self.transfers.get(transfer.depends_on_transfer_id)
+                parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
+            if parent_wait is not None:
+                evaluation.status = "WAITING_PARENT"
+                evaluation.sequence = 1
+                evaluation.safe_error_code = (
+                    "BLOCKED_PARENT_FAILED"
+                    if parent_wait == "BLOCKED_PARENT_FAILED"
+                    else None
+                )
+                evaluation.safe_message = (
+                    "La transferencia padre debe completarse correctamente "
+                    "antes de evaluar esta selección."
+                )
+                transfer.wait_reason = parent_wait
+            else:
+                transfer.wait_reason = "WAITING_EVALUATION"
+            return evaluation
+
     async def aget_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
         return self.get_transfer(transfer_id)
+
+    async def alist_transfer_evaluations(
+        self, transfer_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, EvaluationRecord]:
+        return {
+            transfer_id: transfer.evaluation
+            for transfer_id in transfer_ids
+            if (transfer := self.transfers.get(transfer_id)) is not None
+            and transfer.evaluation is not None
+        }
+
+    @asynccontextmanager
+    async def transfer_execution_lock(self, transfer_id: uuid.UUID) -> AsyncIterator[bool]:
+        lock = self._transfer_execution_locks.setdefault(transfer_id, asyncio.Lock())
+        if lock.locked():
+            yield False
+            return
+        await lock.acquire()
+        try:
+            yield True
+        finally:
+            lock.release()
+
+    def _evaluation_claim_matches(self, claim: EvaluationClaim) -> bool:
+        transfer = self.transfers.get(claim.transfer_id)
+        evaluation = transfer.evaluation if transfer is not None else None
+        return bool(
+            transfer is not None
+            and evaluation is not None
+            and evaluation.status == "EVALUATING"
+            and evaluation.generation == claim.generation
+            and evaluation.claim_token == claim.claim_token
+            and transfer.status in {"SCHEDULED", "QUEUED"}
+            and transfer.dispatch_token is None
+            and transfer.execution_started_at is None
+            and transfer.cancel_requested_at is None
+        )
+
+    async def aclaim_due_evaluations(
+        self, now: datetime, *, limit: int = 1
+    ) -> list[EvaluationClaim]:
+        from app.services.transfer_scheduling import dependency_wait_reason
+
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        now = now.astimezone(UTC)
+        stale_before = now - timedelta(seconds=_EVALUATION_LEASE_SECONDS)
+        claims: list[EvaluationClaim] = []
+
+        def parent_evaluation_ready(transfer: TransferRecord) -> bool:
+            if transfer.depends_on_transfer_id is None:
+                return False
+            parent = self.transfers.get(transfer.depends_on_transfer_id)
+            return parent is not None and parent.status in {
+                "COMPLETED",
+                "COMPLETED_WITH_WARNINGS",
+            }
+
+        async with self._evaluation_claim_lock:
+            candidates = sorted(
+                (
+                    transfer
+                    for transfer in self.transfers.values()
+                    if transfer.evaluation is not None
+                    and (
+                        (
+                            transfer.evaluation.status == "PENDING"
+                            and (
+                                transfer.evaluation.retry_at is None
+                                or transfer.evaluation.retry_at <= now
+                            )
+                        )
+                        or (
+                            transfer.evaluation.status == "EVALUATING"
+                            and (
+                                transfer.evaluation.heartbeat_at is None
+                                or transfer.evaluation.heartbeat_at <= stale_before
+                            )
+                        )
+                        or (
+                            transfer.evaluation.status == "WAITING_PARENT"
+                            and parent_evaluation_ready(transfer)
+                        )
+                    )
+                ),
+                key=lambda transfer: (
+                    (
+                        transfer.evaluation.updated_at
+                        if transfer.evaluation is not None
+                        and transfer.evaluation.updated_at is not None
+                        else transfer.created_at
+                    ),
+                    transfer.id,
+                ),
+            )
+            for transfer in candidates[: min(limit, 100)]:
+                evaluation = transfer.evaluation
+                assert evaluation is not None
+                if (
+                    transfer.status not in {"SCHEDULED", "QUEUED"}
+                    or transfer.dispatch_token is not None
+                    or transfer.execution_started_at is not None
+                    or transfer.cancel_requested_at is not None
+                ):
+                    evaluation.claim_token = None
+                    evaluation.heartbeat_at = None
+                    continue
+
+                if transfer.depends_on_transfer_id is not None:
+                    parent = self.transfers.get(transfer.depends_on_transfer_id)
+                    parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
+                    if parent_wait is not None:
+                        safe_error_code = (
+                            "BLOCKED_PARENT_FAILED"
+                            if parent_wait == "BLOCKED_PARENT_FAILED"
+                            else None
+                        )
+                        safe_message = (
+                            "La transferencia padre debe completarse correctamente "
+                            "antes de evaluar esta selección."
+                        )
+                        if evaluation.status != "WAITING_PARENT":
+                            restart_evaluation(evaluation, now=now)
+                            evaluation.status = "WAITING_PARENT"
+                            evaluation.sequence = 1
+                        elif (
+                            evaluation.safe_error_code != safe_error_code
+                            or evaluation.safe_message != safe_message
+                            or transfer.wait_reason != parent_wait
+                        ):
+                            evaluation.sequence += 1
+                        evaluation.safe_error_code = safe_error_code
+                        evaluation.safe_message = safe_message
+                        evaluation.updated_at = now
+                        transfer.wait_reason = parent_wait
+                        continue
+                    if evaluation.status == "WAITING_PARENT":
+                        restart_evaluation(evaluation, now=now)
+                        transfer.wait_reason = "WAITING_EVALUATION"
+                elif evaluation.status == "WAITING_PARENT":
+                    restart_evaluation(evaluation, now=now)
+                    transfer.wait_reason = "WAITING_EVALUATION"
+
+                owner = self.users.get(transfer.requested_by)
+                if owner is None or not owner.is_active:
+                    transfer.wait_reason = "WAITING_USER_ACTIVE"
+                    continue
+                source = self.connections.get(transfer.source_connection_id)
+                destination = self.connections.get(transfer.destination_connection_id)
+                if (
+                    source is None
+                    or destination is None
+                    or source.deleted_at is not None
+                    or destination.deleted_at is not None
+                    or source.status != "ACTIVE"
+                    or destination.status != "ACTIVE"
+                ):
+                    transfer.wait_reason = "WAITING_CONNECTION_ACTIVE"
+                    continue
+                if (
+                    source.credential_version != transfer.source_credential_version
+                    or destination.credential_version != transfer.destination_credential_version
+                    or (
+                        evaluation.source_credential_version is not None
+                        and evaluation.source_credential_version != source.credential_version
+                    )
+                    or (
+                        evaluation.destination_credential_version is not None
+                        and evaluation.destination_credential_version
+                        != destination.credential_version
+                    )
+                ):
+                    evaluation.status = "BLOCKED"
+                    evaluation.safe_error_code = "BLOCKED_CONNECTION_CHANGED"
+                    evaluation.safe_message = (
+                        "Una conexión o sus credenciales cambiaron. "
+                        "Solicita una nueva evaluación."
+                    )
+                    evaluation.completed_at = now
+                    evaluation.retry_at = None
+                    evaluation.claim_token = None
+                    evaluation.heartbeat_at = None
+                    evaluation.sequence += 1
+                    evaluation.updated_at = now
+                    transfer.wait_reason = "BLOCKED_CONNECTION_CHANGED"
+                    continue
+                if owner.role != "ADMIN" and any(
+                    not connection.is_global
+                    and (owner.id, connection.id) not in self.connection_grants
+                    for connection in (source, destination)
+                ):
+                    transfer.wait_reason = "WAITING_CONNECTION_ACCESS"
+                    continue
+
+                maximum_files = (
+                    self.settings.smb_transfer_max_files
+                    if source.provider_type == "SMB"
+                    else self.settings.transfer_max_files
+                )
+                if evaluation.max_files != maximum_files:
+                    restart_evaluation(evaluation, now=now, max_files=maximum_files)
+                    transfer.wait_reason = "WAITING_EVALUATION"
+                    continue
+                if evaluation.attempt_count >= 3:
+                    evaluation.status = "ERROR"
+                    evaluation.safe_error_code = "EVALUATION_ATTEMPTS_EXHAUSTED"
+                    evaluation.safe_message = (
+                        "No se pudo completar la evaluación tras tres intentos."
+                    )
+                    evaluation.completed_at = now
+                    evaluation.retry_at = None
+                    evaluation.claim_token = None
+                    evaluation.heartbeat_at = None
+                    evaluation.sequence += 1
+                    evaluation.updated_at = now
+                    transfer.wait_reason = "BLOCKED_EVALUATION"
+                    continue
+                claim_token = uuid.uuid4()
+                evaluation.status = "EVALUATING"
+                evaluation.claim_token = claim_token
+                evaluation.attempt_count += 1
+                evaluation.started_at = evaluation.started_at or now
+                evaluation.updated_at = now
+                evaluation.heartbeat_at = now
+                evaluation.retry_at = None
+                evaluation.sequence += 1
+                transfer.wait_reason = "WAITING_EVALUATION"
+                claims.append(
+                    EvaluationClaim(
+                        transfer_id=transfer.id,
+                        generation=evaluation.generation,
+                        claim_token=claim_token,
+                    )
+                )
+        return claims
+
+    async def aheartbeat_evaluation(self, claim: EvaluationClaim, now: datetime) -> bool:
+        async with self._evaluation_claim_lock:
+            if not self._evaluation_claim_matches(claim):
+                return False
+            transfer = self.transfers[claim.transfer_id]
+            assert transfer.evaluation is not None
+            transfer.evaluation.heartbeat_at = now.astimezone(UTC)
+            return True
+
+    async def asave_evaluation_progress(
+        self, claim: EvaluationClaim, progress: InventoryProgress, now: datetime
+    ) -> bool:
+        async with self._evaluation_claim_lock:
+            if not self._evaluation_claim_matches(claim):
+                return False
+            transfer = self.transfers[claim.transfer_id]
+            evaluation = transfer.evaluation
+            assert evaluation is not None
+            if (
+                evaluation.files_found == progress.files_found
+                and evaluation.count_complete == progress.count_complete
+            ):
+                return True
+            evaluation.files_found = progress.files_found
+            evaluation.count_complete = progress.count_complete
+            evaluation.sequence += 1
+            evaluation.updated_at = now.astimezone(UTC)
+            return True
+
+    async def afinish_evaluation(
+        self,
+        claim: EvaluationClaim,
+        *,
+        status: str,
+        progress: InventoryProgress,
+        error_code: str | None,
+        message: str | None,
+        now: datetime,
+        retry_at: datetime | None = None,
+    ) -> bool:
+        if status not in {"PENDING", "APPROVED", "BLOCKED", "ERROR", "WAITING_PARENT"}:
+            raise ValueError("Invalid evaluation completion status")
+        async with self._evaluation_claim_lock:
+            if not self._evaluation_claim_matches(claim):
+                return False
+            transfer = self.transfers[claim.transfer_id]
+            evaluation = transfer.evaluation
+            assert evaluation is not None
+            evaluation.status = status
+            evaluation.files_found = progress.files_found
+            evaluation.count_complete = progress.count_complete
+            evaluation.safe_error_code = error_code
+            evaluation.safe_message = message
+            evaluation.retry_at = retry_at.astimezone(UTC) if retry_at is not None else None
+            evaluation.completed_at = (
+                now.astimezone(UTC) if status in {"APPROVED", "BLOCKED", "ERROR"} else None
+            )
+            evaluation.claim_token = None
+            evaluation.heartbeat_at = None
+            evaluation.sequence += 1
+            evaluation.updated_at = now.astimezone(UTC)
+            finished_at = now.astimezone(UTC)
+            if status == "APPROVED":
+                transfer.wait_reason = (
+                    "WAITING_UNTIL"
+                    if transfer.scheduled_at is not None and transfer.scheduled_at > finished_at
+                    else None
+                )
+            elif status in {"BLOCKED", "ERROR"}:
+                transfer.wait_reason = "BLOCKED_EVALUATION"
+            elif status == "WAITING_PARENT":
+                transfer.wait_reason = "WAITING_PARENT"
+            else:
+                transfer.wait_reason = "WAITING_EVALUATION"
+            return True
 
     async def ais_transfer_cancel_requested(self, transfer_id: uuid.UUID) -> bool:
         transfer = self.get_transfer(transfer_id)
@@ -727,9 +1138,7 @@ class MemoryStore:
             return None
         stored_hash, transfer_id = entry
         if stored_hash != request_hash:
-            raise IdempotencyConflictError(
-                "Idempotency key was already used for different input"
-            )
+            raise IdempotencyConflictError("Idempotency key was already used for different input")
         record = self.transfers.get(transfer_id)
         return replace(record, idempotent_replay=True) if record is not None else None
 
@@ -814,11 +1223,7 @@ class MemoryStore:
         self, notification_id: uuid.UUID, now: datetime, dispatch_token: uuid.UUID
     ) -> None:
         item = self.notification_outbox.get(notification_id)
-        if (
-            item is None
-            or item["status"] != "QUEUED"
-            or item["claim_token"] != dispatch_token
-        ):
+        if item is None or item["status"] != "QUEUED" or item["claim_token"] != dispatch_token:
             return
         item["status"] = "PENDING"
         item["claimed_at"] = None
@@ -858,11 +1263,7 @@ class MemoryStore:
         self, notification_id: uuid.UUID, claim_token: uuid.UUID
     ) -> None:
         item = self.notification_outbox.get(notification_id)
-        if (
-            item is not None
-            and item["status"] == "SENDING"
-            and item["claim_token"] == claim_token
-        ):
+        if item is not None and item["status"] == "SENDING" and item["claim_token"] == claim_token:
             item["status"] = "SENT"
             item["claimed_at"] = None
             item["claim_token"] = None
@@ -876,11 +1277,7 @@ class MemoryStore:
         error_code: str = "SMTP_DELIVERY_FAILED",
     ) -> None:
         item = self.notification_outbox.get(notification_id)
-        if (
-            item is None
-            or item["status"] != "SENDING"
-            or item["claim_token"] != claim_token
-        ):
+        if item is None or item["status"] != "SENDING" or item["claim_token"] != claim_token:
             return
         item["claimed_at"] = None
         item["claim_token"] = None
@@ -924,6 +1321,8 @@ class MemoryStore:
         execution_mode: str,
         depends_on_transfer_id: uuid.UUID | None,
     ) -> TransferRecord | None:
+        from app.services.transfer_scheduling import dependency_wait_reason
+
         transfer = self.transfers.get(transfer_id)
         if (
             transfer is None
@@ -942,6 +1341,7 @@ class MemoryStore:
             if ancestor is None:
                 raise ValueError("La transferencia padre no existe.")
             ancestor_id = ancestor.depends_on_transfer_id
+        dependency_changed = transfer.depends_on_transfer_id != depends_on_transfer_id
         transfer.scheduled_at = scheduled_at
         transfer.schedule_timezone = schedule_timezone
         transfer.execution_mode = execution_mode
@@ -949,6 +1349,49 @@ class MemoryStore:
         due_later = scheduled_at is not None and scheduled_at > datetime.now(UTC)
         transfer.status = "SCHEDULED" if due_later else "QUEUED"
         transfer.wait_reason = "WAITING_UNTIL" if due_later else None
+        if transfer.evaluation is None and scheduled_at is not None:
+            source = self.connections.get(transfer.source_connection_id)
+            destination = self.connections.get(transfer.destination_connection_id)
+            transfer.evaluation = EvaluationRecord(
+                id=uuid.uuid4(),
+                transfer_id=transfer.id,
+                status="PENDING",
+                max_files=(
+                    self.settings.smb_transfer_max_files
+                    if source is not None and source.provider_type == "SMB"
+                    else self.settings.transfer_max_files
+                ),
+                source_credential_version=(
+                    source.credential_version if source is not None else None
+                ),
+                destination_credential_version=(
+                    destination.credential_version if destination is not None else None
+                ),
+            )
+        if dependency_changed and transfer.evaluation is not None:
+            evaluation = transfer.evaluation
+            restart_evaluation(evaluation, now=datetime.now(UTC))
+            parent_wait = None
+            if depends_on_transfer_id is not None:
+                parent = self.transfers.get(depends_on_transfer_id)
+                parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
+            if parent_wait is not None:
+                evaluation.status = "WAITING_PARENT"
+                evaluation.sequence = 1
+                evaluation.safe_error_code = (
+                    "BLOCKED_PARENT_FAILED"
+                    if parent_wait == "BLOCKED_PARENT_FAILED"
+                    else None
+                )
+                evaluation.safe_message = (
+                    "La transferencia padre debe completarse correctamente "
+                    "antes de evaluar esta selección."
+                )
+                transfer.wait_reason = parent_wait
+            else:
+                transfer.wait_reason = (
+                    "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
+                )
         return transfer
 
     async def acancel_transfer(
@@ -963,10 +1406,7 @@ class MemoryStore:
         }:
             return None, False
         transfer.cancel_requested_at = now.astimezone(UTC)
-        if (
-            transfer.status in {"QUEUED", "SCHEDULED"}
-            and transfer.execution_started_at is None
-        ):
+        if transfer.status in {"QUEUED", "SCHEDULED"} and transfer.execution_started_at is None:
             transfer.status = "CANCELLED"
             transfer.completed_at = now.astimezone(UTC)
             transfer.wait_reason = None
@@ -996,6 +1436,233 @@ class MemoryStore:
         transfer.cancel_requested_at = None
         return transfer
 
+    async def adispatch_due_transfers(
+        self,
+        now: datetime,
+        *,
+        max_concurrent: int,
+        max_nextcloud_concurrent: int = 1,
+    ) -> Any:
+        from app.services.transfer_scheduling import (
+            DispatchBatch,
+            TransferReservation,
+            admission_wait_reason,
+            dependency_wait_reason,
+            evaluation_wait_reason,
+            transfer_requires_staging,
+        )
+
+        if max_concurrent < 1 or max_nextcloud_concurrent < 1:
+            raise ValueError("Transfer capacity limits must be positive")
+        now = now.astimezone(UTC)
+        changed_ids: set[uuid.UUID] = set()
+        admitted: list[TransferRecord] = []
+        active_statuses = {"VALIDATING", "RUNNING", "RETRYING", "CANCELLING"}
+        running = [
+            transfer
+            for transfer in self.transfers.values()
+            if transfer.status in active_statuses
+            or (transfer.dispatch_token is not None and transfer.status in ACTIVE_TRANSFER_STATUSES)
+        ]
+
+        def uses_staging(transfer: TransferRecord) -> bool:
+            source = self.connections.get(transfer.source_connection_id)
+            destination = self.connections.get(transfer.destination_connection_id)
+            if source is None or destination is None:
+                return False
+            return transfer_requires_staging(
+                source.provider_type,
+                destination.provider_type,
+                source.adapter_type,
+                destination.adapter_type,
+                transfer.conflict_policy,
+            )
+
+        def uses_nextcloud(transfer: TransferRecord) -> bool:
+            return any(
+                (connection := self.connections.get(connection_id)) is not None
+                and connection.provider_type == "NEXTCLOUD"
+                for connection_id in (
+                    transfer.source_connection_id,
+                    transfer.destination_connection_id,
+                )
+            )
+
+        active = [
+            TransferReservation(
+                transfer_id=transfer.id,
+                source_connection_id=transfer.source_connection_id,
+                destination_connection_id=transfer.destination_connection_id,
+                execution_mode=transfer.execution_mode,
+                uses_staging=uses_staging(transfer),
+                uses_nextcloud=uses_nextcloud(transfer),
+            )
+            for transfer in running
+        ]
+        candidates = sorted(
+            (
+                transfer
+                for transfer in self.transfers.values()
+                if transfer.status in {"SCHEDULED", "QUEUED"}
+                and transfer.dispatch_token is None
+            ),
+            key=lambda transfer: (
+                transfer.scheduled_at or transfer.created_at,
+                transfer.created_at,
+                transfer.id,
+            ),
+        )
+        exclusive_barrier = False
+        for transfer in candidates:
+            scheduled_at = transfer.scheduled_at
+            if scheduled_at is not None and scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=UTC)
+            if scheduled_at is not None and scheduled_at > now:
+                if transfer.wait_reason != "WAITING_UNTIL":
+                    transfer.wait_reason = "WAITING_UNTIL"
+                    changed_ids.add(transfer.id)
+                if transfer.status != "SCHEDULED":
+                    transfer.status = "SCHEDULED"
+                    changed_ids.add(transfer.id)
+                continue
+            if transfer.status == "SCHEDULED":
+                transfer.status = "QUEUED"
+                changed_ids.add(transfer.id)
+
+            if transfer.depends_on_transfer_id is not None:
+                parent = self.transfers.get(transfer.depends_on_transfer_id)
+                parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
+                if parent_wait is not None:
+                    if transfer.wait_reason != parent_wait:
+                        transfer.wait_reason = parent_wait
+                        changed_ids.add(transfer.id)
+                    if (
+                        transfer.evaluation is not None
+                        and transfer.evaluation.status != "WAITING_PARENT"
+                    ):
+                        evaluation = transfer.evaluation
+                        if evaluation.status in {"EVALUATING", "APPROVED", "BLOCKED", "ERROR"}:
+                            restart_evaluation(evaluation, now=now)
+                        else:
+                            evaluation.sequence += 1
+                            evaluation.updated_at = now
+                        evaluation.status = "WAITING_PARENT"
+                        evaluation.safe_error_code = None
+                        evaluation.safe_message = (
+                            "La selección se evaluará cuando termine la transferencia padre."
+                        )
+                    continue
+                if (
+                    transfer.evaluation is not None
+                    and transfer.evaluation.status == "WAITING_PARENT"
+                ):
+                    transfer.evaluation.status = "PENDING"
+                    transfer.evaluation.safe_message = None
+                    transfer.evaluation.updated_at = now
+                    transfer.evaluation.sequence += 1
+
+            owner = self.users.get(transfer.requested_by)
+            if owner is None or not owner.is_active:
+                wait_reason = "WAITING_USER_ACTIVE"
+            else:
+                source = self.connections.get(transfer.source_connection_id)
+                destination = self.connections.get(transfer.destination_connection_id)
+                if (
+                    source is None
+                    or destination is None
+                    or source.deleted_at is not None
+                    or destination.deleted_at is not None
+                    or source.status != "ACTIVE"
+                    or destination.status != "ACTIVE"
+                ):
+                    wait_reason = "WAITING_CONNECTION_ACTIVE"
+                elif (
+                    source.credential_version != transfer.source_credential_version
+                    or destination.credential_version != transfer.destination_credential_version
+                ):
+                    wait_reason = "BLOCKED_CONNECTION_CHANGED"
+                elif owner.role != "ADMIN" and any(
+                    not connection.is_global
+                    and (owner.id, connection.id) not in self.connection_grants
+                    for connection in (source, destination)
+                ):
+                    wait_reason = "WAITING_CONNECTION_ACCESS"
+                else:
+                    wait_reason = None
+            if wait_reason is not None:
+                if transfer.wait_reason != wait_reason:
+                    transfer.wait_reason = wait_reason
+                    changed_ids.add(transfer.id)
+                continue
+
+            assert source is not None and destination is not None
+            current_evaluation = transfer.evaluation
+            if current_evaluation is not None:
+                maximum_files = (
+                    self.settings.smb_transfer_max_files
+                    if source.provider_type == "SMB"
+                    else self.settings.transfer_max_files
+                )
+                if current_evaluation.max_files != maximum_files:
+                    restart_evaluation(current_evaluation, now=now, max_files=maximum_files)
+                    transfer.wait_reason = "WAITING_EVALUATION"
+                    changed_ids.add(transfer.id)
+                    continue
+                evaluation_wait = evaluation_wait_reason(current_evaluation)
+                if evaluation_wait is not None:
+                    if transfer.wait_reason != evaluation_wait:
+                        transfer.wait_reason = evaluation_wait
+                        changed_ids.add(transfer.id)
+                    continue
+
+            if exclusive_barrier:
+                wait_reason = "WAITING_EXCLUSIVE"
+            else:
+                wait_reason = admission_wait_reason(
+                    source_connection_id=transfer.source_connection_id,
+                    destination_connection_id=transfer.destination_connection_id,
+                    execution_mode=transfer.execution_mode,
+                    uses_staging=uses_staging(transfer),
+                    uses_nextcloud=uses_nextcloud(transfer),
+                    active=active,
+                    max_concurrent=max_concurrent,
+                    max_nextcloud_concurrent=max_nextcloud_concurrent,
+                )
+            if wait_reason is not None:
+                if transfer.wait_reason != wait_reason:
+                    transfer.wait_reason = wait_reason
+                    changed_ids.add(transfer.id)
+                if transfer.execution_mode == "EXCLUSIVE":
+                    exclusive_barrier = True
+                continue
+
+            transfer.dispatch_token = uuid.uuid4()
+            transfer.dispatch_claimed_at = now
+            transfer.execution_started_at = None
+            transfer.execution_heartbeat_at = None
+            transfer.wait_reason = None
+            admitted.append(transfer)
+            changed_ids.add(transfer.id)
+            active.append(
+                TransferReservation(
+                    transfer_id=transfer.id,
+                    source_connection_id=transfer.source_connection_id,
+                    destination_connection_id=transfer.destination_connection_id,
+                    execution_mode=transfer.execution_mode,
+                    uses_staging=uses_staging(transfer),
+                    uses_nextcloud=uses_nextcloud(transfer),
+                )
+            )
+            if transfer.execution_mode == "EXCLUSIVE":
+                exclusive_barrier = True
+
+        changed = [
+            self.transfers[transfer_id]
+            for transfer_id in changed_ids
+            if transfer_id in self.transfers
+        ]
+        return DispatchBatch(admitted=admitted, changed=changed)
+
     async def aadd_transfer_manifest_items(
         self, transfer_id: uuid.UUID, entries: list[dict[str, Any]]
     ) -> int:
@@ -1021,15 +1688,11 @@ class MemoryStore:
                 source_path=source_path,
                 destination_path=str(entry["destination_path"]),
                 is_dir=is_dir,
-                source_object_id=(
-                    source_object_id if isinstance(source_object_id, str) else None
-                ),
+                source_object_id=(source_object_id if isinstance(source_object_id, str) else None),
                 requested_destination_path=str(
                     entry.get("requested_destination_path", entry["destination_path"])
                 ),
-                rename_reason=(
-                    str(entry["rename_reason"]) if entry.get("rename_reason") else None
-                ),
+                rename_reason=(str(entry["rename_reason"]) if entry.get("rename_reason") else None),
                 size_bytes=entry.get("size_bytes"),
                 modified_at=entry.get("modified_at"),
                 status="DIRECTORY" if is_dir else "PENDING",
@@ -1209,7 +1872,7 @@ class MemoryStore:
         self, transfer_ids: list[uuid.UUID]
     ) -> dict[uuid.UUID, dict[str, int]]:
         summaries = {
-            transfer_id: {"copied": 0, "failed": 0, "skipped": 0, "pending": 0}
+            transfer_id: {"copied": 0, "failed": 0, "skipped": 0, "pending": 0, "renamed": 0}
             for transfer_id in transfer_ids
         }
         status_keys = {
@@ -1221,6 +1884,8 @@ class MemoryStore:
         for (transfer_id, _), item in self.transfer_manifest_items.items():
             key = status_keys.get(item.status)
             summary = summaries.get(transfer_id)
+            if summary is not None and item.rename_reason is not None:
+                summary["renamed"] += 1
             if summary is not None and not item.is_dir and key is not None:
                 summary[key] += 1
         return summaries

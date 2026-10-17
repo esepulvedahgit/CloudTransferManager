@@ -41,9 +41,11 @@ async def test_google_export_negative_size_is_unknown():
         async def run(self, *args, **kwargs):
             return b'[{"Name":"document.docx","IsDir":false,"Size":-1}]', b""
 
-    provider = RcloneGoogleDriveProvider(uuid.uuid4(), {
-        "client_id": "id", "client_secret": "secret", "refresh_token": "token"
-    }, Runner())
+    provider = RcloneGoogleDriveProvider(
+        uuid.uuid4(),
+        {"client_id": "id", "client_secret": "secret", "refresh_token": "token"},
+        Runner(),
+    )
     page = await provider.list_items("/")
     assert page.items[0].size_bytes is None
 
@@ -117,6 +119,16 @@ async def test_google_download_uses_stable_file_id_and_keeps_oauth_private(tmp_p
                 200,
                 json={"access_token": "refreshed-access", "expires_in": 3600},
             )
+        if request.url.params.get("alt") != "media":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "drive-file-id-2",
+                    "size": "19",
+                    "mimeType": "application/octet-stream",
+                    "capabilities": {"canDownload": True},
+                },
+            )
         return httpx.Response(200, content=b"selected-file-bytes")
 
     provider = RcloneGoogleDriveProvider(
@@ -173,5 +185,3 @@ async def test_google_get_item_rejects_an_id_outside_the_selected_parent():
     )
 
     assert item is None
-
-
