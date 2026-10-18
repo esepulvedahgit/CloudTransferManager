@@ -18,6 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -121,8 +122,9 @@ class TransferJob(Base):
     __table_args__ = (
         CheckConstraint("operation = 'COPY'", name="ck_transfer_copy_only"),
         CheckConstraint(
-            "status IN ('SCHEDULED', 'QUEUED', 'VALIDATING', 'RUNNING', 'CANCELLING', 'CANCELLED', "
-            "'COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'RETRYING')",
+            "status IN ('SCHEDULED', 'QUEUED', 'VALIDATING', 'RUNNING', 'PAUSING', 'PAUSED', "
+            "'CANCELLING', 'CANCELLED', 'COMPLETED', 'COMPLETED_WITH_WARNINGS', "
+            "'FAILED', 'RETRYING')",
             name="ck_transfer_status",
         ),
         CheckConstraint(
@@ -137,9 +139,7 @@ class TransferJob(Base):
             name="ck_transfer_accepted_parent_omissions_attempt",
         ),
         Index("ix_transfer_dispatch", "status", "scheduled_at", "created_at"),
-        UniqueConstraint(
-            "requested_by", "idempotency_key", name="uq_transfer_request_idempotency"
-        ),
+        UniqueConstraint("requested_by", "idempotency_key", name="uq_transfer_request_idempotency"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -164,9 +164,7 @@ class TransferJob(Base):
     send_email_notification: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(32), default="QUEUED", index=True)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    schedule_timezone: Mapped[str] = mapped_column(
-        String(64), default="UTC", server_default="UTC"
-    )
+    schedule_timezone: Mapped[str] = mapped_column(String(64), default="UTC", server_default="UTC")
     execution_mode: Mapped[str] = mapped_column(String(16), default="AUTO", server_default="AUTO")
     depends_on_transfer_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("transfer_jobs.id", ondelete="RESTRICT"), nullable=True
@@ -174,9 +172,7 @@ class TransferJob(Base):
     source_file_error_policy: Mapped[str] = mapped_column(
         String(32), default="STOP", server_default="STOP"
     )
-    accepted_parent_omissions_attempt: Mapped[int | None] = mapped_column(
-        Integer, nullable=True
-    )
+    accepted_parent_omissions_attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
     wait_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     dispatch_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     dispatch_claimed_at: Mapped[datetime | None] = mapped_column(
@@ -188,6 +184,11 @@ class TransferJob(Base):
     execution_heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    pause_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    state_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     progress_percent: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     files_total: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     files_completed: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -291,6 +292,20 @@ class TransferManifestItem(Base):
         ),
         Index("ix_transfer_manifest_scan", "transfer_job_id", "is_dir", "scan_complete"),
         Index("ix_transfer_manifest_status", "transfer_job_id", "status", "id"),
+        Index(
+            "ix_transfer_incident_failed",
+            "updated_at",
+            "id",
+            postgresql_where=text("status = 'FAILED' AND is_dir = false"),
+            sqlite_where=text("status = 'FAILED' AND is_dir = 0"),
+        ),
+        Index(
+            "ix_transfer_incident_omitted",
+            "omitted_at",
+            "id",
+            postgresql_where=text("omission_kind IS NOT NULL AND is_dir = false"),
+            sqlite_where=text("omission_kind IS NOT NULL AND is_dir = 0"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

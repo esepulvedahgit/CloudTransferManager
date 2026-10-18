@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
@@ -37,6 +37,7 @@ from app.services.memory_store import (
     ConnectionUnavailableError,
     IdempotencyConflictError,
     SMTPSettingsRecord,
+    TransferIncidentRecord,
     TransferManifestItemRecord,
     TransferRecord,
     UserAccount,
@@ -82,6 +83,8 @@ _TRANSFER_STATUS_RANK = {
     "VALIDATING": 2,
     "RUNNING": 3,
     "RETRYING": 3,
+    "PAUSING": 4,
+    "PAUSED": 4,
     "CANCELLING": 4,
     "CANCELLED": 5,
     "COMPLETED": 5,
@@ -529,6 +532,9 @@ class DatabaseStore:
             execution_started_at=row.execution_started_at,
             execution_heartbeat_at=row.execution_heartbeat_at,
             cancel_requested_at=row.cancel_requested_at,
+            pause_requested_at=row.pause_requested_at,
+            paused_at=row.paused_at,
+            state_version=row.state_version,
             progress_percent=float(row.progress_percent or 0),
             files_total=row.files_total or 0,
             files_completed=row.files_completed,
@@ -545,9 +551,7 @@ class DatabaseStore:
             started_at=row.started_at,
             completed_at=row.completed_at,
             evaluation=(
-                EvaluationRecord.from_row(evaluation_row)
-                if evaluation_row is not None
-                else None
+                EvaluationRecord.from_row(evaluation_row) if evaluation_row is not None else None
             ),
         )
 
@@ -575,6 +579,7 @@ class DatabaseStore:
             omitted_by=row.omitted_by,
             last_failure_stage=row.last_failure_stage,
             last_failure_attempt=row.last_failure_attempt,
+            updated_at=row.updated_at,
         )
 
     async def acreate_user(
@@ -1083,9 +1088,7 @@ class DatabaseStore:
         async with self.sessions() as session:
             async with session.begin():
                 transfer = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == transfer_id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
                 )
                 if (
                     transfer is None
@@ -1349,8 +1352,7 @@ class DatabaseStore:
                         or destination.credential_version != transfer.destination_credential_version
                         or (
                             evaluation.source_credential_version is not None
-                            and evaluation.source_credential_version
-                            != source.credential_version
+                            and evaluation.source_credential_version != source.credential_version
                         )
                         or (
                             evaluation.destination_credential_version is not None
@@ -1386,8 +1388,7 @@ class DatabaseStore:
                             ).all()
                         )
                         if any(
-                            not connection.is_global
-                            and connection.id not in granted
+                            not connection.is_global and connection.id not in granted
                             for connection in (source, destination)
                         ):
                             transfer.wait_reason = "WAITING_CONNECTION_ACCESS"
@@ -1468,9 +1469,7 @@ class DatabaseStore:
                     .with_for_update()
                 )
                 transfer = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == claim.transfer_id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == claim.transfer_id).with_for_update()
                 )
                 if (
                     evaluation is None
@@ -1493,9 +1492,7 @@ class DatabaseStore:
                     .with_for_update()
                 )
                 transfer = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == claim.transfer_id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == claim.transfer_id).with_for_update()
                 )
                 if evaluation is None or not self._evaluation_claim_matches(
                     evaluation, transfer, claim
@@ -1535,9 +1532,7 @@ class DatabaseStore:
                     .with_for_update()
                 )
                 transfer = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == claim.transfer_id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == claim.transfer_id).with_for_update()
                 )
                 if (
                     evaluation is None
@@ -1563,9 +1558,7 @@ class DatabaseStore:
                     if scheduled_at is not None and scheduled_at.tzinfo is None:
                         scheduled_at = scheduled_at.replace(tzinfo=UTC)
                     transfer.wait_reason = (
-                        "WAITING_UNTIL"
-                        if scheduled_at is not None and scheduled_at > now
-                        else None
+                        "WAITING_UNTIL" if scheduled_at is not None and scheduled_at > now else None
                     )
                 elif status in {"BLOCKED", "ERROR"}:
                     transfer.wait_reason = "BLOCKED_EVALUATION"
@@ -1617,7 +1610,7 @@ class DatabaseStore:
             raise ValueError("max_concurrent must be positive")
         if max_nextcloud_concurrent < 1:
             raise ValueError("max_nextcloud_concurrent must be positive")
-        active_statuses = {"VALIDATING", "RUNNING", "RETRYING", "CANCELLING"}
+        active_statuses = {"VALIDATING", "RUNNING", "RETRYING", "PAUSING", "CANCELLING"}
         changed_ids: set[uuid.UUID] = set()
         admitted_ids: list[uuid.UUID] = []
         now = now.astimezone(UTC)
@@ -1830,8 +1823,7 @@ class DatabaseStore:
                                 evaluation.sequence = 1
                             elif evaluation is not None and (
                                 evaluation.safe_error_code != dependency_error_code(parent_wait)
-                                or evaluation.safe_message
-                                != dependency_wait_message(parent_wait)
+                                or evaluation.safe_message != dependency_wait_message(parent_wait)
                             ):
                                 evaluation.safe_error_code = dependency_error_code(parent_wait)
                                 evaluation.safe_message = dependency_wait_message(parent_wait)
@@ -2167,13 +2159,9 @@ class DatabaseStore:
                         evaluation.safe_message = dependency_wait_message(parent_wait)
                         row.wait_reason = parent_wait
                     elif evaluation_created:
-                        row.wait_reason = (
-                            "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
-                        )
+                        row.wait_reason = "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
                     else:
-                        row.wait_reason = (
-                            "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
-                        )
+                        row.wait_reason = "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
                 record = self._transfer(row, evaluation_override=evaluation)
                 await session.flush()
                 return record
@@ -2195,8 +2183,13 @@ class DatabaseStore:
                 }:
                     return None, False
                 row.cancel_requested_at = now
-                if row.status in {"QUEUED", "SCHEDULED"} and row.execution_started_at is None:
+                if (
+                    row.status in {"QUEUED", "SCHEDULED", "PAUSED"}
+                    and row.execution_started_at is None
+                ):
                     row.status = "CANCELLED"
+                    row.pause_requested_at = None
+                    row.paused_at = None
                     row.completed_at = now
                     row.wait_reason = None
                     row.dispatch_token = None
@@ -2207,8 +2200,126 @@ class DatabaseStore:
                 else:
                     row.status = "CANCELLING"
                     needs_worker_signal = True
+                row.state_version += 1
                 await session.flush()
                 return self._transfer(row), needs_worker_signal
+
+    async def apause_transfer(
+        self, transfer_id: uuid.UUID, now: datetime
+    ) -> tuple[TransferRecord | None, bool]:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if row is None or row.status in _TERMINAL_TRANSFER_STATUSES:
+                    return None, False
+                if row.status in {"PAUSING", "PAUSED"}:
+                    return self._transfer(row), row.status == "PAUSING"
+                if row.status == "CANCELLING" or row.cancel_requested_at is not None:
+                    return None, False
+                if row.status in {"QUEUED", "SCHEDULED"} and row.execution_started_at is None:
+                    row.status = "PAUSED"
+                    row.paused_at = now
+                    row.pause_requested_at = None
+                    row.current_item = None
+                    row.current_speed_bps = None
+                    row.wait_reason = None
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+                    row.execution_heartbeat_at = None
+                    needs_worker = False
+                elif row.status in {"VALIDATING", "RUNNING", "RETRYING"} or (
+                    row.status == "QUEUED" and row.execution_started_at is not None
+                ):
+                    source = await session.get(StorageConnection, row.source_connection_id)
+                    destination = await session.get(
+                        StorageConnection, row.destination_connection_id
+                    )
+                    supports_boundary = bool(
+                        row.conflict_policy == "KEEP_BOTH"
+                        or (source is not None and source.provider_type == "SMB")
+                        or (
+                            source is not None
+                            and destination is not None
+                            and source.provider_type == destination.provider_type == "MOCK"
+                        )
+                    )
+                    if not supports_boundary:
+                        return None, False
+                    row.status = "PAUSING"
+                    row.pause_requested_at = now
+                    needs_worker = True
+                else:
+                    return None, False
+                row.state_version += 1
+                await session.flush()
+                return self._transfer(row), needs_worker
+
+    async def acheck_transfer_execution_control(
+        self,
+        transfer_id: uuid.UUID,
+        dispatch_token: uuid.UUID | None,
+        next_item_path: str,
+    ) -> str:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if row is None or (
+                    dispatch_token is not None and row.dispatch_token != dispatch_token
+                ):
+                    return "lost"
+                if row.cancel_requested_at is not None or row.status == "CANCELLING":
+                    return "cancel"
+                if row.pause_requested_at is not None or row.status == "PAUSING":
+                    return "pause"
+                if row.status not in {"VALIDATING", "RUNNING", "RETRYING"}:
+                    return "lost"
+                row.current_item = next_item_path
+                return "continue"
+
+    async def acomplete_transfer_pause(
+        self,
+        transfer_id: uuid.UUID,
+        dispatch_token: uuid.UUID | None,
+        now: datetime,
+    ) -> TransferRecord | None:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if row is None or (
+                    dispatch_token is not None and row.dispatch_token != dispatch_token
+                ):
+                    return None
+                if row.status == "CANCELLING" and row.cancel_requested_at is not None:
+                    row.status = "CANCELLED"
+                    row.completed_at = now
+                    row.cancel_requested_at = None
+                    row.paused_at = None
+                    await self._ensure_notification_outbox(session, row)
+                elif row.status == "PAUSING" and row.cancel_requested_at is None:
+                    row.status = "PAUSED"
+                    row.paused_at = now
+                else:
+                    return None
+                row.pause_requested_at = None
+                row.current_item = None
+                row.current_speed_bps = None
+                row.estimated_remaining_seconds = None
+                row.dispatch_token = None
+                row.dispatch_claimed_at = None
+                row.execution_started_at = None
+                row.execution_heartbeat_at = None
+                row.wait_reason = None
+                row.state_version += 1
+                await session.flush()
+                return self._transfer(row)
 
     async def aresume_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
         async with self.sessions() as session:
@@ -2217,12 +2328,35 @@ class DatabaseStore:
                     select(TransferJob)
                     .where(
                         TransferJob.id == transfer_id,
-                        TransferJob.status.in_({"FAILED", "CANCELLED"}),
+                        TransferJob.status.in_({"FAILED", "CANCELLED", "PAUSED"}),
                     )
                     .with_for_update()
                 )
                 if row is None:
                     return None
+                if row.status == "PAUSED":
+                    scheduled_at = row.scheduled_at
+                    if scheduled_at is not None and scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=UTC)
+                    now = datetime.now(UTC)
+                    row.status = (
+                        "SCHEDULED" if scheduled_at is not None and scheduled_at > now else "QUEUED"
+                    )
+                    row.pause_requested_at = None
+                    row.paused_at = None
+                    row.completed_at = None
+                    row.current_item = None
+                    row.current_speed_bps = None
+                    row.estimated_remaining_seconds = None
+                    row.wait_reason = "WAITING_UNTIL" if row.status == "SCHEDULED" else None
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+                    row.execution_started_at = None
+                    row.execution_heartbeat_at = None
+                    row.cancel_requested_at = None
+                    row.state_version += 1
+                    await session.flush()
+                    return self._transfer(row)
                 row.status = "QUEUED"
                 row.attempt_count += 1
                 row.completed_at = None
@@ -2235,6 +2369,7 @@ class DatabaseStore:
                 row.execution_started_at = None
                 row.execution_heartbeat_at = None
                 row.cancel_requested_at = None
+                row.state_version += 1
                 await session.flush()
                 return self._transfer(row)
 
@@ -2253,9 +2388,7 @@ class DatabaseStore:
         async with self.sessions() as session:
             async with session.begin():
                 child = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == child_id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == child_id).with_for_update()
                 )
                 if child is None:
                     raise TransferRecoveryNotFoundError("Transfer not found")
@@ -2408,9 +2541,7 @@ class DatabaseStore:
         async with self.sessions() as session:
             async with session.begin():
                 row = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == transfer_id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
                 )
                 if row is None:
                     raise TransferRecoveryNotFoundError("Transfer not found")
@@ -2465,9 +2596,7 @@ class DatabaseStore:
                 ):
                     raise TransferRecoveryConflictError("Transfer execution is still active")
 
-                connection_ids = sorted(
-                    {row.source_connection_id, row.destination_connection_id}
-                )
+                connection_ids = sorted({row.source_connection_id, row.destination_connection_id})
                 connections = (
                     await session.scalars(
                         select(StorageConnection)
@@ -2495,9 +2624,11 @@ class DatabaseStore:
                     raise TransferRecoveryConflictError("Transfer credentials changed")
                 if actor.role != "ADMIN":
                     for connection in (source, destination):
-                        if not connection.is_global and await session.get(
-                            UserConnectionGrant, (actor_id, connection.id)
-                        ) is None:
+                        if (
+                            not connection.is_global
+                            and await session.get(UserConnectionGrant, (actor_id, connection.id))
+                            is None
+                        ):
                             raise TransferRecoveryNotFoundError("Transfer not found")
 
                 selected = list(
@@ -2637,9 +2768,7 @@ class DatabaseStore:
         async with self.sessions() as session:
             async with session.begin():
                 row = await session.scalar(
-                    select(TransferJob)
-                    .where(TransferJob.id == transfer_id)
-                    .with_for_update()
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
                 )
                 if row is None:
                     raise TransferRecoveryNotFoundError("Transfer not found")
@@ -2693,9 +2822,7 @@ class DatabaseStore:
                 ):
                     raise TransferRecoveryConflictError("Transfer execution is still active")
 
-                connection_ids = sorted(
-                    {row.source_connection_id, row.destination_connection_id}
-                )
+                connection_ids = sorted({row.source_connection_id, row.destination_connection_id})
                 connections = (
                     await session.scalars(
                         select(StorageConnection)
@@ -2723,9 +2850,11 @@ class DatabaseStore:
                     raise TransferRecoveryConflictError("Transfer credentials changed")
                 if actor.role != "ADMIN":
                     for connection in (source, destination):
-                        if not connection.is_global and await session.get(
-                            UserConnectionGrant, (actor_id, connection.id)
-                        ) is None:
+                        if (
+                            not connection.is_global
+                            and await session.get(UserConnectionGrant, (actor_id, connection.id))
+                            is None
+                        ):
                             raise TransferRecoveryNotFoundError("Transfer not found")
 
                 item = await session.scalar(
@@ -3143,7 +3272,10 @@ class DatabaseStore:
             TransferJob.execution_mode == "EXCLUSIVE",
             TransferJob.depends_on_transfer_id.is_not(None),
         )
-        background = and_(programmed, TransferJob.status.in_(ACTIVE_TRANSFER_STATUSES))
+        background = or_(
+            TransferJob.status.in_({"PAUSING", "PAUSED"}),
+            and_(programmed, TransferJob.status.in_(ACTIVE_TRANSFER_STATUSES)),
+        )
         if background_only:
             criteria.append(background)
         if exclude_background:
@@ -3177,21 +3309,274 @@ class DatabaseStore:
             rows = (await session.scalars(statement)).all()
             return [self._transfer(row) for row in rows], total
 
-    async def asave_transfer(self, transfer: TransferRecord) -> None:
+    async def alist_transfer_pause_capabilities(
+        self, transfer_ids: Iterable[uuid.UUID]
+    ) -> dict[uuid.UUID, tuple[bool, str | None]]:
+        ids = list(set(transfer_ids))
+        if not ids:
+            return {}
+        source = aliased(StorageConnection)
+        destination = aliased(StorageConnection)
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TransferJob.id,
+                        TransferJob.status,
+                        TransferJob.execution_started_at,
+                        TransferJob.conflict_policy,
+                        source.provider_type,
+                        destination.provider_type,
+                    )
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(TransferJob.id.in_(ids))
+                )
+            ).all()
+        result: dict[uuid.UUID, tuple[bool, str | None]] = {}
+        for transfer_id, status, execution_started_at, conflict_policy, src, dst in rows:
+            unstarted = status in {"QUEUED", "SCHEDULED"} and execution_started_at is None
+            supported = bool(
+                unstarted
+                or conflict_policy == "KEEP_BOTH"
+                or src == "SMB"
+                or (src == "MOCK" and dst == "MOCK")
+            )
+            reason = (
+                "LEGACY_BULK_EXECUTION"
+                if not supported
+                and (
+                    status in {"VALIDATING", "RUNNING", "RETRYING"}
+                    or execution_started_at is not None
+                )
+                else None
+            )
+            result[transfer_id] = supported, reason
+        return result
+
+    async def alist_transfer_incidents(
+        self,
+        requested_by: uuid.UUID | None,
+        *,
+        kind: str,
+        before_at: datetime | None = None,
+        before_id: uuid.UUID | None = None,
+        limit: int = 20,
+    ) -> list[TransferIncidentRecord]:
+        if kind not in {"failed", "omitted"}:
+            raise ValueError("Invalid transfer incident kind")
+        source = aliased(StorageConnection)
+        destination = aliased(StorageConnection)
+        incident_at = (
+            TransferManifestItem.updated_at if kind == "failed" else TransferManifestItem.omitted_at
+        )
+        incident_filter = (
+            TransferManifestItem.status == "FAILED"
+            if kind == "failed"
+            else and_(
+                TransferManifestItem.status == "SKIPPED",
+                TransferManifestItem.omission_kind.is_not(None),
+                TransferManifestItem.omitted_at.is_not(None),
+            )
+        )
+        criteria: list[Any] = [TransferManifestItem.is_dir.is_(False), incident_filter]
+        if requested_by is not None:
+            criteria.append(TransferJob.requested_by == requested_by)
+        if before_at is not None and before_id is not None:
+            criteria.append(
+                or_(
+                    incident_at < before_at,
+                    and_(incident_at == before_at, TransferManifestItem.id < before_id),
+                )
+            )
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TransferJob,
+                        TransferManifestItem,
+                        source,
+                        destination,
+                        incident_at.label("incident_at"),
+                    )
+                    .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(*criteria)
+                    .order_by(incident_at.desc(), TransferManifestItem.id.desc())
+                    .limit(max(1, min(limit, 101)))
+                )
+            ).all()
+            return [
+                TransferIncidentRecord(
+                    transfer=self._transfer(transfer),
+                    item=self._manifest_item(item),
+                    incident_at=cast(datetime, occurred_at),
+                    source_connection=self._connection(source_row),
+                    destination_connection=self._connection(destination_row),
+                )
+                for transfer, item, source_row, destination_row, occurred_at in rows
+            ]
+
+    async def acount_transfer_incidents(self, requested_by: uuid.UUID | None) -> dict[str, int]:
+        async with self.sessions() as session:
+            criteria: list[Any] = [TransferManifestItem.is_dir.is_(False)]
+            if requested_by is not None:
+                criteria.append(TransferJob.requested_by == requested_by)
+            rows = (
+                await session.execute(
+                    select(TransferManifestItem.status, func.count())
+                    .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                    .where(
+                        *criteria,
+                        or_(
+                            TransferManifestItem.status == "FAILED",
+                            and_(
+                                TransferManifestItem.status == "SKIPPED",
+                                TransferManifestItem.omission_kind.is_not(None),
+                                TransferManifestItem.omitted_at.is_not(None),
+                            ),
+                        ),
+                    )
+                    .group_by(TransferManifestItem.status)
+                )
+            ).all()
+        counts = {"FAILED": 0, "SKIPPED": 0}
+        counts.update({str(row_status): int(count) for row_status, count in rows})
+        return {"failed": counts["FAILED"], "omitted": counts["SKIPPED"]}
+
+    async def alist_transfer_failure_diagnostics(
+        self, transfer_ids: set[uuid.UUID]
+    ) -> dict[uuid.UUID, list[dict[str, Any]]]:
+        if not transfer_ids:
+            return {}
+        async with self.sessions() as session:
+            events = (
+                await session.scalars(
+                    select(TransferEvent)
+                    .where(
+                        TransferEvent.transfer_job_id.in_(transfer_ids),
+                        TransferEvent.event_type == "FAILURE_DIAGNOSTIC",
+                    )
+                    .order_by(TransferEvent.created_at)
+                )
+            ).all()
+        result: dict[uuid.UUID, list[dict[str, Any]]] = {
+            transfer_id: [] for transfer_id in transfer_ids
+        }
+        for event in events:
+            result[event.transfer_job_id].append(
+                {
+                    "event_type": event.event_type,
+                    "technical_details": event.technical_details,
+                    "provider_error_code": event.provider_error_code,
+                    "created_at": event.created_at,
+                }
+            )
+        return result
+
+    async def acount_transfer_manifest_basename_matches_bulk(
+        self, candidates: list[tuple[uuid.UUID, str]]
+    ) -> dict[tuple[uuid.UUID, str], int]:
+        if not candidates:
+            return {}
+        criteria = [
+            and_(
+                TransferManifestItem.transfer_job_id == transfer_id,
+                or_(
+                    TransferManifestItem.source_path == basename,
+                    TransferManifestItem.source_path.endswith(f"/{basename}", autoescape=True),
+                ),
+            )
+            for transfer_id, basename in set(candidates)
+        ]
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TransferManifestItem.transfer_job_id, TransferManifestItem.source_path
+                    ).where(
+                        TransferManifestItem.is_dir.is_(False),
+                        or_(*criteria),
+                    )
+                )
+            ).all()
+        counts = {candidate: 0 for candidate in candidates}
+        for transfer_id, source_path in rows:
+            basename = PurePosixPath(source_path).name
+            key = (transfer_id, basename)
+            if key in counts:
+                counts[key] += 1
+        return counts
+
+    async def alist_accessible_connection_ids(
+        self, user_id: uuid.UUID, connection_ids: set[uuid.UUID]
+    ) -> set[uuid.UUID]:
+        if not connection_ids:
+            return set()
+        async with self.sessions() as session:
+            granted_ids = select(UserConnectionGrant.connection_id).where(
+                UserConnectionGrant.user_id == user_id
+            )
+            rows = await session.scalars(
+                select(StorageConnection.id).where(
+                    StorageConnection.id.in_(connection_ids),
+                    StorageConnection.deleted_at.is_(None),
+                    or_(
+                        StorageConnection.is_global.is_(True),
+                        StorageConnection.id.in_(granted_ids),
+                    ),
+                )
+            )
+            return set(rows.all())
+
+    async def asave_transfer(
+        self,
+        transfer: TransferRecord,
+        *,
+        expected_dispatch_token: uuid.UUID | None = None,
+    ) -> bool:
         async with self.sessions() as session:
             async with session.begin():
                 row = await session.scalar(
                     select(TransferJob).where(TransferJob.id == transfer.id).with_for_update()
                 )
                 if row is None or row.status in _TERMINAL_TRANSFER_STATUSES:
-                    return
-                if transfer.attempt_count < row.attempt_count:
-                    return
-                if _TRANSFER_STATUS_RANK.get(transfer.status, -1) < _TRANSFER_STATUS_RANK.get(
-                    row.status, -1
+                    return False
+                if (
+                    expected_dispatch_token is not None
+                    and row.dispatch_token != expected_dispatch_token
                 ):
-                    return
-                row.status = transfer.status
+                    return False
+                if transfer.attempt_count < row.attempt_count:
+                    return False
+                preserve_status = False
+                if row.status == "PAUSING" and transfer.status not in {
+                    "PAUSING",
+                    "FAILED",
+                    "CANCELLED",
+                    "COMPLETED",
+                    "COMPLETED_WITH_WARNINGS",
+                }:
+                    preserve_status = True
+                elif row.status == "PAUSED" and transfer.status not in {
+                    "PAUSED",
+                    "QUEUED",
+                    "SCHEDULED",
+                }:
+                    return False
+                elif (
+                    row.status == "CANCELLING"
+                    and transfer.status != "CANCELLING"
+                    and transfer.status not in _TERMINAL_TRANSFER_STATUSES
+                ):
+                    preserve_status = True
+                if not preserve_status and _TRANSFER_STATUS_RANK.get(
+                    transfer.status, -1
+                ) < _TRANSFER_STATUS_RANK.get(row.status, -1):
+                    return False
+                if not preserve_status:
+                    row.status = transfer.status
                 row.progress_percent = transfer.progress_percent
                 row.files_total = transfer.files_total
                 row.files_completed = transfer.files_completed
@@ -3208,7 +3593,17 @@ class DatabaseStore:
                     row.started_at = transfer.started_at
                 if transfer.completed_at is not None:
                     row.completed_at = transfer.completed_at
+                if row.status in _TERMINAL_TRANSFER_STATUSES:
+                    row.pause_requested_at = None
+                    row.paused_at = None
+                    row.cancel_requested_at = None
+                row.state_version += 1
+                transfer.status = row.status
+                transfer.pause_requested_at = row.pause_requested_at
+                transfer.paused_at = row.paused_at
+                transfer.state_version = row.state_version
                 await self._ensure_notification_outbox(session, row)
+                return True
 
     async def aadd_transfer_manifest_items(
         self, transfer_id: uuid.UUID, entries: list[dict[str, Any]]

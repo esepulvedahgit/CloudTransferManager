@@ -194,3 +194,54 @@ async def test_redis_sse_waits_for_subscription_ack_and_keeps_events_during_snap
     assert len(frames) == 2
     assert '"status":"RUNNING"' in frames[0]
     assert '"status":"COMPLETED"' in frames[1]
+
+
+@pytest.mark.asyncio
+async def test_sse_snapshot_includes_legacy_pause_reason_and_closes_at_paused():
+    store = MemoryStore()
+    user = store.add_user(
+        "legacy-stream",
+        "legacy-stream@example.test",
+        PasswordService().hash("SafePassword123!"),
+        role="ADMIN",
+    )
+    source = store.create_connection("MEGA origen", "MEGA", user.id)
+    destination = store.create_connection("Drive destino", "GOOGLE_DRIVE", user.id)
+    transfer = store.create_transfer(
+        user.id, source.id, destination.id, ["/source.rar"], "/backup"
+    )
+    transfer.status = "RUNNING"
+    transfer.conflict_policy = "SKIP"
+    await store.asave_transfer(transfer)
+    app = create_app(
+        Settings(app_secret_key="test-secret-key", session_cookie_secure=False), store=store
+    )
+    subscribe = app.state.event_hub.subscribe
+
+    def queue_paused_after_snapshot(transfer_id):
+        queue = subscribe(transfer_id)
+        queue.put_nowait({"status": "PAUSED", "job_id": str(transfer.id)})
+        return queue
+
+    app.state.event_hub.subscribe = queue_paused_after_snapshot
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        csrf = (await client.get("/api/v1/auth/csrf")).json()["csrf_token"]
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={"username_or_email": user.username, "password": "SafePassword123!"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert login.status_code == 200
+        response = await asyncio.wait_for(
+            client.get(f"/api/v1/transfers/{transfer.id}/stream"), timeout=1
+        )
+
+    frames = [
+        json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")
+    ]
+    assert frames[0]["pause_supported"] is False
+    assert frames[0]["pause_unavailable_reason"] == "LEGACY_BULK_EXECUTION"
+    assert frames[1]["status"] == "PAUSED"

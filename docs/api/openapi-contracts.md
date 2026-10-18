@@ -356,13 +356,24 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 ### `GET /api/v1/transfers`
 - Devuelve historial paginado con `offset` y `page_size`; ADMIN ve todas las transferencias y USER solo las propias.
 - `pending_only=true` limita la lista a estados `SCHEDULED` y `QUEUED`, para recorrer la cola completa por páginas.
-- `background_only=true` limita la lista a tareas administradas por **Programaciones** que sigan en estados no terminales: `SCHEDULED`, `QUEUED`, `VALIDATING`, `RUNNING`, `RETRYING` o `CANCELLING`. Una tarea pertenece a Programaciones cuando tiene `scheduled_at`, `wait_reason`, modo `EXCLUSIVE` o una transferencia padre (`depends_on_transfer_id`). La respuesta conserva `total_count` después de aplicar el filtro de propietario.
+- `background_only=true` limita la lista a tareas administradas por **Programaciones** que sigan en estados no terminales: `SCHEDULED`, `QUEUED`, `VALIDATING`, `RUNNING`, `RETRYING`, `PAUSING`, `PAUSED` o `CANCELLING`. Una tarea pertenece a Programaciones cuando tiene `scheduled_at`, `wait_reason`, modo `EXCLUSIVE`, una transferencia padre (`depends_on_transfer_id`) o está pausando/pausada. La respuesta conserva `total_count` después de aplicar el filtro de propietario.
 - `exclude_background=true` omite únicamente esas tareas no terminales de Programaciones. Las transferencias terminales, incluidas las programadas, siguen disponibles en la lista general.
 - Las respuestas de creación, detalle, listado y SSE incluyen `evaluation`. Si no se requiere evaluación anticipada, el estado es `NOT_REQUIRED`. Un conteo nulo significa que la cantidad todavía se desconoce; solo `count_complete=true` confirma el total.
 - Cada elemento incluye `manifest_summary`: `copied` son archivos copiados y verificados, `failed` son archivos con error, `skipped` cuenta archivos omitidos, `omitted` identifica el subconjunto con omisión explícita y `pending` son archivos aún no resueltos. `omitted_bytes` suma el tamaño conocido de ese subconjunto y no se agrega a bytes transferidos. Los contadores de archivos excluyen entradas de directorio. En SMB, `files_completed` cuenta elementos resueltos y no equivale a `copied`.
+- Los registros incluyen `state_version`; cuando corresponda, también `pause_requested_at`, `paused_at`, `pause_supported` y `pause_unavailable_reason`. El cliente conserva el snapshot con mayor versión dentro del mismo intento.
+
+### `GET /api/v1/transfer-incidents?kind=failed|omitted&limit=20&cursor=…`
+- Devuelve una página acotada de fallos de archivos o de omisiones explícitas, con conteos globales para el usuario (ADMIN ve todas las transferencias). Los `SKIPPED` históricos por conflicto no cuentan como omisiones.
+- Cada fila incluye identidad/estado/intento de transferencia, nombres y proveedor de las conexiones, rutas completas de origen, destino asignado y destino solicitado si fue renombrado, fecha del incidente, código de error o tipo de omisión, elegibilidad de acción y motivo seguro si no está disponible.
+- `limit` admite de 1 a 100; `cursor` es opaco y estable para continuar la paginación. El panel usa `/skip-and-resume` para la omisión confirmada y `/retry-omitted` para reintentos explícitos.
 
 ### `GET /api/v1/transfers/{transfer_id}`
-- Devuelve el estado y métricas actuales de la transferencia visible para el usuario.
+- Devuelve el estado y métricas actuales de la transferencia visible para el usuario, incluida la capacidad de pausa y la razón segura si no está disponible.
+
+### `POST /api/v1/transfers/{transfer_id}/pause`
+- Requiere sesión del propietario o ADMIN y token CSRF. Devuelve `202 Accepted` con el estado canónico `PAUSING` o `PAUSED`.
+- Una tarea `QUEUED`/`SCHEDULED` que aún no empezó pasa inmediatamente a `PAUSED`; una compatible en ejecución pasa a `PAUSING` y termina el archivo actual antes de parar en el siguiente límite. Las llamadas repetidas son idempotentes.
+- Para una ejecución histórica por lote sin límites seguros entre archivos responde `409` con `{ "code": "LEGACY_BULK_EXECUTION", "message": "…" }`. No termina el proceso del proveedor para forzar una pausa.
 
 ### `GET /api/v1/transfers/{transfer_id}/events`
 - Devuelve eventos auditables con categorías de error y detalles técnicos sanitizados; solo el solicitante o ADMIN puede consultarlos.
@@ -383,9 +394,9 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 - Descarga CSV paginado de las omisiones explícitas de una transferencia terminal. Solo el propietario o ADMIN puede acceder. Se escapan celdas y se neutralizan prefijos de fórmula; el endpoint no está disponible antes del estado terminal (`409`).
 
 ### `POST /api/v1/transfers/{transfer_id}/resume`
-- Disponible para transferencias nuevas `KEEP_BOTH` y para trabajos SMB históricos en estado `FAILED` o `CANCELLED`, cuando el manifiesto conserva archivos pendientes/fallidos y ambas conexiones siguen activas.
+- Disponible para transferencias nuevas `KEEP_BOTH` en estado `PAUSED`, además de transferencias nuevas y trabajos SMB históricos reanudables en `FAILED` o `CANCELLED`, cuando hay trabajo pendiente y ambas conexiones siguen activas. Para un `PAUSED` vacío que no había comenzado, también permite continuar.
 - Acepta sin cuerpo las llamadas existentes; opcionalmente `{ "source_file_error_policy": "STOP" }`. Rechaza con `422` `SKIP_CONFIRMED_RESTRICTED` hasta verificar una firma individual de la versión instalada de MEGAcmd.
-- Requiere las mismas versiones de credenciales capturadas por el trabajo y, para SMB, la misma raíz del NAS. Reutiliza los nombres ya asignados y responde `202 Accepted`. Las escrituras ambiguas se verifican por SHA-256 o se detienen para evitar duplicar.
+- Para un trabajo pausado conserva `attempt_count` y `scheduled_at`; si la hora ya venció o no hay fecha, vuelve a `QUEUED`, y si sigue en el futuro vuelve a `SCHEDULED`. Requiere las mismas versiones de credenciales capturadas por el trabajo y, para SMB, la misma raíz del NAS. Reutiliza los nombres ya asignados y responde `202 Accepted`. Las escrituras ambiguas se verifican por SHA-256 o se detienen para evitar duplicar.
 
 ### `POST /api/v1/transfers/{transfer_id}/accept-parent-omissions`
 - Para una transferencia hija bloqueada por `BLOCKED_PARENT_OMISSIONS`, requiere CSRF y cuerpo `{ "expected_parent_attempt": 3, "request_id": "<UUID>" }`. Acepta explícitamente las omisiones del intento indicado del padre terminal y responde `202 Accepted`; no despacha el trabajo desde el navegador.

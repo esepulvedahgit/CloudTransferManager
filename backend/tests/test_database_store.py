@@ -480,6 +480,38 @@ async def test_stale_transfer_save_cannot_undo_a_cancel_request(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_terminal_completion_wins_when_it_races_with_cancellation(tmp_path):
+    database_path = tmp_path / "completion-cancel-race.sqlite"
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{database_path}")
+    store = DatabaseStore(settings)
+    await store.create_schema()
+    user = await store.acreate_user("completion-owner", "completion-owner@example.test", "hash")
+    source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
+    created = await store.acreate_transfer(user.id, source.id, destination.id, ["/file"], "/copy")
+    active = await store.aget_transfer(created.id)
+    assert active is not None
+    active.status = "RUNNING"
+    await store.asave_transfer(active)
+
+    cancelled, should_signal_worker = await store.acancel_transfer(
+        created.id, datetime.now(UTC)
+    )
+    assert cancelled is not None and should_signal_worker
+    completed = await store.aget_transfer(created.id)
+    assert completed is not None and completed.status == "CANCELLING"
+    completed.status = "COMPLETED"
+    completed.completed_at = datetime.now(UTC)
+    await store.asave_transfer(completed)
+
+    persisted = await store.aget_transfer(created.id)
+    await store.aclose()
+    assert persisted is not None
+    assert persisted.status == "COMPLETED"
+    assert persisted.cancel_requested_at is None
+
+
+@pytest.mark.asyncio
 async def test_stale_transfer_save_cannot_replace_a_terminal_state(tmp_path):
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'terminal-race.sqlite'}")
     store = DatabaseStore(settings)

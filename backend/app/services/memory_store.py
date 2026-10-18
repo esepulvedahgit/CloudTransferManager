@@ -23,8 +23,34 @@ from app.services.transfer_progress import smb_manifest_progress_percent
 from app.settings import Settings
 
 ACTIVE_TRANSFER_STATUSES = frozenset(
-    {"SCHEDULED", "QUEUED", "VALIDATING", "RUNNING", "RETRYING", "CANCELLING"}
+    {
+        "SCHEDULED",
+        "QUEUED",
+        "VALIDATING",
+        "RUNNING",
+        "RETRYING",
+        "PAUSING",
+        "PAUSED",
+        "CANCELLING",
+    }
 )
+_TERMINAL_TRANSFER_STATUSES = frozenset(
+    {"COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "CANCELLED"}
+)
+_TRANSFER_STATUS_RANK = {
+    "SCHEDULED": 0,
+    "QUEUED": 1,
+    "VALIDATING": 2,
+    "RUNNING": 3,
+    "RETRYING": 3,
+    "PAUSING": 4,
+    "PAUSED": 4,
+    "CANCELLING": 4,
+    "CANCELLED": 5,
+    "COMPLETED": 5,
+    "COMPLETED_WITH_WARNINGS": 5,
+    "FAILED": 5,
+}
 _NOTIFICATION_LEASE_SECONDS = 300
 _EVALUATION_LEASE_SECONDS = 60
 
@@ -132,6 +158,11 @@ class TransferRecord:
     execution_started_at: datetime | None = None
     execution_heartbeat_at: datetime | None = None
     cancel_requested_at: datetime | None = None
+    pause_requested_at: datetime | None = None
+    paused_at: datetime | None = None
+    state_version: int = 0
+    pause_supported: bool | None = None
+    pause_unavailable_reason: str | None = None
     progress_percent: float = 0.0
     files_total: int = 0
     files_completed: int = 0
@@ -189,6 +220,16 @@ class TransferRecord:
             "source_file_error_policy": self.source_file_error_policy,
             "accepted_parent_omissions_attempt": self.accepted_parent_omissions_attempt,
             "wait_reason": self.wait_reason,
+            "pause_requested_at": self.pause_requested_at.isoformat()
+            if self.pause_requested_at
+            else None,
+            "paused_at": self.paused_at.isoformat() if self.paused_at else None,
+            "state_version": self.state_version,
+            "pause_supported": self.pause_supported
+            if self.pause_supported is not None
+            else self.conflict_policy == "KEEP_BOTH"
+            or self.status in {"QUEUED", "SCHEDULED", "PAUSING", "PAUSED"},
+            "pause_unavailable_reason": self.pause_unavailable_reason,
             "evaluation": (
                 self.evaluation.public_dict() if self.evaluation else not_required_evaluation()
             ),
@@ -226,6 +267,7 @@ class TransferManifestItemRecord:
     omitted_by: uuid.UUID | None = None
     last_failure_stage: str | None = None
     last_failure_attempt: int | None = None
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -249,7 +291,18 @@ class TransferManifestItemRecord:
         }
 
 
+@dataclass
+class TransferIncidentRecord:
+    transfer: TransferRecord
+    item: TransferManifestItemRecord
+    incident_at: datetime
+    source_connection: ConnectionRecord | None
+    destination_connection: ConnectionRecord | None
+
+
 def is_programmed_background_transfer(transfer: TransferRecord) -> bool:
+    if transfer.status in {"PAUSING", "PAUSED"}:
+        return True
     return transfer.status in ACTIVE_TRANSFER_STATUSES and bool(
         transfer.scheduled_at is not None
         or transfer.wait_reason is not None
@@ -624,6 +677,15 @@ class MemoryStore:
             and (connection.is_global or (user_id, connection_id) in self.connection_grants)
         )
 
+    async def alist_accessible_connection_ids(
+        self, user_id: uuid.UUID, connection_ids: set[uuid.UUID]
+    ) -> set[uuid.UUID]:
+        return {
+            connection_id
+            for connection_id in connection_ids
+            if await self.ahas_connection_access(user_id, connection_id)
+        }
+
     async def agrant_connection(
         self, user_id: uuid.UUID, connection_id: uuid.UUID, granted_by: uuid.UUID
     ) -> None:
@@ -716,9 +778,7 @@ class MemoryStore:
                     parent.status if parent else "FAILED",
                     parent_omitted_count=parent_omitted_count,
                     parent_attempt_count=parent.attempt_count if parent else 1,
-                    accepted_parent_omissions_attempt=(
-                        transfer.accepted_parent_omissions_attempt
-                    ),
+                    accepted_parent_omissions_attempt=(transfer.accepted_parent_omissions_attempt),
                 )
             if parent_wait is not None:
                 evaluation.status = "WAITING_PARENT"
@@ -919,8 +979,7 @@ class MemoryStore:
                     evaluation.status = "BLOCKED"
                     evaluation.safe_error_code = "BLOCKED_CONNECTION_CHANGED"
                     evaluation.safe_message = (
-                        "Una conexión o sus credenciales cambiaron. "
-                        "Solicita una nueva evaluación."
+                        "Una conexión o sus credenciales cambiaron. Solicita una nueva evaluación."
                     )
                     evaluation.completed_at = now
                     evaluation.retry_at = None
@@ -1100,6 +1159,73 @@ class MemoryStore:
         )
         return records[offset : offset + limit], len(records)
 
+    async def alist_transfer_incidents(
+        self,
+        requested_by: uuid.UUID | None,
+        *,
+        kind: Literal["failed", "omitted"],
+        before_at: datetime | None = None,
+        before_id: uuid.UUID | None = None,
+        limit: int = 20,
+    ) -> list[TransferIncidentRecord]:
+        incidents: list[TransferIncidentRecord] = []
+        for (transfer_id, _), item in self.transfer_manifest_items.items():
+            transfer = self.transfers.get(transfer_id)
+            if transfer is None or (
+                requested_by is not None and transfer.requested_by != requested_by
+            ):
+                continue
+            if item.is_dir:
+                continue
+            if kind == "failed":
+                if item.status != "FAILED":
+                    continue
+                incident_at = item.updated_at
+            else:
+                if (
+                    item.status != "SKIPPED"
+                    or item.omission_kind is None
+                    or item.omitted_at is None
+                ):
+                    continue
+                incident_at = item.omitted_at
+            if (
+                before_at is not None
+                and before_id is not None
+                and not (
+                    incident_at < before_at
+                    or (incident_at == before_at and item.id.int < before_id.int)
+                )
+            ):
+                continue
+            incidents.append(
+                TransferIncidentRecord(
+                    transfer=transfer,
+                    item=item,
+                    incident_at=incident_at,
+                    source_connection=self.connections.get(transfer.source_connection_id),
+                    destination_connection=self.connections.get(transfer.destination_connection_id),
+                )
+            )
+        incidents.sort(key=lambda row: (row.incident_at, row.item.id.int), reverse=True)
+        return incidents[: max(1, min(limit, 101))]
+
+    async def acount_transfer_incidents(self, requested_by: uuid.UUID | None) -> dict[str, int]:
+        counts = {"failed": 0, "omitted": 0}
+        for (transfer_id, _), item in self.transfer_manifest_items.items():
+            transfer = self.transfers.get(transfer_id)
+            if transfer is None or (
+                requested_by is not None and transfer.requested_by != requested_by
+            ):
+                continue
+            if item.is_dir:
+                continue
+            if item.status == "FAILED":
+                counts["failed"] += 1
+            if item.status == "SKIPPED" and item.omission_kind is not None and item.omitted_at:
+                counts["omitted"] += 1
+        return counts
+
     async def acreate_transfer(
         self,
         requested_by: uuid.UUID,
@@ -1189,9 +1315,102 @@ class MemoryStore:
         record = self.transfers.get(transfer_id)
         return replace(record, idempotent_replay=True) if record is not None else None
 
-    async def asave_transfer(self, transfer: TransferRecord) -> None:
+    async def alist_transfer_pause_capabilities(
+        self, transfer_ids: Iterable[uuid.UUID]
+    ) -> dict[uuid.UUID, tuple[bool, str | None]]:
+        capabilities: dict[uuid.UUID, tuple[bool, str | None]] = {}
+        for transfer_id in transfer_ids:
+            transfer = self.transfers.get(transfer_id)
+            if transfer is None:
+                continue
+            source = self.connections.get(transfer.source_connection_id)
+            destination = self.connections.get(transfer.destination_connection_id)
+            unstarted = transfer.status in {"QUEUED", "SCHEDULED"} and (
+                transfer.execution_started_at is None
+            )
+            supported = bool(
+                unstarted
+                or transfer.conflict_policy == "KEEP_BOTH"
+                or (source is not None and source.provider_type == "SMB")
+                or (
+                    source is not None
+                    and destination is not None
+                    and source.provider_type == destination.provider_type == "MOCK"
+                )
+            )
+            unavailable = (
+                "LEGACY_BULK_EXECUTION"
+                if not supported
+                and (
+                    transfer.status in {"VALIDATING", "RUNNING", "RETRYING"}
+                    or transfer.execution_started_at is not None
+                )
+                else None
+            )
+            capabilities[transfer_id] = supported, unavailable
+        return capabilities
+
+    async def asave_transfer(
+        self,
+        transfer: TransferRecord,
+        *,
+        expected_dispatch_token: uuid.UUID | None = None,
+    ) -> bool:
+        current = self.transfers.get(transfer.id)
+        if expected_dispatch_token is not None and (
+            current is None or current.dispatch_token != expected_dispatch_token
+        ):
+            return False
+        preserve_status = False
+        if current is not None:
+            if current.status in _TERMINAL_TRANSFER_STATUSES and current is not transfer:
+                return False
+            if transfer.attempt_count < current.attempt_count:
+                return False
+            if current.status == "PAUSING" and transfer.status not in {
+                "PAUSING",
+                *_TERMINAL_TRANSFER_STATUSES,
+            }:
+                preserve_status = True
+            elif current.status == "PAUSED" and transfer.status not in {
+                "PAUSED",
+                "QUEUED",
+                "SCHEDULED",
+            }:
+                return False
+            elif (
+                current.status == "CANCELLING"
+                and transfer.status != "CANCELLING"
+                and transfer.status not in _TERMINAL_TRANSFER_STATUSES
+            ):
+                preserve_status = True
+            if not preserve_status and _TRANSFER_STATUS_RANK.get(
+                transfer.status, -1
+            ) < _TRANSFER_STATUS_RANK.get(current.status, -1):
+                return False
+            if preserve_status:
+                transfer.status = current.status
+                transfer.cancel_requested_at = current.cancel_requested_at
+                transfer.pause_requested_at = current.pause_requested_at
+                transfer.paused_at = current.paused_at
+        if transfer.status in _TERMINAL_TRANSFER_STATUSES:
+            transfer.pause_requested_at = None
+            transfer.paused_at = None
+            transfer.cancel_requested_at = None
+        if transfer.cancel_requested_at is not None and transfer.status not in (
+            _TERMINAL_TRANSFER_STATUSES
+        ):
+            transfer.status = "CANCELLING"
+        elif transfer.pause_requested_at is not None and transfer.status not in (
+            _TERMINAL_TRANSFER_STATUSES
+        ):
+            transfer.status = "PAUSING"
+        transfer.state_version = (
+            current.state_version + 1 if current is not None else transfer.state_version + 1
+        )
         self.transfers[transfer.id] = transfer
         self._ensure_notification_outbox(transfer)
+        return True
 
     def _ensure_notification_outbox(self, transfer: TransferRecord) -> None:
         if not transfer.send_email_notification or transfer.status not in {
@@ -1446,9 +1665,7 @@ class MemoryStore:
                     parent.status if parent else "FAILED",
                     parent_omitted_count=parent_omitted_count,
                     parent_attempt_count=parent.attempt_count if parent else 1,
-                    accepted_parent_omissions_attempt=(
-                        transfer.accepted_parent_omissions_attempt
-                    ),
+                    accepted_parent_omissions_attempt=(transfer.accepted_parent_omissions_attempt),
                 )
             if parent_wait is not None:
                 evaluation.status = "WAITING_PARENT"
@@ -1457,9 +1674,7 @@ class MemoryStore:
                 evaluation.safe_message = dependency_wait_message(parent_wait)
                 transfer.wait_reason = parent_wait
             else:
-                transfer.wait_reason = (
-                    "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
-                )
+                transfer.wait_reason = "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
         return transfer
 
     async def acancel_transfer(
@@ -1474,8 +1689,13 @@ class MemoryStore:
         }:
             return None, False
         transfer.cancel_requested_at = now.astimezone(UTC)
-        if transfer.status in {"QUEUED", "SCHEDULED"} and transfer.execution_started_at is None:
+        if (
+            transfer.status in {"QUEUED", "SCHEDULED", "PAUSED"}
+            and transfer.execution_started_at is None
+        ):
             transfer.status = "CANCELLED"
+            transfer.pause_requested_at = None
+            transfer.paused_at = None
             transfer.completed_at = now.astimezone(UTC)
             transfer.wait_reason = None
             transfer.dispatch_token = None
@@ -1484,12 +1704,136 @@ class MemoryStore:
             self._ensure_notification_outbox(transfer)
             return transfer, False
         transfer.status = "CANCELLING"
+        transfer.state_version += 1
         return transfer, True
+
+    async def apause_transfer(
+        self, transfer_id: uuid.UUID, now: datetime
+    ) -> tuple[TransferRecord | None, bool]:
+        transfer = self.transfers.get(transfer_id)
+        if transfer is None or transfer.status in {
+            "COMPLETED",
+            "COMPLETED_WITH_WARNINGS",
+            "FAILED",
+            "CANCELLED",
+        }:
+            return None, False
+        if transfer.status in {"PAUSING", "PAUSED"}:
+            return transfer, transfer.status == "PAUSING"
+        if transfer.status == "CANCELLING" or transfer.cancel_requested_at is not None:
+            return None, False
+
+        timestamp = now.astimezone(UTC)
+        if transfer.status in {"QUEUED", "SCHEDULED"} and transfer.execution_started_at is None:
+            transfer.status = "PAUSED"
+            transfer.paused_at = timestamp
+            transfer.pause_requested_at = None
+            transfer.current_item = None
+            transfer.current_speed_bps = None
+            transfer.wait_reason = None
+            transfer.dispatch_token = None
+            transfer.dispatch_claimed_at = None
+            transfer.execution_heartbeat_at = None
+            needs_worker = False
+        else:
+            is_active_execution = transfer.status in {"VALIDATING", "RUNNING", "RETRYING"} or (
+                transfer.status == "QUEUED" and transfer.execution_started_at is not None
+            )
+            if not is_active_execution:
+                return None, False
+            source = self.connections.get(transfer.source_connection_id)
+            destination = self.connections.get(transfer.destination_connection_id)
+            supports_boundary = bool(
+                transfer.conflict_policy == "KEEP_BOTH"
+                or (source is not None and source.provider_type == "SMB")
+                or (
+                    source is not None
+                    and destination is not None
+                    and source.provider_type == destination.provider_type == "MOCK"
+                )
+            )
+            if not supports_boundary:
+                return None, False
+            transfer.status = "PAUSING"
+            transfer.pause_requested_at = timestamp
+            needs_worker = True
+        transfer.state_version += 1
+        return transfer, needs_worker
+
+    async def acheck_transfer_execution_control(
+        self,
+        transfer_id: uuid.UUID,
+        dispatch_token: uuid.UUID | None,
+        next_item_path: str,
+    ) -> str:
+        transfer = self.transfers.get(transfer_id)
+        if transfer is None:
+            return "lost"
+        if dispatch_token is not None and transfer.dispatch_token != dispatch_token:
+            return "lost"
+        if transfer.cancel_requested_at is not None or transfer.status == "CANCELLING":
+            return "cancel"
+        if transfer.pause_requested_at is not None or transfer.status == "PAUSING":
+            return "pause"
+        transfer.current_item = next_item_path
+        return "continue"
+
+    async def acomplete_transfer_pause(
+        self,
+        transfer_id: uuid.UUID,
+        dispatch_token: uuid.UUID | None,
+        now: datetime,
+    ) -> TransferRecord | None:
+        transfer = self.transfers.get(transfer_id)
+        if transfer is None:
+            return None
+        if dispatch_token is not None and transfer.dispatch_token != dispatch_token:
+            return None
+        if transfer.status == "CANCELLING" and transfer.cancel_requested_at is not None:
+            transfer.status = "CANCELLED"
+            transfer.completed_at = now.astimezone(UTC)
+            transfer.cancel_requested_at = None
+            self._ensure_notification_outbox(transfer)
+        elif transfer.status == "PAUSING" and transfer.cancel_requested_at is None:
+            transfer.status = "PAUSED"
+            transfer.paused_at = now.astimezone(UTC)
+        else:
+            return None
+        transfer.pause_requested_at = None
+        transfer.current_item = None
+        transfer.current_speed_bps = None
+        transfer.estimated_remaining_seconds = None
+        transfer.dispatch_token = None
+        transfer.dispatch_claimed_at = None
+        transfer.execution_started_at = None
+        transfer.execution_heartbeat_at = None
+        transfer.wait_reason = None
+        transfer.state_version += 1
+        return transfer
 
     async def aresume_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
         transfer = self.transfers.get(transfer_id)
-        if transfer is None or transfer.status not in {"FAILED", "CANCELLED"}:
+        if transfer is None or transfer.status not in {"FAILED", "CANCELLED", "PAUSED"}:
             return None
+        if transfer.status == "PAUSED":
+            timestamp = datetime.now(UTC)
+            scheduled_at = transfer.scheduled_at
+            if scheduled_at is not None and scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=UTC)
+            transfer.status = (
+                "SCHEDULED" if scheduled_at is not None and scheduled_at > timestamp else "QUEUED"
+            )
+            transfer.pause_requested_at = None
+            transfer.paused_at = None
+            transfer.completed_at = None
+            transfer.wait_reason = "WAITING_UNTIL" if transfer.status == "SCHEDULED" else None
+            transfer.dispatch_token = None
+            transfer.dispatch_claimed_at = None
+            transfer.execution_started_at = None
+            transfer.execution_heartbeat_at = None
+            transfer.cancel_requested_at = None
+            transfer.state_version += 1
+            return transfer
         transfer.status = "QUEUED"
         transfer.attempt_count += 1
         transfer.completed_at = None
@@ -1502,6 +1846,7 @@ class MemoryStore:
         transfer.execution_started_at = None
         transfer.execution_heartbeat_at = None
         transfer.cancel_requested_at = None
+        transfer.state_version += 1
         return transfer
 
     async def aaccept_parent_omissions(
@@ -1571,10 +1916,7 @@ class MemoryStore:
                 or child.execution_started_at is not None
                 or child.execution_heartbeat_at is not None
                 or child.cancel_requested_at is not None
-                or (
-                    execution_lock := self._transfer_execution_locks.get(child_id)
-                )
-                is not None
+                or (execution_lock := self._transfer_execution_locks.get(child_id)) is not None
                 and execution_lock.locked()
             ):
                 raise TransferRecoveryConflictError("Child transfer execution is still active")
@@ -1709,10 +2051,7 @@ class MemoryStore:
                 or transfer.dispatch_claimed_at is not None
                 or transfer.execution_started_at is not None
                 or transfer.execution_heartbeat_at is not None
-                or (
-                    execution_lock := self._transfer_execution_locks.get(transfer_id)
-                )
-                is not None
+                or (execution_lock := self._transfer_execution_locks.get(transfer_id)) is not None
                 and execution_lock.locked()
             ):
                 raise TransferRecoveryConflictError("Transfer execution is still active")
@@ -1759,9 +2098,7 @@ class MemoryStore:
                 if key[0] == transfer_id and candidate.id in set(item_ids)
             ]
             previous_transfer = replace(transfer)
-            previous_items = {
-                key: replace(self.transfer_manifest_items[key]) for key in keys
-            }
+            previous_items = {key: replace(self.transfer_manifest_items[key]) for key in keys}
             event_count = len(self.transfer_events.get(transfer_id, []))
             audit_count = len(self.audit_events)
             old_attempt = transfer.attempt_count
@@ -1917,10 +2254,7 @@ class MemoryStore:
                 or transfer.dispatch_claimed_at is not None
                 or transfer.execution_started_at is not None
                 or transfer.execution_heartbeat_at is not None
-                or (
-                    execution_lock := self._transfer_execution_locks.get(transfer_id)
-                )
-                is not None
+                or (execution_lock := self._transfer_execution_locks.get(transfer_id)) is not None
                 and execution_lock.locked()
             ):
                 raise TransferRecoveryConflictError("Transfer execution is still active")
@@ -1951,9 +2285,7 @@ class MemoryStore:
             if source_file_error_policy is not None:
                 policy = normalize_source_file_error_policy(source_file_error_policy)
                 if policy != "STOP":
-                    raise TransferRecoveryConflictError(
-                        "Automatic source omission is not enabled"
-                    )
+                    raise TransferRecoveryConflictError("Automatic source omission is not enabled")
 
             all_items = [
                 candidate
@@ -2158,8 +2490,7 @@ class MemoryStore:
             (
                 transfer
                 for transfer in self.transfers.values()
-                if transfer.status in {"SCHEDULED", "QUEUED"}
-                and transfer.dispatch_token is None
+                if transfer.status in {"SCHEDULED", "QUEUED"} and transfer.dispatch_token is None
             ),
             key=lambda transfer: (
                 transfer.scheduled_at or transfer.created_at,
@@ -2198,9 +2529,7 @@ class MemoryStore:
                     parent.status if parent else "FAILED",
                     parent_omitted_count=parent_omitted_count,
                     parent_attempt_count=parent.attempt_count if parent else 1,
-                    accepted_parent_omissions_attempt=(
-                        transfer.accepted_parent_omissions_attempt
-                    ),
+                    accepted_parent_omissions_attempt=(transfer.accepted_parent_omissions_attempt),
                 )
                 if parent_wait is not None:
                     wait_reason_changed = transfer.wait_reason != parent_wait
@@ -2222,8 +2551,7 @@ class MemoryStore:
                         evaluation.safe_message = dependency_wait_message(parent_wait)
                     elif transfer.evaluation is not None and (
                         transfer.evaluation.safe_error_code != dependency_error_code(parent_wait)
-                        or transfer.evaluation.safe_message
-                        != dependency_wait_message(parent_wait)
+                        or transfer.evaluation.safe_message != dependency_wait_message(parent_wait)
                         or wait_reason_changed
                     ):
                         transfer.evaluation.safe_error_code = dependency_error_code(parent_wait)
@@ -2375,6 +2703,7 @@ class MemoryStore:
                 size_bytes=entry.get("size_bytes"),
                 modified_at=entry.get("modified_at"),
                 status="DIRECTORY" if is_dir else "PENDING",
+                updated_at=datetime.now(UTC),
             )
             inserted += 1
         files = [
@@ -2480,6 +2809,15 @@ class MemoryStore:
             and PurePosixPath(item.source_path).name == basename
         )
 
+    async def acount_transfer_manifest_basename_matches_bulk(
+        self, candidates: list[tuple[uuid.UUID, str]]
+    ) -> dict[tuple[uuid.UUID, str], int]:
+        unique = set(candidates)
+        return {
+            candidate: await self.acount_transfer_manifest_basename_matches(*candidate)
+            for candidate in unique
+        }
+
     async def aupdate_transfer_manifest_item(
         self,
         transfer_id: uuid.UUID,
@@ -2530,6 +2868,7 @@ class MemoryStore:
         item.status = status
         item.verified_by = verified_by
         item.error_code = error_code
+        item.updated_at = datetime.now(UTC)
         if status == "FAILED":
             item.last_failure_stage = failure_stage
             item.last_failure_attempt = failure_attempt
@@ -2643,6 +2982,18 @@ class MemoryStore:
 
     async def alist_transfer_events(self, transfer_job_id: uuid.UUID) -> list[dict[str, Any]]:
         return list(self.transfer_events.get(transfer_job_id, []))
+
+    async def alist_transfer_failure_diagnostics(
+        self, transfer_ids: set[uuid.UUID]
+    ) -> dict[uuid.UUID, list[dict[str, Any]]]:
+        return {
+            transfer_id: [
+                event
+                for event in self.transfer_events.get(transfer_id, [])
+                if event.get("event_type") == "FAILURE_DIAGNOSTIC"
+            ]
+            for transfer_id in transfer_ids
+        }
 
     async def aadd_audit_event(
         self,

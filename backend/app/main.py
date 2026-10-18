@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -90,6 +91,26 @@ logger = logging.getLogger(__name__)
 @lru_cache(maxsize=1)
 def _dummy_password_hash() -> str:
     return PasswordService().hash(secrets.token_urlsafe(32))
+
+
+def encode_transfer_incident_cursor(occurred_at: datetime, item_id: uuid.UUID) -> str:
+    payload = f"{occurred_at.astimezone(UTC).isoformat()}|{item_id}"
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_transfer_incident_cursor(value: str | None) -> tuple[datetime, uuid.UUID] | None:
+    if value is None:
+        return None
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True).decode("utf-8")
+        timestamp, item_id = decoded.split("|", maxsplit=1)
+        occurred_at = datetime.fromisoformat(timestamp)
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("Cursor timestamp must include a timezone")
+        return occurred_at.astimezone(UTC), uuid.UUID(item_id)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="Cursor de incidencias inválido") from exc
 
 
 class LoginRequest(BaseModel):
@@ -514,7 +535,18 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         record.events.append(data)
         return data
 
+    async def attach_pause_capabilities(records: list[TransferRecord]) -> None:
+        capabilities = await app.state.store.alist_transfer_pause_capabilities(
+            [record.id for record in records]
+        )
+        for record in records:
+            capability = capabilities.get(record.id)
+            if capability is not None:
+                record.pause_supported, record.pause_unavailable_reason = capability
+
     async def publish_transfer(record: TransferRecord) -> None:
+        if record.pause_supported is None:
+            await attach_pause_capabilities([record])
         record.manifest_summary = (
             await app.state.store.alist_transfer_manifest_summaries([record.id])
         )[record.id]
@@ -641,9 +673,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             from app.worker import celery_app
 
             inspector = celery_app.control.inspect(timeout=1)
-            active_queues = (
-                await asyncio.to_thread(inspector.active_queues) if inspector else None
-            )
+            active_queues = await asyncio.to_thread(inspector.active_queues) if inspector else None
             notification_queue_ready = any(
                 isinstance(queue, dict) and queue.get("name") == "notifications"
                 for queues in (active_queues or {}).values()
@@ -665,9 +695,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             from app.worker import celery_app
 
             inspector = celery_app.control.inspect(timeout=1)
-            active_queues = (
-                await asyncio.to_thread(inspector.active_queues) if inspector else None
-            )
+            active_queues = await asyncio.to_thread(inspector.active_queues) if inspector else None
             evaluation_queue_ready = any(
                 isinstance(queue, dict) and queue.get("name") == "evaluations"
                 for queues in (active_queues or {}).values()
@@ -743,9 +771,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 result="FAILURE",
             )
             raise invalid
-        updated_user = await app.state.store.arecord_login_success(
-            user.id, user.password_hash, now
-        )
+        updated_user = await app.state.store.arecord_login_success(user.id, user.password_hash, now)
         if updated_user is None:
             await audit_request(
                 request,
@@ -952,9 +978,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=422, detail="No hay cambios para aplicar")
         if admin.id == user_id and payload.is_active is False:
             raise HTTPException(status_code=409, detail="No puedes desactivar tu propia cuenta")
-        changes: dict[str, str | bool] = payload.model_dump(
-            exclude_unset=True, exclude_none=True
-        )
+        changes: dict[str, str | bool] = payload.model_dump(exclude_unset=True, exclude_none=True)
         if "username" in changes:
             changes["username"] = str(changes["username"]).strip().casefold()
         if "email" in changes:
@@ -1793,9 +1817,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         try:
             if payload.depends_on_transfer_id is not None:
                 parent = await app.state.store.aget_transfer(payload.depends_on_transfer_id)
-                if parent is None or (
-                    parent.requested_by != user.id and user.role != "ADMIN"
-                ):
+                if parent is None or (parent.requested_by != user.id and user.role != "ADMIN"):
                     raise HTTPException(status_code=404, detail="Transferencia padre no encontrada")
             record = await app.state.store.acreate_transfer(
                 user.id,
@@ -2046,9 +2068,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             )
         if payload.depends_on_transfer_id is not None:
             parent = await app.state.store.aget_transfer(payload.depends_on_transfer_id)
-            if parent is None or (
-                parent.requested_by != user.id and user.role != "ADMIN"
-            ):
+            if parent is None or (parent.requested_by != user.id and user.role != "ADMIN"):
                 raise HTTPException(status_code=404, detail="Transferencia padre no encontrada")
         try:
             updated = await app.state.store.aupdate_transfer_schedule(
@@ -2064,8 +2084,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "La transferencia ya está admitida para ejecución "
-                    "y no se puede reprogramar."
+                    "La transferencia ya está admitida para ejecución y no se puede reprogramar."
                 ),
             )
         await publish_transfer(updated)
@@ -2080,9 +2099,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 "scheduled_at": updated.scheduled_at.isoformat() if updated.scheduled_at else None,
                 "execution_mode": updated.execution_mode,
                 "depends_on_transfer_id": (
-                    str(updated.depends_on_transfer_id)
-                    if updated.depends_on_transfer_id
-                    else None
+                    str(updated.depends_on_transfer_id) if updated.depends_on_transfer_id else None
                 ),
             },
         )
@@ -2094,6 +2111,149 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             except Exception:
                 pass
         return cast(dict[str, Any], updated.public_dict())
+
+    @app.get("/api/v1/transfer-incidents")
+    async def list_transfer_incidents(
+        kind: Literal["failed", "omitted"] = Query(default="failed"),
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=256),
+        user: UserAccount = Depends(current_user),
+    ) -> dict[str, Any]:
+        decoded_cursor = decode_transfer_incident_cursor(cursor)
+        before_at, before_id = decoded_cursor if decoded_cursor else (None, None)
+        requested_by = None if user.role == "ADMIN" else user.id
+        counts = await app.state.store.acount_transfer_incidents(requested_by)
+        incidents = await app.state.store.alist_transfer_incidents(
+            requested_by,
+            kind=kind,
+            before_at=before_at,
+            before_id=before_id,
+            limit=limit + 1,
+        )
+        has_more = len(incidents) > limit
+        incidents = incidents[:limit]
+        transfer_ids = {incident.transfer.id for incident in incidents}
+        failure_events = await app.state.store.alist_transfer_failure_diagnostics(transfer_ids)
+        failed_candidates = [
+            (incident.transfer.id, PurePosixPath(incident.item.source_path).name)
+            for incident in incidents
+            if incident.item.status == "FAILED"
+        ]
+        basename_counts = await app.state.store.acount_transfer_manifest_basename_matches_bulk(
+            failed_candidates
+        )
+        connection_ids = {
+            connection.id
+            for incident in incidents
+            for connection in (incident.source_connection, incident.destination_connection)
+            if connection is not None
+        }
+        accessible_ids = (
+            connection_ids
+            if user.role == "ADMIN"
+            else await app.state.store.alist_accessible_connection_ids(user.id, connection_ids)
+        )
+
+        public_items = []
+        for incident in incidents:
+            transfer = incident.transfer
+            item = incident.item
+            source = incident.source_connection
+            destination = incident.destination_connection
+            transfer.source_provider_type = source.provider_type if source else None
+            basename = PurePosixPath(item.source_path).name
+            failure_stage, failure_attempt, failure_retryable = resolve_failure_evidence(
+                transfer,
+                item,
+                failure_events.get(transfer.id, []),
+                basename_matches=basename_counts.get((transfer.id, basename), 0),
+            )
+            unavailable_reason = skip_unavailable_reason(
+                transfer,
+                item,
+                failure_stage=failure_stage,
+                failure_attempt=failure_attempt,
+                failure_retryable=failure_retryable,
+            )
+            if unavailable_reason is None:
+                if source is None or destination is None:
+                    unavailable_reason = "CONNECTION_UNAVAILABLE"
+                elif source.status != "ACTIVE" or destination.status != "ACTIVE":
+                    unavailable_reason = "CONNECTION_INACTIVE"
+                elif (
+                    source.credential_version != transfer.source_credential_version
+                    or destination.credential_version != transfer.destination_credential_version
+                ):
+                    unavailable_reason = "CREDENTIALS_CHANGED"
+                elif source.id not in accessible_ids or destination.id not in accessible_ids:
+                    unavailable_reason = "CONNECTION_ACCESS_CHANGED"
+
+            can_retry_omission = bool(
+                transfer.status in {"FAILED", "CANCELLED", "COMPLETED_WITH_WARNINGS"}
+                and not item.is_dir
+                and item.status == "SKIPPED"
+                and item.omission_kind is not None
+                and item.omitted_at is not None
+                and not item.copy_started
+                and transfer.dispatch_token is None
+                and transfer.dispatch_claimed_at is None
+                and transfer.execution_started_at is None
+                and transfer.execution_heartbeat_at is None
+                and source is not None
+                and destination is not None
+                and source.status == "ACTIVE"
+                and destination.status == "ACTIVE"
+                and source.credential_version == transfer.source_credential_version
+                and destination.credential_version == transfer.destination_credential_version
+                and source.id in accessible_ids
+                and destination.id in accessible_ids
+            )
+            public_items.append(
+                {
+                    "transfer": {
+                        "id": str(transfer.id),
+                        "public_id": transfer.public_id,
+                        "status": transfer.status,
+                        "attempt_count": transfer.attempt_count,
+                        "source_connection": {
+                            "name": source.name,
+                            "provider_type": source.provider_type,
+                        }
+                        if source
+                        else None,
+                        "destination_connection": {
+                            "name": destination.name,
+                            "provider_type": destination.provider_type,
+                        }
+                        if destination
+                        else None,
+                    },
+                    "item": {
+                        "id": str(item.id),
+                        "source_path": item.source_path,
+                        "destination_path": item.destination_path,
+                        "requested_destination_path": item.requested_destination_path,
+                        "rename_reason": item.rename_reason,
+                        "status": item.status,
+                        "size_bytes": item.size_bytes,
+                        "error_code": item.error_code,
+                        "failure_stage": failure_stage,
+                        "omission_kind": item.omission_kind,
+                        "omitted_at": item.omitted_at.isoformat() if item.omitted_at else None,
+                        "incident_at": incident.incident_at.isoformat(),
+                    },
+                    "can_skip": unavailable_reason is None,
+                    "skip_unavailable_reason": unavailable_reason,
+                    "can_retry_omission": can_retry_omission,
+                }
+            )
+
+        next_cursor = (
+            encode_transfer_incident_cursor(incidents[-1].incident_at, incidents[-1].item.id)
+            if has_more and incidents
+            else None
+        )
+        return {"items": public_items, "counts": counts, "next_cursor": next_cursor}
 
     @app.get("/api/v1/transfers")
     async def list_transfers(
@@ -2113,6 +2273,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             background_only=background_only,
             exclude_background=exclude_background,
         )
+        await attach_pause_capabilities(page_records)
         summaries = await app.state.store.alist_transfer_manifest_summaries(
             [record.id for record in page_records]
         )
@@ -2142,6 +2303,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         transfer_id: uuid.UUID, user: UserAccount = Depends(current_user)
     ) -> dict[str, Any]:
         record = await visible_transfer(transfer_id, user)
+        await attach_pause_capabilities([record])
         record.manifest_summary = (
             await app.state.store.alist_transfer_manifest_summaries([record.id])
         )[record.id]
@@ -2204,6 +2366,84 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             },
         )
 
+    @app.post("/api/v1/transfers/{transfer_id}/pause", status_code=status.HTTP_202_ACCEPTED)
+    async def pause_transfer(
+        transfer_id: uuid.UUID,
+        request: Request,
+        user: UserAccount = Depends(current_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        record = await visible_transfer(transfer_id, user)
+        if record.status not in {"PAUSED", "PAUSING"}:
+            source = await app.state.store.aget_connection(record.source_connection_id)
+            destination = await app.state.store.aget_connection(record.destination_connection_id)
+            if source is None or destination is None:
+                raise HTTPException(status_code=409, detail="No se encontraron las conexiones")
+            unstarted = (
+                record.status in {"QUEUED", "SCHEDULED"} and record.execution_started_at is None
+            )
+            supports_boundary_pause = (
+                record.conflict_policy == "KEEP_BOTH"
+                or source.provider_type == "SMB"
+                or (source.provider_type == destination.provider_type == "MOCK")
+            )
+            if not unstarted and not supports_boundary_pause:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "LEGACY_BULK_EXECUTION",
+                        "message": (
+                            "Esta ejecución no tiene límites verificables entre archivos; "
+                            "puede cancelarla o dejar que termine."
+                        ),
+                    },
+                )
+        paused, needs_worker = await app.state.store.apause_transfer(transfer_id, datetime.now(UTC))
+        if paused is None:
+            latest = await app.state.store.aget_transfer(transfer_id)
+            if latest is not None:
+                await attach_pause_capabilities([latest])
+                if latest.pause_unavailable_reason is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": latest.pause_unavailable_reason,
+                            "message": (
+                                "La transferencia pasó a una ejecución sin límites seguros "
+                                "entre archivos."
+                            ),
+                        },
+                    )
+            raise HTTPException(status_code=409, detail="La transferencia ya no se puede pausar")
+        await publish_transfer(paused)
+        if paused.status not in {"PAUSING", "PAUSED"}:
+            raise HTTPException(status_code=409, detail="La transferencia ya no se puede pausar")
+        if paused.status == "PAUSING" and needs_worker and app.state.event_bus:
+            try:
+                await app.state.event_bus.publish_progress(
+                    str(paused.id),
+                    {
+                        **paused.public_dict(),
+                        "job_id": str(paused.id),
+                        "current_speed_bps": paused.current_speed_bps,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    },
+                )
+            except Exception:
+                # PostgreSQL stores the request; the boundary checkpoint reads it directly.
+                pass
+        await audit_request(
+            request,
+            actor_user_id=user.id,
+            action="TRANSFER_PAUSE_REQUESTED",
+            resource_type="transfer",
+            resource_id=str(paused.id),
+            result="SUCCESS",
+            metadata={"public_id": paused.public_id, "status": paused.status},
+        )
+        return cast(dict[str, Any], paused.public_dict())
+
     @app.post("/api/v1/transfers/{transfer_id}/resume", status_code=status.HTTP_202_ACCEPTED)
     async def resume_transfer(
         transfer_id: uuid.UUID,
@@ -2215,7 +2455,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         del payload
         del user_csrf
         record = await visible_transfer(transfer_id, user)
-        if record.status not in {"FAILED", "CANCELLED"}:
+        if record.status not in {"FAILED", "CANCELLED", "PAUSED"}:
             raise HTTPException(status_code=409, detail="La transferencia no se puede reanudar")
         if record.source_credential_version < 1 or record.destination_credential_version < 1:
             raise HTTPException(
@@ -2251,7 +2491,11 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 if not await app.state.store.ahas_connection_access(user.id, connection_id):
                     raise HTTPException(status_code=404, detail="Transferencia no encontrada")
         counts = await app.state.store.aget_transfer_manifest_counts(record.id)
-        if counts["pending"] == 0 and counts["failed"] == 0:
+        if (
+            counts["pending"] == 0
+            and counts["failed"] == 0
+            and not (record.status == "PAUSED" and counts.get("total", 0) == 0)
+        ):
             raise HTTPException(status_code=409, detail="No hay elementos pendientes para reanudar")
 
         resumed = await app.state.store.aresume_transfer(transfer_id)
@@ -2455,10 +2699,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         await publish_transfer(accepted)
         if config.app_env.lower() == "production":
             try:
-                if (
-                    accepted.evaluation is not None
-                    and accepted.evaluation.status == "PENDING"
-                ):
+                if accepted.evaluation is not None and accepted.evaluation.status == "PENDING":
                     from app.worker import dispatch_pending_evaluations
 
                     dispatch_pending_evaluations.delay()
@@ -2505,6 +2746,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 # Subscribe first, then take a fresh snapshot. Any transition before the
                 # subscription is reflected in this read; later transitions are buffered.
                 snapshot = await visible_transfer(transfer_id, user)
+                await attach_pause_capabilities([snapshot])
                 snapshot.manifest_summary = (
                     await app.state.store.alist_transfer_manifest_summaries([snapshot.id])
                 )[snapshot.id]
@@ -2515,6 +2757,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                     "COMPLETED_WITH_WARNINGS",
                     "FAILED",
                     "CANCELLED",
+                    "PAUSED",
                 }:
                     return
                 while True:
@@ -2545,6 +2788,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                         "COMPLETED_WITH_WARNINGS",
                         "FAILED",
                         "CANCELLED",
+                        "PAUSED",
                     }:
                         return
             finally:

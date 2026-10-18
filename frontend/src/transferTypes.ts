@@ -39,6 +39,11 @@ export type TransferRecord = {
   depends_on_transfer_id?: string | null;
   accepted_parent_omissions_attempt?: number | null;
   wait_reason?: string | null;
+  pause_requested_at?: string | null;
+  paused_at?: string | null;
+  state_version?: number;
+  pause_supported?: boolean;
+  pause_unavailable_reason?: string | null;
   can_edit_schedule?: boolean;
   evaluation?: TransferEvaluation;
   manifest_summary?: TransferManifestSummary;

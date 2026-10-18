@@ -3,6 +3,7 @@ import shutil
 import smtplib
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -173,8 +174,11 @@ async def test_progress_publish_failure_does_not_fail_a_completed_transfer(monke
         async def transfer_execution_lock(self, _transfer_id):
             yield True
 
-        async def astart_transfer_dispatch(self, _transfer_id, _token, _now):
+        async def astart_transfer_dispatch(self, transfer_id, token, now):
             reservation["active"] = True
+            transfer = self.transfers[transfer_id]
+            transfer.dispatch_token = token
+            transfer.execution_started_at = now
             return True
 
         async def afinish_transfer_dispatch(self, _transfer_id, _token):
@@ -218,6 +222,79 @@ async def test_progress_publish_failure_does_not_fail_a_completed_transfer(monke
     assert (await store.aget_transfer(transfer.id)).status == "COMPLETED"
     assert reservation["active_when_completed_was_published"] is True
     assert reservation["active"] is False
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_publish_progress_after_dispatch_token_is_replaced(monkeypatch):
+    tokens = {"replacement": None}
+    published_events = []
+
+    class WorkerStore(MemoryStore):
+        @asynccontextmanager
+        async def transfer_execution_lock(self, _transfer_id):
+            yield True
+
+        async def astart_transfer_dispatch(self, transfer_id, token, now):
+            transfer = self.transfers[transfer_id]
+            transfer.dispatch_token = token
+            transfer.execution_started_at = now
+            return True
+
+        async def afinish_transfer_dispatch(self, transfer_id, token):
+            transfer = self.transfers[transfer_id]
+            if transfer.dispatch_token == token:
+                transfer.dispatch_token = None
+                transfer.execution_started_at = None
+
+        async def aclose(self):
+            return None
+
+    class EventBus:
+        def __init__(self, _client):
+            pass
+
+        async def publish_progress(self, _transfer_id, event):
+            published_events.append(event)
+
+        async def clear_cancel(self, _transfer_id):
+            return None
+
+        async def aclose(self):
+            return None
+
+    class StaleExecutor:
+        def __init__(self, _settings, store, publish, _should_cancel, **_kwargs):
+            self.store = store
+            self.publish = publish
+
+        async def execute(self, transfer_id):
+            stale = replace(await self.store.aget_transfer(transfer_id))
+            stale.status = "RUNNING"
+            stale.bytes_transferred = 500
+            replacement = uuid.uuid4()
+            self.store.transfers[transfer_id].dispatch_token = replacement
+            tokens["replacement"] = replacement
+            await self.publish(stale)
+            return False
+
+    store = WorkerStore()
+    user = store.add_user("stale-worker", "stale-worker@example.test", "hash")
+    source = store.create_connection("Source", "MOCK", user.id)
+    destination = store.create_connection("Destination", "MOCK", user.id)
+    transfer = store.create_transfer(user.id, source.id, destination.id, ["/source.txt"], "/dest")
+    monkeypatch.setattr(worker, "get_settings", lambda: Settings())
+    monkeypatch.setattr(worker, "DatabaseStore", lambda _settings: store)
+    monkeypatch.setattr(worker.Redis, "from_url", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(worker, "RedisEventBus", EventBus)
+    monkeypatch.setattr(worker, "TransferExecutor", StaleExecutor)
+
+    await worker._execute_transfer(transfer.id, uuid.uuid4())
+
+    current = await store.aget_transfer(transfer.id)
+    assert published_events == []
+    assert current.status == "QUEUED"
+    assert current.bytes_transferred == 0
+    assert current.dispatch_token == tokens["replacement"]
 
 
 @pytest.mark.asyncio
@@ -266,7 +343,7 @@ async def test_worker_keeps_reservation_until_failed_staging_cleanup_finishes(
             return None
 
     class CleanupFailingExecutor:
-        def __init__(self, current_settings, _store, _publish, _should_cancel):
+        def __init__(self, current_settings, _store, _publish, _should_cancel, **_kwargs):
             self.settings = current_settings
 
         async def execute(self, transfer_id):

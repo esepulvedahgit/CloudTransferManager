@@ -80,6 +80,8 @@ class TransferExecutor:
         *,
         runner: RcloneRunner | Any | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        dispatch_token: uuid.UUID | None = None,
+        defer_pause_finalize: bool = False,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -91,6 +93,11 @@ class TransferExecutor:
             settings.transfer_staging_path,
         )
         self.sleep = sleep
+        self.dispatch_token = dispatch_token
+        self.defer_pause_finalize = defer_pause_finalize
+
+    class _PauseAtFileBoundary(Exception):
+        """Raised after the current file has settled and before selecting another one."""
 
     class _PreflightError(Exception):
         def __init__(
@@ -104,28 +111,39 @@ class TransferExecutor:
             self.message = message
             self.technical_details = technical_details or {}
 
-    async def execute(self, transfer_id: uuid.UUID) -> None:
+    async def execute(self, transfer_id: uuid.UUID) -> bool:
         record = await self.store.aget_transfer(transfer_id)
         if record is None or record.status in self._terminal:
-            return
+            return False
         source = await self.store.aget_connection(record.source_connection_id)
         destination = await self.store.aget_connection(record.destination_connection_id)
         if source is None or destination is None:
             await self._fail(record, error_code="CONNECTION_NOT_FOUND")
-            return
+            return False
+        record.pause_supported = bool(
+            record.conflict_policy == "KEEP_BOTH"
+            or source.provider_type == "SMB"
+            or (source.provider_type == destination.provider_type == "MOCK")
+        )
+        record.pause_unavailable_reason = (
+            None if record.pause_supported else "LEGACY_BULK_EXECUTION"
+        )
 
         record.status = "VALIDATING"
         record.started_at = datetime.now(UTC)
         await self.publish(record)
         if await self.should_cancel():
             await self._cancel(record)
-            return
+            return False
         if source.provider_type == destination.provider_type == "MOCK":
-            await self._run_mock(record)
-            return
+            try:
+                await self._run_mock(record)
+            except self._PauseAtFileBoundary:
+                return await self._finish_pause_at_boundary(record)
+            return False
         if source.provider_type == "MOCK" or destination.provider_type == "MOCK":
             await self._fail(record, error_code="PROVIDER_PAIR_UNSUPPORTED")
-            return
+            return False
 
         uses_nextcloud = "NEXTCLOUD" in {source.provider_type, destination.provider_type}
         original_runner = self.runner
@@ -152,6 +170,8 @@ class TransferExecutor:
                     await self._run_versioned_copy(record, source, destination)
                 else:
                     await self._run_rclone(record, source, destination)
+        except self._PauseAtFileBoundary:
+            return await self._finish_pause_at_boundary(record)
         except (
             RcloneCancelledError,
             MegaCmdCancelledError,
@@ -201,6 +221,32 @@ class TransferExecutor:
             )
         finally:
             self.runner = original_runner
+        return False
+
+    async def _finish_pause_at_boundary(self, record: TransferRecord) -> bool:
+        if self.defer_pause_finalize:
+            return True
+        paused = await self.store.acomplete_transfer_pause(
+            record.id, self.dispatch_token, datetime.now(UTC)
+        )
+        if paused is not None:
+            await self.publish(paused)
+        return True
+
+    async def _checkpoint_file_boundary(self, record: TransferRecord, next_item_path: str) -> None:
+        checkpoint = getattr(self.store, "acheck_transfer_execution_control", None)
+        if checkpoint is None:
+            if await self.should_cancel():
+                raise RcloneCancelledError("Transfer cancelled")
+            return
+        decision = await checkpoint(record.id, self.dispatch_token, next_item_path)
+        if decision == "pause":
+            raise self._PauseAtFileBoundary
+        if decision == "cancel":
+            raise RcloneCancelledError("Transfer cancelled")
+        if decision == "lost":
+            raise asyncio.CancelledError
+        record.current_item = next_item_path
 
     @property
     def _terminal(self) -> set[str]:
@@ -222,6 +268,7 @@ class TransferExecutor:
         record.status = "RUNNING"
         await self.publish(record)
         for item in files:
+            await self._checkpoint_file_boundary(record, item.path)
             if await self.should_cancel():
                 await self._cancel(record)
                 return
@@ -466,6 +513,7 @@ class TransferExecutor:
                 if not page:
                     break
                 for item in page:
+                    await self._checkpoint_file_boundary(record, item.source_path)
                     if await self.should_cancel():
                         await self._cancel(record)
                         return
@@ -1810,8 +1858,9 @@ class TransferExecutor:
                     await self._fail(
                         record,
                         error_code="MEGA_MANIFEST_REBUILD_REQUIRED",
-                        message=("El inventario MEGA difiere del origen; "
-                                 "cree una nueva transferencia."),
+                        message=(
+                            "El inventario MEGA difiere del origen; cree una nueva transferencia."
+                        ),
                     )
                     return
             assigned_directories: dict[str, str] = {}
@@ -2039,6 +2088,7 @@ class TransferExecutor:
                     continue
                 if row.status == "COPIED":
                     continue
+                await self._checkpoint_file_boundary(record, row.source_path)
                 if await self.should_cancel():
                     await self._cancel(record)
                     return

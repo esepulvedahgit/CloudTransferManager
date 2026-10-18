@@ -602,6 +602,37 @@ describe('Cloud Transfer Manager', () => {
     expect(newGeneration.bytes_transferred).toBe(400);
   });
 
+  it('keeps the newest durable pause state when a stale SSE snapshot arrives', () => {
+    const pausing: Transfer = {
+      id: 'pause-versioned', public_id: 'TRF-2026-000211', status: 'PAUSING',
+      progress_percent: 40, files_completed: 2, files_total: 5,
+      bytes_transferred: 400, bytes_total: 1_000, current_item: '/current.rar',
+      average_speed_bps: null, current_speed_bps: null,
+      destination_connection_id: 'destination', destination_path: '/Backup',
+      attempt_count: 2, state_version: 8, pause_supported: true,
+      pause_requested_at: '2026-10-18T20:00:00Z',
+    };
+    const staleRunning = mergeTransferState(pausing, {
+      ...pausing,
+      status: 'RUNNING',
+      current_item: '/next.rar',
+      state_version: 7,
+    });
+    const resumed = mergeTransferState(pausing, {
+      ...pausing,
+      status: 'RUNNING',
+      current_item: '/next.rar',
+      pause_requested_at: null,
+      paused_at: null,
+      state_version: 9,
+    });
+
+    expect(staleRunning.status).toBe('PAUSING');
+    expect(staleRunning.current_item).toBe('/current.rar');
+    expect(resumed.status).toBe('RUNNING');
+    expect(resumed.state_version).toBe(9);
+  });
+
   it('does not lose omission warnings when a delayed SSE frame arrives for the same attempt', () => {
     const current: Transfer = {
       id: 'merge-omission', public_id: 'TRF-2026-000210', status: 'RUNNING',

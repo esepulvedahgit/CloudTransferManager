@@ -53,6 +53,7 @@ import { z } from 'zod';
 import { apiRequest, ApiError } from './api';
 import DocumentationSection from './DocumentationSection';
 import ScheduledTransferEvaluation, { type TransferEvaluation } from './ScheduledTransferEvaluation';
+import TransferIncidentPanel from './TransferIncidentPanel';
 import TransferFileReport from './TransferFileReport';
 import type { TransferManifestPage, TransferRecord } from './transferTypes';
 import './styles.css';
@@ -96,8 +97,8 @@ type TransferCapabilities = {
 };
 const terminalTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED'];
 const successfulTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS'];
-const backgroundTransferStatuses = ['SCHEDULED', 'QUEUED', 'VALIDATING', 'RUNNING', 'RETRYING', 'CANCELLING'];
-const streamingTransferStatuses = ['VALIDATING', 'RUNNING', 'RETRYING', 'CANCELLING'];
+const backgroundTransferStatuses = ['SCHEDULED', 'QUEUED', 'VALIDATING', 'RUNNING', 'RETRYING', 'PAUSING', 'PAUSED', 'CANCELLING'];
+const streamingTransferStatuses = ['VALIDATING', 'RUNNING', 'RETRYING', 'PAUSING', 'CANCELLING'];
 const terminalProgressDisplayMs = 3_000;
 const notRequiredEvaluation: TransferEvaluation = {
   status: 'NOT_REQUIRED',
@@ -114,6 +115,7 @@ const notRequiredEvaluation: TransferEvaluation = {
 };
 
 function isProgrammedBackgroundTransfer(transfer: Transfer): boolean {
+  if (transfer.status === 'PAUSING' || transfer.status === 'PAUSED') return true;
   return backgroundTransferStatuses.includes(transfer.status) && Boolean(
     transfer.scheduled_at
     || transfer.wait_reason
@@ -141,8 +143,20 @@ export function mergeTransferState(current: Transfer, incoming: Transfer): Trans
   let merged: Transfer;
   const currentAttempt = current.attempt_count ?? 1;
   const incomingAttempt = incoming.attempt_count ?? 1;
+  const currentStateVersion = current.state_version;
+  const incomingStateVersion = incoming.state_version;
   if (incomingAttempt < currentAttempt) merged = current;
   else if (incomingAttempt > currentAttempt) merged = incoming;
+  else if (
+    currentStateVersion !== undefined
+    && incomingStateVersion !== undefined
+    && incomingStateVersion < currentStateVersion
+  ) merged = current;
+  else if (
+    currentStateVersion !== undefined
+    && incomingStateVersion !== undefined
+    && incomingStateVersion > currentStateVersion
+  ) merged = incoming;
   else {
     const currentIsTerminal = terminalTransferStatuses.includes(current.status);
     const incomingIsTerminal = terminalTransferStatuses.includes(incoming.status);
@@ -1262,6 +1276,8 @@ function transferStatusLabel(status: string): string {
     VALIDATING: 'Validando',
     RUNNING: 'En curso',
     RETRYING: 'Reintentando',
+    PAUSING: 'Pausando',
+    PAUSED: 'Pausada',
     CANCELLING: 'Cancelando',
     COMPLETED: 'Completada',
     COMPLETED_WITH_WARNINGS: 'Completada con avisos',
@@ -1915,7 +1931,7 @@ function TransferWorkspace({
     ? historyTransfers.find((transfer) => transfer.id === reportTransferId) ?? null
     : null;
   const liveTransfers = historyTransfers.filter((transfer) => (
-    ['VALIDATING', 'RUNNING', 'RETRYING', 'CANCELLING'].includes(transfer.status)
+    ['VALIDATING', 'RUNNING', 'RETRYING', 'PAUSING', 'CANCELLING'].includes(transfer.status)
     || visibleActiveTransfer?.id === transfer.id
   ));
   const pendingTransferItems = pendingTransfersQuery.data?.pages.flatMap((page) => page.items) ?? [];
@@ -2144,6 +2160,12 @@ function TransferWorkspace({
               if (failure) setTransferFailure({ transferId: update.id, message: failure.message });
             }).catch(() => undefined);
           }
+        } else if (update.status === 'PAUSED') {
+          stream.close();
+          setActiveTransfer((current) => current?.id === update.id ? null : current);
+          void queryClient.invalidateQueries({ queryKey: ['background-transfers'] });
+          void queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] });
+          void queryClient.invalidateQueries({ queryKey: ['transfers'] });
         }
       };
       return stream;
@@ -2291,6 +2313,31 @@ function TransferWorkspace({
     }
   };
 
+  const pauseTransfer = async (transfer: Transfer) => {
+    setBusy(true);
+    try {
+      const updated = await apiRequest<Transfer>(`/api/v1/transfers/${transfer.id}/pause`, {
+        method: 'POST',
+      });
+      if (activeTransfer?.id === updated.id) setActiveTransfer(updated);
+      setNotice(updated.status === 'PAUSED'
+        ? 'Transferencia pausada entre archivos.'
+        : 'Se pausará después de terminar el archivo actual.');
+      setNoticeSeverity('info');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      ]);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo pausar la transferencia.');
+      setNoticeSeverity('error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const retryTransferEvaluation = async (transfer: Transfer) => {
     setRetryingEvaluationId(transfer.id);
     try {
@@ -2368,6 +2415,60 @@ function TransferWorkspace({
     setNotice('Archivo omitido. La transferencia continuará con los archivos restantes.');
     setNoticeSeverity('warning');
     refreshTransferReport(reportTransfer.id);
+  };
+
+  const skipIncidentAndResume = async (
+    transferId: string,
+    itemId: string,
+    expectedAttempt: number,
+    requestId: string,
+  ) => {
+    const updated = await apiRequest<Transfer>(
+      `/api/v1/transfers/${transferId}/items/${itemId}/skip-and-resume`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_attempt: expectedAttempt,
+          request_id: requestId,
+          reason: 'USER_ACCEPTED_SOURCE_FAILURE',
+        }),
+      },
+    );
+    setActiveTransfer((current) => current?.id === updated.id ? updated : current);
+    setNotice('Archivo omitido. La transferencia continuará con los archivos restantes.');
+    setNoticeSeverity('warning');
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['transfer-incidents'] }),
+    ]);
+  };
+
+  const retryIncidentOmission = async (
+    transferId: string,
+    itemId: string,
+    expectedAttempt: number,
+    requestId: string,
+  ) => {
+    const updated = await apiRequest<Transfer>(
+      `/api/v1/transfers/${transferId}/retry-omitted`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ expected_attempt: expectedAttempt, request_id: requestId, item_ids: [itemId] }),
+      },
+    );
+    setActiveTransfer((current) => current?.id === updated.id ? updated : current);
+    setNotice('El archivo omitido volvió a la cola.');
+    setNoticeSeverity('success');
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['transfer-incidents'] }),
+    ]);
   };
 
   const retryOmittedReportItems = async (itemIds: string[], requestId: string) => {
@@ -2647,11 +2748,15 @@ function TransferWorkspace({
                   </Box>
                   <Chip size="small" className="history-status" data-status={transfer.status} label={transferStatusLabel(transfer.status)} />
                 </Box>
-                {waitLabel ? (
+                {transfer.status === 'PAUSED' ? (
+                  <Typography className="background-transfer-detail" variant="caption" color="text.secondary">
+                    Pausada entre archivos · reanúdala desde Programaciones
+                  </Typography>
+                ) : waitLabel ? (
                   <Typography className="background-transfer-detail" variant="caption" color="text.secondary">
                     {waitLabel}
                   </Typography>
-                ) : isActive ? (
+              ) : isActive ? (
                   <>
                     <Box className="background-transfer-progress-meta">
                       <Typography variant="caption" color="text.secondary">
@@ -2875,12 +2980,34 @@ function TransferWorkspace({
                         Reprogramar
                       </Button>
                     )}
+                    {transfer.status === 'PAUSED' && (
+                      <Button size="small" disabled={busy} onClick={() => void resumeTransfer(transfer)}>
+                        Reanudar
+                      </Button>
+                    )}
+                    {['SCHEDULED', 'QUEUED', 'VALIDATING', 'RUNNING', 'RETRYING'].includes(transfer.status) && (
+                      <Button
+                        size="small"
+                        disabled={busy || (transfer.pause_supported === false && source?.provider_type !== 'SMB')}
+                        title={transfer.pause_unavailable_reason === 'LEGACY_BULK_EXECUTION'
+                          ? 'Esta ejecución antigua no puede pausarse entre archivos.'
+                          : undefined}
+                        onClick={() => void pauseTransfer(transfer)}
+                      >
+                        Pausar
+                      </Button>
+                    )}
                     {!terminalTransferStatuses.includes(transfer.status) && transfer.status !== 'CANCELLING' && (
                       <Button size="small" color="error" disabled={busy} onClick={() => void cancelTransfer(transfer)}>
                         Cancelar
                       </Button>
                     )}
                   </Stack>
+                  {transfer.status === 'PAUSING' && (
+                    <Alert severity="info" sx={{ mt: 1 }}>
+                      Pausando al terminar {transfer.current_item ?? 'el archivo actual'}.
+                    </Alert>
+                  )}
                 </Box>
               );
             })}
@@ -3087,7 +3214,26 @@ function TransferWorkspace({
                   : ` · ETA ${transfer.estimated_remaining_seconds}s`}
               </Typography>
               {!['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED', 'CANCELLING'].includes(transfer.status) && (
-                <Button color="error" size="small" sx={{ mt: 1 }} onClick={() => void cancelTransfer(transfer)} disabled={busy}>Cancelar transferencia</Button>
+                <Stack direction="row" spacing={0.75} sx={{ mt: 1 }}>
+                  {['QUEUED', 'SCHEDULED', 'VALIDATING', 'RUNNING', 'RETRYING'].includes(transfer.status) && (
+                    <Button
+                      size="small"
+                      disabled={busy || (transfer.pause_supported === false && connections.find((item) => item.id === transfer.source_connection_id)?.provider_type !== 'SMB')}
+                      title={transfer.pause_unavailable_reason === 'LEGACY_BULK_EXECUTION'
+                        ? 'Esta ejecución antigua no puede pausarse entre archivos.'
+                        : undefined}
+                      onClick={() => void pauseTransfer(transfer)}
+                    >
+                      Pausar entre archivos
+                    </Button>
+                  )}
+                  <Button color="error" size="small" onClick={() => void cancelTransfer(transfer)} disabled={busy}>Cancelar transferencia</Button>
+                </Stack>
+              )}
+              {transfer.status === 'PAUSING' && (
+                <Alert severity="info" sx={{ mt: 1 }}>
+                  Pausando después del archivo actual{transfer.current_item ? `: ${transfer.current_item}` : '…'}
+                </Alert>
               )}
             </CardContent>
           </Card>
@@ -3116,6 +3262,8 @@ function TransferWorkspace({
             </CardContent>
           </Card>
         )}
+
+        <TransferIncidentPanel onSkip={skipIncidentAndResume} onRetry={retryIncidentOmission} />
 
         <Box className="history-heading">
           <Box>

@@ -98,11 +98,21 @@ async def _execute_transfer(transfer_id: uuid.UUID, dispatch_token: uuid.UUID) -
     redis_client = Redis.from_url(current_settings.redis_url, decode_responses=True)
     event_bus = RedisEventBus(redis_client)
 
-    async def publish(record: Any) -> None:
-        record.manifest_summary = (await store.alist_transfer_manifest_summaries([record.id]))[
+    async def publish(record: Any, *, already_persisted: bool = False) -> None:
+        if not already_persisted and not await store.asave_transfer(
+            record, expected_dispatch_token=dispatch_token
+        ):
+            return
+        canonical = await store.aget_transfer(record.id)
+        if canonical is None:
+            return
+        canonical.manifest_summary = (await store.alist_transfer_manifest_summaries([record.id]))[
             record.id
         ]
-        await store.asave_transfer(record)
+        capability = (await store.alist_transfer_pause_capabilities([record.id])).get(record.id)
+        if capability is not None:
+            canonical.pause_supported, canonical.pause_unavailable_reason = capability
+        record = canonical
         try:
             await store.aadd_transfer_event(
                 record.id,
@@ -165,12 +175,18 @@ async def _execute_transfer(transfer_id: uuid.UUID, dispatch_token: uuid.UUID) -
             ):
                 return
             heartbeat_task = asyncio.create_task(heartbeat())
-            execution_task: asyncio.Task[None] | None = None
+            execution_task: asyncio.Task[bool] | None = None
+            pause_ready = False
             try:
                 execution_task = asyncio.create_task(
-                    TransferExecutor(current_settings, store, publish, should_cancel).execute(
-                        transfer_id
-                    )
+                    TransferExecutor(
+                        current_settings,
+                        store,
+                        publish,
+                        should_cancel,
+                        dispatch_token=dispatch_token,
+                        defer_pause_finalize=True,
+                    ).execute(transfer_id)
                 )
                 done, _pending = await asyncio.wait(
                     {heartbeat_task, execution_task},
@@ -185,7 +201,7 @@ async def _execute_transfer(transfer_id: uuid.UUID, dispatch_token: uuid.UUID) -
                     if heartbeat_error is not None:
                         raise heartbeat_error
                     raise RuntimeError("Transfer execution ownership was lost")
-                await execution_task
+                pause_ready = await execution_task
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -204,6 +220,21 @@ async def _execute_transfer(transfer_id: uuid.UUID, dispatch_token: uuid.UUID) -
                 if execution_task is not None and not execution_task.done():
                     execution_task.cancel()
                     await asyncio.gather(execution_task, return_exceptions=True)
+                if pause_ready:
+                    paused = await store.acomplete_transfer_pause(
+                        transfer_id, dispatch_token, datetime.now(UTC)
+                    )
+                    if paused is not None:
+                        try:
+                            await publish(paused, already_persisted=True)
+                        except Exception as exc:
+                            logger.warning(
+                                "Transfer pause state publication failed",
+                                extra={
+                                    "transfer_id": str(transfer_id),
+                                    "exception_type": type(exc).__name__,
+                                },
+                            )
                 try:
                     await event_bus.clear_cancel(str(transfer_id))
                 except Exception:

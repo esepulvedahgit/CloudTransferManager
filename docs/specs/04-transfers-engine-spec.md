@@ -97,12 +97,18 @@ Las tareas con fecha futura tienen un registro durable de evaluación anticipada
 - `QUEUED`: En cola esperando capacidad, dependencias o disponibilidad de conexiones.
 - `VALIDATING`: Verificando existencia de origen y permisos de destino.
 - `RUNNING`: Proceso MEGAcmd o Rclone activo transfiriendo datos.
+- `PAUSING`: Hay una solicitud durable de pausa; el archivo ya seleccionado termina copia, verificación y limpieza antes de detenerse en el límite siguiente.
+- `PAUSED`: Trabajo detenido entre archivos, sin reserva de worker ni consumo de capacidad activa. Conserva el manifiesto, las copias verificadas y el horario.
 - `CANCELLING`: Solicitud de cancelación recibida; enviando SIGTERM/SIGKILL al subproceso.
 - `CANCELLED`: Trabajo cancelado por el usuario; subproceso terminado y recursos liberados.
 - `COMPLETED`: Todos los elementos copiados con éxito.
 - `COMPLETED_WITH_WARNINGS`: Transferencia finalizada, pero algunos archivos no esenciales tuvieron advertencias.
 - `FAILED`: Error fatal o superado el límite de reintentos.
 - `RETRYING`: En espera de backoff exponencial para reintentar; registra `RETRY_SCHEDULED` con el próximo intento y el tiempo de espera.
+
+La pausa no termina el proceso del proveedor ni interrumpe el archivo actual. El worker persiste el estado en `PAUSED` después de cerrar los contextos del proveedor y el heartbeat. Antes de tomar cada archivo, un checkpoint atómico bajo bloqueo de la transferencia decide entre cancelar, pausar o reclamar el siguiente archivo. Cancelar prevalece si coincide con una pausa. Un error fatal del archivo actual y la finalización normal del último archivo prevalecen sobre la pausa. El token de despacho y `state_version` cercan escrituras atrasadas del worker; el frontend ignora snapshots de una versión menor. Los trabajos activos con ejecución histórica por lote que no demuestre límites entre archivos rechazan la pausa con `LEGACY_BULK_EXECUTION`. Un trabajo heredado todavía no iniciado sí se puede pausar antes de despacharlo.
+
+Pausar una transferencia `SCHEDULED` o `QUEUED` todavía no iniciada la deja inmediatamente en `PAUSED` e invalida su reserva de despacho. Reanudar un trabajo pausado conserva `attempt_count` y `scheduled_at`: vuelve a `SCHEDULED` si la hora sigue en el futuro, y a `QUEUED` si ya venció o no tenía fecha. `PAUSING` y `PAUSED` continúan visibles en Programaciones y protegen sus conexiones; solo `PAUSING` conserva una ejecución activa hasta alcanzar el límite.
 
 ---
 
@@ -150,14 +156,17 @@ wait_reason VARCHAR(64) NULL,
 dispatch_token UUID NULL,
 dispatch_claimed_at TIMESTAMP WITH TIME ZONE NULL,
 execution_started_at TIMESTAMP WITH TIME ZONE NULL,
-execution_heartbeat_at TIMESTAMP WITH TIME ZONE NULL
+execution_heartbeat_at TIMESTAMP WITH TIME ZONE NULL,
+pause_requested_at TIMESTAMP WITH TIME ZONE NULL,
+paused_at TIMESTAMP WITH TIME ZONE NULL,
+state_version INTEGER NOT NULL DEFAULT 0
 ```
 
 El dispatcher serializa admisiones con un advisory lock transaccional y reserva cada transferencia antes de publicarla a Celery. El worker valida el token y vuelve a comprobar estado, permisos y versión de credenciales antes de ejecutar. Beat revisa pendientes cada 15 segundos; un token sin inicio se libera tras 120 segundos y un heartbeat vencido solo se marca interrumpido si el advisory lock de ejecución ya no está tomado. Los mensajes de reserva usan UUID nuevos para descartar entregas antiguas.
 
 `AUTO` respeta `TRANSFER_MAX_CONCURRENT`, las colisiones de lectura/escritura sobre conexiones y un cupo global de staging. Las transferencias nuevas `KEEP_BOTH` reservan staging cualquiera que sea el par de proveedores. `EXCLUSIVE` espera a que terminen los trabajos admitidos, levanta una barrera FIFO y evita admitir posteriores hasta finalizar. La programación no inicia una VPN ni expone el SMB: el worker debe tener conectividad de red vigente hacia el NAS.
 
-Las transferencias programadas o en espera se consultan aparte de la lista de historial. `background_only=true` devuelve trabajos activos que tienen fecha, modo exclusivo, dependencia o motivo de espera; `exclude_background=true` los omite del historial hasta que alcanzan un estado terminal. La API de listados agrega `manifest_summary` para que el historial SMB muestre resultados reales en vez de presentar `files_completed` como cantidad copiada.
+Las transferencias programadas o en espera se consultan aparte de la lista de historial. `background_only=true` devuelve trabajos activos que tienen fecha, modo exclusivo, dependencia o motivo de espera, además de `PAUSING` y `PAUSED`; `exclude_background=true` los omite del historial hasta que alcanzan un estado terminal. La API de listados agrega `manifest_summary` para que el historial SMB muestre resultados reales en vez de presentar `files_completed` como cantidad copiada.
 
 Los únicos padres que liberan un hijo son `COMPLETED` y `COMPLETED_WITH_WARNINGS`. `FAILED` y `CANCELLED` mantienen el hijo bloqueado para evitar una ejecución accidental.
 
@@ -240,4 +249,11 @@ Los eventos incluyen etapa (`SOURCE_DOWNLOAD`, `DESTINATION_UPLOAD`, `DESTINATIO
 - `GET /items` devuelve conteos globales por estado y el subconjunto `omitted` con `omitted_bytes`, aunque la respuesta solo incluya una página del manifiesto.
 - Un hijo de una transferencia con omisiones explícitas queda en `BLOCKED_PARENT_OMISSIONS`, incluso si el padre terminó con advertencias. El propietario o ADMIN puede aceptar las omisiones del intento del padre indicado; una nueva ejecución del padre invalida esa aceptación. Evaluación, dispatcher y preflight final vuelven a comprobar el intento aceptado.
 - `source_file_error_policy` se guarda como `STOP` por omisión. La opción `SKIP_CONFIRMED_RESTRICTED` permanece rechazada por creación y recuperación hasta verificar una firma MEGAcmd de restricción individual en la versión instalada. El código `API_EBLOCKED` documentado por el [SDK oficial de MEGA](https://github.com/meganz/sdk/blob/master/include/mega/types.h) no demuestra que un código de salida de MEGAcmd tenga ese mapeo ni que la restricción afecte solo a un archivo. Los diagnósticos sin firma comprobada quedan `UNKNOWN`; nunca se omiten automáticamente.
+- El panel global de incidentes `GET /api/v1/transfer-incidents` pagina fallos de archivos y omisiones explícitas por separado, cuenta el total visible al usuario y muestra las rutas completas de origen y destino asignado. No incluye conflictos `SKIPPED` históricos. La acción de omisión se ofrece solo cuando la evidencia vigente permite reanudar de forma segura; el informe por transferencia y su CSV siguen disponibles.
 - El downgrade de `20261018_0015` se detiene antes de alterar el esquema cuando existen omisiones explícitas. Mantener el esquema y desplegar una versión compatible hasta drenar o conservar los trabajos; la versión antigua del ejecutor podría reprocesar filas `SKIPPED` sin sus metadatos.
+
+## Pausa entre archivos
+
+- `POST /api/v1/transfers/{transfer_id}/pause` requiere sesión del propietario o ADMIN y CSRF. Un trabajo pendiente no iniciado pausa inmediatamente; una ejecución compatible pasa a `PAUSING` y se pausa en el próximo límite entre archivos. La solicitud repetida devuelve el estado vigente.
+- La respuesta pública incluye `pause_supported` y `pause_unavailable_reason`. Los trabajos activos de ejecución histórica por lote no se detienen de forma insegura; responden `409` con `LEGACY_BULK_EXECUTION`.
+- Reanudar `PAUSED` vuelve a programar o encolar según `scheduled_at`, sin contar un intento adicional. Cancelación concurrente prevalece. No ejecutar downgrade de `20261018_0017` mientras exista cualquier trabajo `PAUSING` o `PAUSED`.

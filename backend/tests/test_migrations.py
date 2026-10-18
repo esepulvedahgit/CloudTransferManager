@@ -83,8 +83,11 @@ def test_omission_migration_preserves_legacy_skipped_manifest_rows(tmp_path):
         for path in sorted(migration_dir.glob("*.py"))
         if path.name != "__init__.py"
     ]
-    migration = next(item for item in migrations if item["revision"] == "20261018_0015")
-    previous = [item for item in migrations if item["revision"] != "20261018_0015"]
+    migration_index = next(
+        index for index, item in enumerate(migrations) if item["revision"] == "20261018_0015"
+    )
+    migration = migrations[migration_index]
+    previous = migrations[:migration_index]
     engine = create_engine(f"sqlite:///{tmp_path / 'legacy-omission.sqlite'}")
     transfer_id = "18a72d94-b7b1-4ecb-b77a-33cd7891e525"
     item_id = "7bf9ff3e-9e5b-4c73-b2f6-4a58bc2f64f7"
@@ -125,8 +128,11 @@ def test_omission_migration_downgrade_refuses_to_erase_explicit_omissions(tmp_pa
         for path in sorted(migration_dir.glob("*.py"))
         if path.name != "__init__.py"
     ]
-    migration = next(item for item in migrations if item["revision"] == "20261018_0015")
-    previous = [item for item in migrations if item["revision"] != "20261018_0015"]
+    migration_index = next(
+        index for index, item in enumerate(migrations) if item["revision"] == "20261018_0015"
+    )
+    migration = migrations[migration_index]
+    previous = migrations[:migration_index]
     engine = create_engine(f"sqlite:///{tmp_path / 'explicit-omission-downgrade.sqlite'}")
     transfer_id = "18a72d94-b7b1-4ecb-b77a-33cd7891e525"
     item_id = "7bf9ff3e-9e5b-4c73-b2f6-4a58bc2f64f7"
@@ -163,4 +169,46 @@ def test_omission_migration_downgrade_refuses_to_erase_explicit_omissions(tmp_pa
 
     assert "omission_kind" in columns
     assert tuple(row) == ("SKIPPED", "USER_ACCEPTED_SOURCE_FAILURE")
+    engine.dispose()
+
+
+def test_pause_migration_downgrade_refuses_to_remove_live_pause_states(tmp_path):
+    migration_dir = Path(__file__).parents[1] / "migrations/versions"
+    migrations = [
+        runpy.run_path(str(path))
+        for path in sorted(migration_dir.glob("*.py"))
+        if path.name != "__init__.py"
+    ]
+    migration = next(item for item in migrations if item["revision"] == "20261018_0017")
+    engine = create_engine(f"sqlite:///{tmp_path / 'paused-transfer-downgrade.sqlite'}")
+    transfer_id = uuid.UUID("b3cbda67-13a5-493e-88c9-bff17e0566bc")
+
+    with engine.begin() as connection:
+        with Operations.context(MigrationContext.configure(connection)):
+            for upgrade in migrations:
+                upgrade["upgrade"]()
+        connection.execute(
+            TransferJob.__table__.insert().values(
+                id=transfer_id,
+                public_id="TRF-2026-000100",
+                requested_by=uuid.UUID("e267fe79-086e-4519-a749-5be01e034efe"),
+                source_connection_id=uuid.UUID("f0596305-8513-4174-918f-76cda3dc5869"),
+                destination_connection_id=uuid.UUID("368b08ea-00a3-443e-8d64-99221d2eab96"),
+                source_paths=["/source"],
+                destination_path="/destination",
+                status="PAUSED",
+                pause_requested_at=datetime(2026, 10, 18, 12, 0, tzinfo=UTC),
+                paused_at=datetime(2026, 10, 18, 12, 1, tzinfo=UTC),
+            )
+        )
+        with Operations.context(MigrationContext.configure(connection)):
+            with pytest.raises(RuntimeError, match="PAUSING or PAUSED"):
+                migration["downgrade"]()
+        columns = {column["name"] for column in inspect(connection).get_columns("transfer_jobs")}
+        status = connection.scalar(
+            select(TransferJob.status).where(TransferJob.id == transfer_id)
+        )
+
+    assert {"pause_requested_at", "paused_at", "state_version"}.issubset(columns)
+    assert status == "PAUSED"
     engine.dispose()

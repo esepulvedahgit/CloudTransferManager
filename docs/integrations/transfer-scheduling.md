@@ -32,7 +32,13 @@ El propietario o ADMIN puede solicitar una generación nueva con `POST /api/v1/t
 
 Las transferencias programadas, exclusivas, dependientes o en espera no crean tarjetas grandes de progreso ni aparecen en **Historial reciente** mientras sigan activas. El reloj pequeño del encabezado muestra cuántas hay en segundo plano. Al abrirlo, puedes revisar el motivo de espera o, cuando ya se ejecutan, los bytes transferidos y el porcentaje.
 
-Las tareas futuras y en cola conservan en **Programaciones** las acciones disponibles para reprogramar o cancelar. Las ejecuciones activas también permanecen allí como filas de estado, sin una tarjeta de progreso; desde la sección se puede solicitar su cancelación. La sección pagina los trabajos activos y permite cargar páginas anteriores para conservar accesibles las acciones de cancelación aunque existan más de 200 tareas recientes. Cuando una ejecución termina, desaparece del indicador y pasa al historial con su estado definitivo. La UI recibe actualizaciones inmediatas por SSE y vuelve a consultar cada 15 segundos si se perdió un evento; el sondeo se pausa cuando la pestaña queda en segundo plano.
+Las tareas futuras y en cola conservan en **Programaciones** las acciones disponibles para reprogramar, pausar o cancelar. Las ejecuciones activas también permanecen allí como filas de estado, sin una tarjeta de progreso; desde la sección se puede solicitar pausa o cancelación. La sección pagina los trabajos activos y permite cargar páginas anteriores para conservar accesibles las acciones aunque existan más de 200 tareas recientes. Cuando una ejecución termina, desaparece del indicador y pasa al historial con su estado definitivo. La UI recibe actualizaciones inmediatas por SSE y vuelve a consultar cada 15 segundos si se perdió un evento; el sondeo se pausa cuando la pestaña queda en segundo plano.
+
+## Pausar y reanudar
+
+Puedes pausar una tarea inmediata o programada que todavía no comenzó; pasa de inmediato a `PAUSED` y libera su reserva de despacho. Una ejecución compatible en curso muestra `PAUSING` mientras termina el archivo seleccionado, verifica el destino y limpia staging. Solo entonces pasa a `PAUSED`; no se interrumpe el subproceso a mitad de archivo. La fila pausada permanece en Programaciones, protege sus conexiones y libera capacidad para otros trabajos. Si cancelas mientras espera el límite, la cancelación prevalece.
+
+Reanudar mantiene el manifiesto, las copias verificadas, las asignaciones de nombre, el número de intento y la fecha programada. Una fecha futura la devuelve a `SCHEDULED`; una fecha vencida o inexistente la devuelve a `QUEUED`. Transferencias históricas activas que procesan en lote y no ofrecen un límite seguro entre archivos responden con `LEGACY_BULK_EXECUTION`; todavía se pueden pausar antes de iniciar.
 
 El historial muestra los conteos del manifiesto común (`copied`, `failed`, `skipped`) junto al avance en bytes. Cada fila puede mostrar el nombre solicitado y el asignado. `files_completed` cuenta elementos resueltos y no se debe interpretar como cantidad de archivos copiados.
 
@@ -64,8 +70,8 @@ El scheduler calcula la admisión usando `TRANSFER_MAX_CONCURRENT`, que debe coi
 ## Despliegue de la evaluación anticipada
 
 1. Respaldar PostgreSQL y abrir una ventana sin nuevas admisiones. Pausar Beat y `control-worker`, y esperar a que terminen las copias ya admitidas.
-2. Aplicar las migraciones pendientes en orden, incluida `20261017_0013` para evaluaciones y `20261018_0015` para recuperación por archivo; comprobar el head esperado y el respaldo antes de reanudar admisiones.
+2. Aplicar las migraciones pendientes en orden, incluidas `20261017_0013` para evaluaciones, `20261018_0015` para recuperación por archivo, `20261018_0016` para índices del panel de incidentes y `20261018_0017` para pausa entre archivos; comprobar el head esperado y el respaldo antes de reanudar admisiones.
 3. Desplegar API y los workers `transfers`, `control` y `evaluations` con la misma versión, manteniendo Beat detenido. Comprobar `/health/ready` y `/health/evaluations`.
 4. Iniciar una sola instancia de Beat y reanudar el despacho. Revisar una programación de prueba y confirmar que su conteo aparece en Programaciones antes de la hora de ejecución.
 
-Si se revierte la aplicación, conservar la tabla y columnas de evaluación. No ejecutar downgrade mientras existan evaluaciones en uso. No se requiere reiniciar PostgreSQL ni Redis para este cambio.
+Si se revierte la aplicación, conservar las tablas y columnas de evaluación/pausa. No ejecutar downgrade de `20261018_0017` mientras existan trabajos `PAUSING` o `PAUSED`, ni borrar metadatos de omisión en uso. No se requiere reiniciar PostgreSQL ni Redis para este cambio.
