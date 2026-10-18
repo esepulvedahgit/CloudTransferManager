@@ -128,6 +128,14 @@ class TransferJob(Base):
         CheckConstraint(
             "execution_mode IN ('AUTO', 'EXCLUSIVE')", name="ck_transfer_execution_mode"
         ),
+        CheckConstraint(
+            "source_file_error_policy IN ('STOP', 'SKIP_CONFIRMED_RESTRICTED')",
+            name="ck_transfer_source_file_error_policy",
+        ),
+        CheckConstraint(
+            "accepted_parent_omissions_attempt IS NULL OR accepted_parent_omissions_attempt >= 1",
+            name="ck_transfer_accepted_parent_omissions_attempt",
+        ),
         Index("ix_transfer_dispatch", "status", "scheduled_at", "created_at"),
         UniqueConstraint(
             "requested_by", "idempotency_key", name="uq_transfer_request_idempotency"
@@ -162,6 +170,12 @@ class TransferJob(Base):
     execution_mode: Mapped[str] = mapped_column(String(16), default="AUTO", server_default="AUTO")
     depends_on_transfer_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("transfer_jobs.id", ondelete="RESTRICT"), nullable=True
+    )
+    source_file_error_policy: Mapped[str] = mapped_column(
+        String(32), default="STOP", server_default="STOP"
+    )
+    accepted_parent_omissions_attempt: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
     )
     wait_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     dispatch_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
@@ -257,6 +271,24 @@ class TransferManifestItem(Base):
             "status IN ('DIRECTORY', 'PENDING', 'COPIED', 'SKIPPED', 'FAILED')",
             name="ck_transfer_manifest_status",
         ),
+        CheckConstraint(
+            "omission_kind IS NULL OR omission_kind IN "
+            "('USER_ACCEPTED_SOURCE_FAILURE', 'MEGA_FILE_RESTRICTED')",
+            name="ck_transfer_manifest_omission_kind",
+        ),
+        CheckConstraint(
+            "omission_kind IS NULL OR (is_dir = false AND status = 'SKIPPED' "
+            "AND omitted_at IS NOT NULL AND copy_started = false)",
+            name="ck_transfer_manifest_explicit_omission",
+        ),
+        CheckConstraint(
+            "omission_kind IS NOT NULL OR (omitted_at IS NULL AND omitted_by IS NULL)",
+            name="ck_transfer_manifest_omission_metadata",
+        ),
+        CheckConstraint(
+            "last_failure_attempt IS NULL OR last_failure_attempt >= 1",
+            name="ck_transfer_manifest_last_failure_attempt",
+        ),
         Index("ix_transfer_manifest_scan", "transfer_job_id", "is_dir", "scan_complete"),
         Index("ix_transfer_manifest_status", "transfer_job_id", "status", "id"),
     )
@@ -280,6 +312,19 @@ class TransferManifestItem(Base):
     destination_existed_before: Mapped[bool] = mapped_column(Boolean, default=False)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     verified_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    omission_kind: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    omitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    omitted_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+            name="fk_transfer_manifest_items_omitted_by_users",
+        ),
+        nullable=True,
+    )
+    last_failure_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_failure_attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

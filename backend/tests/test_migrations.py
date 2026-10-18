@@ -6,7 +6,7 @@ from pathlib import Path
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, inspect, select, text
 
 from app.models import Base, TransferJob
 
@@ -72,4 +72,46 @@ def test_migration_chain_matches_current_schema_and_downgrades(tmp_path):
 
         assert inspect(connection).get_table_names() == []
 
+    engine.dispose()
+
+
+def test_omission_migration_preserves_legacy_skipped_manifest_rows(tmp_path):
+    migration_dir = Path(__file__).parents[1] / "migrations/versions"
+    migrations = [
+        runpy.run_path(str(path))
+        for path in sorted(migration_dir.glob("*.py"))
+        if path.name != "__init__.py"
+    ]
+    migration = next(item for item in migrations if item["revision"] == "20261018_0015")
+    previous = [item for item in migrations if item["revision"] != "20261018_0015"]
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-omission.sqlite'}")
+    transfer_id = "18a72d94-b7b1-4ecb-b77a-33cd7891e525"
+    item_id = "7bf9ff3e-9e5b-4c73-b2f6-4a58bc2f64f7"
+
+    with engine.begin() as connection:
+        context = MigrationContext.configure(connection)
+        with Operations.context(context):
+            for upgrade in previous:
+                upgrade["upgrade"]()
+        connection.execute(
+            text(
+                "INSERT INTO transfer_manifest_items "
+                "(id, transfer_job_id, source_path, destination_path, source_path_digest, "
+                "is_dir, size_bytes, status, copy_started, destination_existed_before, "
+                "scan_complete) VALUES (:id, :transfer_id, '/legacy.rar', '/archive/legacy.rar', "
+                ":digest, 0, 77, 'SKIPPED', 0, 0, 1)"
+            ),
+            {"id": item_id, "transfer_id": transfer_id, "digest": "a" * 64},
+        )
+        with Operations.context(MigrationContext.configure(connection)):
+            migration["upgrade"]()
+        row = connection.execute(
+            text(
+                "SELECT status, size_bytes, copy_started, omission_kind, omitted_at, omitted_by "
+                "FROM transfer_manifest_items WHERE id = :id"
+            ),
+            {"id": item_id},
+        ).one()
+
+    assert tuple(row) == ("SKIPPED", 77, 0, None, None, None)
     engine.dispose()

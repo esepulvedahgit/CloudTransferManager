@@ -157,6 +157,8 @@ async def test_database_store_aggregates_manifest_summaries_for_transfer_page(tm
         "skipped": 1,
         "pending": 1,
         "renamed": 0,
+        "omitted": 0,
+        "omitted_bytes": 0,
     }
     assert summaries[missing_id] == {
         "copied": 0,
@@ -164,6 +166,8 @@ async def test_database_store_aggregates_manifest_summaries_for_transfer_page(tm
         "skipped": 0,
         "pending": 0,
         "renamed": 0,
+        "omitted": 0,
+        "omitted_bytes": 0,
     }
 
 

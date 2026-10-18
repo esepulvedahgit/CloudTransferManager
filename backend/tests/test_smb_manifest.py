@@ -164,6 +164,8 @@ async def test_memory_store_aggregates_file_manifest_summaries_without_directori
         "skipped": 1,
         "pending": 1,
         "renamed": 0,
+        "omitted": 0,
+        "omitted_bytes": 0,
     }
     assert summaries[missing_id] == {
         "copied": 0,
@@ -171,6 +173,8 @@ async def test_memory_store_aggregates_file_manifest_summaries_without_directori
         "skipped": 0,
         "pending": 0,
         "renamed": 0,
+        "omitted": 0,
+        "omitted_bytes": 0,
     }
 
 

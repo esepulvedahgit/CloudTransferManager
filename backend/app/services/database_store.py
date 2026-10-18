@@ -47,6 +47,7 @@ from app.services.transfer_evaluation import (
     EvaluationRecord,
     restart_evaluation,
 )
+from app.services.transfer_omissions import normalize_source_file_error_policy
 from app.services.transfer_progress import smb_manifest_progress_percent
 from app.services.transfer_scheduling import (
     DispatchBatch,
@@ -483,6 +484,8 @@ class DatabaseStore:
             schedule_timezone=row.schedule_timezone,
             execution_mode=row.execution_mode,
             depends_on_transfer_id=row.depends_on_transfer_id,
+            source_file_error_policy=row.source_file_error_policy,
+            accepted_parent_omissions_attempt=row.accepted_parent_omissions_attempt,
             wait_reason=row.wait_reason,
             dispatch_token=row.dispatch_token,
             dispatch_claimed_at=row.dispatch_claimed_at,
@@ -528,6 +531,11 @@ class DatabaseStore:
             destination_existed_before=row.destination_existed_before,
             error_code=row.error_code,
             verified_by=row.verified_by,
+            omission_kind=row.omission_kind,
+            omitted_at=row.omitted_at,
+            omitted_by=row.omitted_by,
+            last_failure_stage=row.last_failure_stage,
+            last_failure_attempt=row.last_failure_attempt,
         )
 
     async def acreate_user(
@@ -890,7 +898,9 @@ class DatabaseStore:
         audit_event: dict[str, Any] | None = None,
         source_item_ids: list[str | None] | None = None,
         source_parent_ids: list[str | None] | None = None,
+        source_file_error_policy: str = "STOP",
     ) -> TransferRecord:
+        source_file_error_policy = normalize_source_file_error_policy(source_file_error_policy)
         if (idempotency_key is None) != (idempotency_request_hash is None):
             raise ValueError("Idempotency key and request hash must be supplied together")
         async with self.sessions() as session:
@@ -952,6 +962,7 @@ class DatabaseStore:
                         schedule_timezone=schedule_timezone,
                         execution_mode=execution_mode,
                         depends_on_transfer_id=depends_on_transfer_id,
+                        source_file_error_policy=source_file_error_policy,
                         wait_reason=(
                             "WAITING_UNTIL"
                             if scheduled_at is not None and scheduled_at > datetime.now(UTC)
@@ -2700,7 +2711,15 @@ class DatabaseStore:
         self, transfer_ids: list[uuid.UUID]
     ) -> dict[uuid.UUID, dict[str, int]]:
         summaries = {
-            transfer_id: {"copied": 0, "failed": 0, "skipped": 0, "pending": 0, "renamed": 0}
+            transfer_id: {
+                "copied": 0,
+                "failed": 0,
+                "skipped": 0,
+                "pending": 0,
+                "renamed": 0,
+                "omitted": 0,
+                "omitted_bytes": 0,
+            }
             for transfer_id in transfer_ids
         }
         if not transfer_ids:
@@ -2726,6 +2745,18 @@ class DatabaseStore:
                         func.sum(
                             case((TransferManifestItem.rename_reason.is_not(None), 1), else_=0)
                         ).label("renamed"),
+                        func.sum(
+                            case((TransferManifestItem.omission_kind.is_not(None), 1), else_=0)
+                        ).label("omitted"),
+                        func.sum(
+                            case(
+                                (
+                                    TransferManifestItem.omission_kind.is_not(None),
+                                    TransferManifestItem.size_bytes,
+                                ),
+                                else_=0,
+                            )
+                        ).label("omitted_bytes"),
                     )
                     .where(
                         TransferManifestItem.transfer_job_id.in_(transfer_ids),
@@ -2733,13 +2764,15 @@ class DatabaseStore:
                     .group_by(TransferManifestItem.transfer_job_id)
                 )
             ).all()
-        for transfer_id, copied, failed, skipped, pending, renamed in rows:
+        for transfer_id, copied, failed, skipped, pending, renamed, omitted, omitted_bytes in rows:
             summaries[transfer_id] = {
                 "copied": int(copied or 0),
                 "failed": int(failed or 0),
                 "skipped": int(skipped or 0),
                 "pending": int(pending or 0),
                 "renamed": int(renamed or 0),
+                "omitted": int(omitted or 0),
+                "omitted_bytes": int(omitted_bytes or 0),
             }
         return summaries
 

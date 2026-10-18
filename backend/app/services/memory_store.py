@@ -17,6 +17,7 @@ from app.services.transfer_evaluation import (
     not_required_evaluation,
     restart_evaluation,
 )
+from app.services.transfer_omissions import normalize_source_file_error_policy
 from app.services.transfer_progress import smb_manifest_progress_percent
 from app.settings import Settings
 
@@ -121,6 +122,8 @@ class TransferRecord:
     schedule_timezone: str = "UTC"
     execution_mode: str = "AUTO"
     depends_on_transfer_id: uuid.UUID | None = None
+    source_file_error_policy: str = "STOP"
+    accepted_parent_omissions_attempt: int | None = None
     wait_reason: str | None = None
     dispatch_token: uuid.UUID | None = None
     dispatch_claimed_at: datetime | None = None
@@ -181,6 +184,8 @@ class TransferRecord:
             "depends_on_transfer_id": (
                 str(self.depends_on_transfer_id) if self.depends_on_transfer_id else None
             ),
+            "source_file_error_policy": self.source_file_error_policy,
+            "accepted_parent_omissions_attempt": self.accepted_parent_omissions_attempt,
             "wait_reason": self.wait_reason,
             "evaluation": (
                 self.evaluation.public_dict() if self.evaluation else not_required_evaluation()
@@ -214,6 +219,11 @@ class TransferManifestItemRecord:
     destination_existed_before: bool = False
     error_code: str | None = None
     verified_by: str | None = None
+    omission_kind: str | None = None
+    omitted_at: datetime | None = None
+    omitted_by: uuid.UUID | None = None
+    last_failure_stage: str | None = None
+    last_failure_attempt: int | None = None
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -230,6 +240,10 @@ class TransferManifestItemRecord:
             "status": self.status,
             "error_code": self.error_code,
             "verified_by": self.verified_by,
+            "omission_kind": self.omission_kind,
+            "omitted_at": self.omitted_at.isoformat() if self.omitted_at else None,
+            "last_failure_stage": self.last_failure_stage,
+            "last_failure_attempt": self.last_failure_attempt,
         }
 
 
@@ -378,7 +392,9 @@ class MemoryStore:
         depends_on_transfer_id: uuid.UUID | None = None,
         source_item_ids: list[str | None] | None = None,
         source_parent_ids: list[str | None] | None = None,
+        source_file_error_policy: str = "STOP",
     ) -> TransferRecord:
+        source_file_error_policy = normalize_source_file_error_policy(source_file_error_policy)
         is_scheduled = scheduled_at is not None and scheduled_at > datetime.now(UTC)
         record = TransferRecord(
             id=uuid.uuid4(),
@@ -399,6 +415,7 @@ class MemoryStore:
             schedule_timezone=schedule_timezone,
             execution_mode=execution_mode,
             depends_on_transfer_id=depends_on_transfer_id,
+            source_file_error_policy=source_file_error_policy,
             wait_reason="WAITING_UNTIL" if is_scheduled else None,
         )
         if is_scheduled:
@@ -1073,6 +1090,7 @@ class MemoryStore:
         audit_event: dict[str, Any] | None = None,
         source_item_ids: list[str | None] | None = None,
         source_parent_ids: list[str | None] | None = None,
+        source_file_error_policy: str = "STOP",
     ) -> TransferRecord:
         if (idempotency_key is None) != (idempotency_request_hash is None):
             raise ValueError("Idempotency key and request hash must be supplied together")
@@ -1106,6 +1124,7 @@ class MemoryStore:
             depends_on_transfer_id,
             source_item_ids,
             source_parent_ids,
+            source_file_error_policy,
         )
         if idempotency_key is not None and idempotency_request_hash is not None:
             self.transfer_idempotency[(requested_by, idempotency_key)] = (
@@ -1872,7 +1891,15 @@ class MemoryStore:
         self, transfer_ids: list[uuid.UUID]
     ) -> dict[uuid.UUID, dict[str, int]]:
         summaries = {
-            transfer_id: {"copied": 0, "failed": 0, "skipped": 0, "pending": 0, "renamed": 0}
+            transfer_id: {
+                "copied": 0,
+                "failed": 0,
+                "skipped": 0,
+                "pending": 0,
+                "renamed": 0,
+                "omitted": 0,
+                "omitted_bytes": 0,
+            }
             for transfer_id in transfer_ids
         }
         status_keys = {
@@ -1888,6 +1915,9 @@ class MemoryStore:
                 summary["renamed"] += 1
             if summary is not None and not item.is_dir and key is not None:
                 summary[key] += 1
+                if item.omission_kind is not None:
+                    summary["omitted"] += 1
+                    summary["omitted_bytes"] += item.size_bytes or 0
         return summaries
 
     def _manifest_item(

@@ -65,6 +65,7 @@ from app.services.smtp_config import (
 )
 from app.services.transfer_evaluation import EvaluationConflictError
 from app.services.transfer_executor import TransferExecutor
+from app.services.transfer_omissions import SourceFileErrorPolicy
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -194,6 +195,7 @@ class TransferCreate(BaseModel):
     schedule_timezone: str = "UTC"
     execution_mode: Literal["AUTO", "EXCLUSIVE"] = "AUTO"
     depends_on_transfer_id: uuid.UUID | None = None
+    source_file_error_policy: SourceFileErrorPolicy = SourceFileErrorPolicy.STOP
 
     @field_validator("scheduled_at")
     @classmethod
@@ -1712,6 +1714,11 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         del user_csrf
         if payload.operation != "COPY":
             raise HTTPException(status_code=422, detail="Solo se permite la operación COPY")
+        if payload.source_file_error_policy != SourceFileErrorPolicy.STOP:
+            raise HTTPException(
+                status_code=422,
+                detail="La omisión automática de archivos no está disponible todavía.",
+            )
         if payload.conflict_policy != "KEEP_BOTH":
             raise HTTPException(
                 status_code=422,
@@ -1806,6 +1813,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 },
                 source_item_ids=payload.source_item_ids,
                 source_parent_ids=payload.source_parent_ids,
+                source_file_error_policy=payload.source_file_error_policy.value,
             )
         except IdempotencyConflictError as exc:
             raise HTTPException(
@@ -2006,7 +2014,15 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             item = record.public_dict()
             item["manifest_summary"] = summaries.get(
                 record.id,
-                {"copied": 0, "failed": 0, "skipped": 0, "pending": 0},
+                {
+                    "copied": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "pending": 0,
+                    "renamed": 0,
+                    "omitted": 0,
+                    "omitted_bytes": 0,
+                },
             )
             items.append(item)
         return {

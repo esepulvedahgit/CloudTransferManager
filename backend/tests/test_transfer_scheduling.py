@@ -1227,6 +1227,8 @@ async def test_background_only_returns_nonterminal_scheduled_transfers():
         "skipped": 1,
         "pending": 1,
         "renamed": 0,
+        "omitted": 0,
+        "omitted_bytes": 0,
     }
     assert paged_response.json()["total_count"] == len(background_specs)
     assert len(paged_response.json()["items"]) == 2
