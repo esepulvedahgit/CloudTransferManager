@@ -31,6 +31,14 @@ def test_migration_chain_matches_current_schema_and_downgrades(tmp_path):
             for migration in migrations:
                 migration["upgrade"]()
 
+        manifest_columns = {
+            column["name"]: column
+            for column in inspect(connection).get_columns("transfer_manifest_items")
+        }
+        assert (
+            manifest_columns["verified_by"]["type"].length >= len("SHA256_RECONCILED")
+        )
+
         differences = compare_metadata(
             MigrationContext.configure(connection, opts={"compare_type": True}), Base.metadata
         )
