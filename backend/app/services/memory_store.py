@@ -1544,9 +1544,18 @@ class MemoryStore:
                 if (
                     event.get("resource_type") == "transfer"
                     and event.get("resource_id") == str(child_id)
-                    and event.get("action") == "TRANSFER_PARENT_OMISSIONS_ACCEPTED"
+                    and event.get("action")
+                    in {
+                        "TRANSFER_FILE_OMITTED",
+                        "TRANSFER_OMITTED_FILES_RETRIED",
+                        "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                    }
                     and event.get("metadata", {}).get("request_id") == str(request_id)
                 ):
+                    if event.get("actor_user_id") != str(actor_id):
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used by another actor"
+                        )
                     if event.get("metadata", {}).get("request_hash") != request_hash:
                         raise TransferRecoveryConflictError(
                             "Request id was already used for a different acceptance"
@@ -1668,9 +1677,18 @@ class MemoryStore:
                 if (
                     event.get("resource_type") == "transfer"
                     and event.get("resource_id") == str(transfer_id)
-                    and event.get("action") == "TRANSFER_OMITTED_FILES_RETRIED"
+                    and event.get("action")
+                    in {
+                        "TRANSFER_FILE_OMITTED",
+                        "TRANSFER_OMITTED_FILES_RETRIED",
+                        "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                    }
                     and event.get("metadata", {}).get("request_id") == str(request_id)
                 ):
+                    if event.get("actor_user_id") != str(actor_id):
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used by another actor"
+                        )
                     if event.get("metadata", {}).get("request_hash") != request_hash:
                         raise TransferRecoveryConflictError(
                             "Request id was already used for a different retry"
@@ -1857,6 +1875,11 @@ class MemoryStore:
             transfer = self.transfers.get(transfer_id)
             if transfer is None:
                 raise TransferRecoveryNotFoundError("Transfer not found")
+            actor = self.users.get(actor_id)
+            if actor is None or not actor.is_active:
+                raise TransferRecoveryNotFoundError("Transfer not found")
+            if actor.role != "ADMIN" and transfer.requested_by != actor_id:
+                raise TransferRecoveryNotFoundError("Transfer not found")
             request_hash = recovery_request_hash(
                 item_id=item_id,
                 expected_attempt=expected_attempt,
@@ -1866,9 +1889,18 @@ class MemoryStore:
                 if (
                     event.get("resource_type") == "transfer"
                     and event.get("resource_id") == str(transfer_id)
-                    and event.get("action") == "TRANSFER_FILE_OMITTED"
+                    and event.get("action")
+                    in {
+                        "TRANSFER_FILE_OMITTED",
+                        "TRANSFER_OMITTED_FILES_RETRIED",
+                        "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                    }
                     and event.get("metadata", {}).get("request_id") == str(request_id)
                 ):
+                    if event.get("actor_user_id") != str(actor_id):
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used by another actor"
+                        )
                     if event.get("metadata", {}).get("request_hash") != request_hash:
                         raise TransferRecoveryConflictError(
                             "Request id was already used for a different recovery action"
@@ -1876,11 +1908,6 @@ class MemoryStore:
                     transfer.idempotent_replay = True
                     return transfer
 
-            actor = self.users.get(actor_id)
-            if actor is None or not actor.is_active:
-                raise TransferRecoveryNotFoundError("Transfer not found")
-            if actor.role != "ADMIN" and transfer.requested_by != actor_id:
-                raise TransferRecoveryNotFoundError("Transfer not found")
             if expected_attempt != transfer.attempt_count:
                 raise TransferRecoveryConflictError("Transfer attempt changed")
             if transfer.status != "FAILED":
@@ -1941,7 +1968,7 @@ class MemoryStore:
                 if not candidate.is_dir and PurePosixPath(candidate.source_path).name == basename
             )
             transfer.source_provider_type = source.provider_type
-            failure_stage, failure_attempt = resolve_failure_evidence(
+            failure_stage, failure_attempt, failure_retryable = resolve_failure_evidence(
                 transfer,
                 item,
                 events,
@@ -1952,6 +1979,7 @@ class MemoryStore:
                 item,
                 failure_stage=failure_stage,
                 failure_attempt=failure_attempt,
+                failure_retryable=failure_retryable,
             ):
                 raise TransferRecoveryConflictError(
                     skip_unavailable_reason(
@@ -1959,6 +1987,7 @@ class MemoryStore:
                         item,
                         failure_stage=failure_stage,
                         failure_attempt=failure_attempt,
+                        failure_retryable=failure_retryable,
                     )
                     or "Transfer item cannot be omitted"
                 )
@@ -2527,6 +2556,7 @@ class MemoryStore:
             for (item_transfer_id, _), item in self.transfer_manifest_items.items()
             if item_transfer_id == transfer_id
         ]
+        omitted_items = [item for item in rows if item.omission_kind is not None]
         return {
             "total": len(rows),
             "pending": sum(
@@ -2537,6 +2567,8 @@ class MemoryStore:
             "copied": sum(1 for item in rows if item.status == "COPIED"),
             "skipped": sum(1 for item in rows if item.status == "SKIPPED"),
             "failed": sum(1 for item in rows if item.status == "FAILED"),
+            "omitted": len(omitted_items),
+            "omitted_bytes": sum(item.size_bytes or 0 for item in omitted_items),
         }
 
     async def alist_transfer_manifest_summaries(

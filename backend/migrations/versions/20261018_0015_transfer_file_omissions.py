@@ -77,6 +77,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    explicit_omissions = op.get_bind().execute(
+        sa.text(
+            "SELECT COUNT(*) FROM transfer_manifest_items "
+            "WHERE omission_kind IS NOT NULL"
+        )
+    ).scalar_one()
+    if explicit_omissions:
+        raise RuntimeError(
+            "Cannot downgrade while explicit transfer omissions exist; "
+            "the older executor would retry those files."
+        )
+
     with op.batch_alter_table("transfer_manifest_items") as batch_op:
         batch_op.drop_constraint("ck_transfer_manifest_last_failure_attempt", type_="check")
         batch_op.drop_constraint("ck_transfer_manifest_omission_metadata", type_="check")

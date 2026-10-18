@@ -75,6 +75,7 @@ from app.services.transfer_omissions import (
 )
 from app.services.transfer_recovery import (
     AcceptParentOmissionsRequest,
+    ResumeTransferRequest,
     RetryOmittedRequest,
     SkipAndResumeRequest,
     accept_parent_omissions,
@@ -1921,7 +1922,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         basename_matches = await app.state.store.acount_transfer_manifest_basename_matches(
             record.id, basename
         )
-        failure_stage, failure_attempt = resolve_failure_evidence(
+        failure_stage, failure_attempt, failure_retryable = resolve_failure_evidence(
             record,
             item,
             events,
@@ -1932,6 +1933,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             item,
             failure_stage=failure_stage,
             failure_attempt=failure_attempt,
+            failure_retryable=failure_retryable,
         )
         return unavailable is None, unavailable
 
@@ -2206,9 +2208,11 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
     async def resume_transfer(
         transfer_id: uuid.UUID,
         request: Request,
+        payload: ResumeTransferRequest | None = None,
         user: UserAccount = Depends(current_user),
         user_csrf: None = Depends(csrf_guard),
     ) -> dict[str, Any]:
+        del payload
         del user_csrf
         record = await visible_transfer(transfer_id, user)
         if record.status not in {"FAILED", "CANCELLED"}:

@@ -627,7 +627,15 @@ async def test_database_store_persists_idempotent_manifest_batches_and_credentia
     assert inserted == 10_001
     assert repeated == 0
     assert len(first_page) == 200
-    assert counts == {"total": 10_001, "pending": 10_000, "copied": 1, "skipped": 0, "failed": 0}
+    assert counts == {
+        "total": 10_001,
+        "pending": 10_000,
+        "copied": 1,
+        "skipped": 0,
+        "failed": 0,
+        "omitted": 0,
+        "omitted_bytes": 0,
+    }
     assert updated_source is not None and updated_source.credential_version == 2
     assert persisted_transfer is not None
     assert persisted_transfer.source_credential_version == 1

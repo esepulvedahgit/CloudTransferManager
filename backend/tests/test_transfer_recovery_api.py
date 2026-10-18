@@ -7,6 +7,7 @@ import pytest
 from app.main import create_app
 from app.security.passwords import PasswordService
 from app.services.memory_store import MemoryStore
+from app.services.transfer_omissions import TransferRecoveryConflictError
 from app.settings import Settings
 
 
@@ -200,6 +201,112 @@ async def test_skip_and_resume_is_atomic_audited_and_idempotent(monkeypatch):
         "TRANSFER_RESUMED",
         "TRANSFER_FILE_OMITTED",
     ]
+
+
+@pytest.mark.parametrize(
+    ("error_code", "retryable"),
+    [
+        ("MEGACMD_DOWNLOAD_OUTPUT_MISSING", True),
+        ("SOURCE_SIZE_MISMATCH", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_skip_and_resume_rejects_transient_or_integrity_mega_failure(
+    monkeypatch, error_code, retryable
+):
+    store = MemoryStore()
+    user = store.add_user(
+        "transient-admin",
+        "transient-admin@example.test",
+        PasswordService().hash("A-Strong-Password123!"),
+        role="ADMIN",
+    )
+    _source, _destination, transfer, failed_item = await failed_mega_transfer(store, user.id)
+    failed_item.error_code = error_code
+    for event in store.transfer_events[transfer.id]:
+        if event["event_type"] == "FAILURE_DIAGNOSTIC":
+            event["provider_error_code"] = error_code
+            event["technical_details"]["retryable"] = retryable
+    app = create_app(
+        Settings(
+            app_env="production",
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+        ),
+        store=store,
+    )
+    app.state.event_bus = None
+    monkeypatch.setattr("app.worker.dispatch_pending_transfers.delay", lambda: None)
+    client = await logged_in_client(app, user.username)
+    response = await client.post(
+        f"/api/v1/transfers/{transfer.id}/items/{failed_item.id}/skip-and-resume",
+        json={
+            "expected_attempt": 2,
+            "request_id": str(uuid.uuid4()),
+            "reason": "USER_ACCEPTED_SOURCE_FAILURE",
+        },
+        headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+    )
+    await client.aclose()
+
+    assert response.status_code == 409
+    assert transfer.status == "FAILED"
+    assert transfer.attempt_count == 2
+    assert failed_item.status == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_recovery_request_id_cannot_be_reused_for_a_different_action():
+    store = MemoryStore()
+    user = store.add_user(
+        "cross-action-owner", "cross-action@example.test", "hash", role="ADMIN"
+    )
+    _source, _destination, transfer, failed_item = await failed_mega_transfer(store, user.id)
+    request_id = uuid.uuid4()
+    await store.askip_transfer_item_and_resume(
+        transfer.id,
+        failed_item.id,
+        actor_id=user.id,
+        expected_attempt=2,
+        request_id=request_id,
+    )
+    transfer.status = "COMPLETED_WITH_WARNINGS"
+
+    with pytest.raises(TransferRecoveryConflictError, match="[Rr]equest id"):
+        await store.aretry_omitted_transfer_items(
+            transfer.id,
+            item_ids=[failed_item.id],
+            actor_id=user.id,
+            expected_attempt=3,
+            request_id=request_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_skip_replay_is_bound_to_the_original_actor():
+    store = MemoryStore()
+    owner = store.add_user("replay-owner", "replay-owner@example.test", "hash", role="ADMIN")
+    other_admin = store.add_user(
+        "replay-other-admin", "replay-other-admin@example.test", "hash", role="ADMIN"
+    )
+    _source, _destination, transfer, failed_item = await failed_mega_transfer(store, owner.id)
+    request_id = uuid.uuid4()
+    await store.askip_transfer_item_and_resume(
+        transfer.id,
+        failed_item.id,
+        actor_id=owner.id,
+        expected_attempt=2,
+        request_id=request_id,
+    )
+
+    with pytest.raises(TransferRecoveryConflictError, match="actor"):
+        await store.askip_transfer_item_and_resume(
+            transfer.id,
+            failed_item.id,
+            actor_id=other_admin.id,
+            expected_attempt=2,
+            request_id=request_id,
+        )
 
 
 @pytest.mark.asyncio
@@ -478,6 +585,78 @@ async def test_omissions_csv_is_terminal_only_and_returns_safe_csv():
     assert "'/source/=HYPERLINK" in response.text
     assert "/destination/restricted.rar" in response.text
     assert nonterminal.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_skip_and_resume_rejects_unverified_automatic_omission_policy(monkeypatch):
+    store = MemoryStore()
+    user = store.add_user(
+        "policy-owner",
+        "policy-owner@example.test",
+        PasswordService().hash("A-Strong-Password123!"),
+        role="ADMIN",
+    )
+    _source, _destination, transfer, item = await failed_mega_transfer(store, user.id)
+    app = create_app(
+        Settings(
+            app_env="production",
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+        ),
+        store=store,
+    )
+    app.state.event_bus = None
+    client = await logged_in_client(app, user.username)
+    response = await client.post(
+        f"/api/v1/transfers/{transfer.id}/items/{item.id}/skip-and-resume",
+        json={
+            "expected_attempt": 2,
+            "request_id": str(uuid.uuid4()),
+            "reason": "USER_ACCEPTED_SOURCE_FAILURE",
+            "source_file_error_policy": "SKIP_CONFIRMED_RESTRICTED",
+        },
+        headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+    )
+    await client.aclose()
+
+    assert response.status_code == 422
+    assert transfer.status == "FAILED"
+    assert transfer.attempt_count == 2
+    assert transfer.source_file_error_policy == "STOP"
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_unverified_automatic_omission_policy(monkeypatch):
+    store = MemoryStore()
+    user = store.add_user(
+        "resume-policy-owner",
+        "resume-policy-owner@example.test",
+        PasswordService().hash("A-Strong-Password123!"),
+        role="ADMIN",
+    )
+    _source, _destination, transfer, _item = await failed_mega_transfer(store, user.id)
+    app = create_app(
+        Settings(
+            app_env="production",
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+        ),
+        store=store,
+    )
+    app.state.event_bus = None
+    monkeypatch.setattr("app.worker.dispatch_pending_transfers.delay", lambda: None)
+    client = await logged_in_client(app, user.username)
+    response = await client.post(
+        f"/api/v1/transfers/{transfer.id}/resume",
+        json={"source_file_error_policy": "SKIP_CONFIRMED_RESTRICTED"},
+        headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+    )
+    await client.aclose()
+
+    assert response.status_code == 422
+    assert transfer.status == "FAILED"
+    assert transfer.attempt_count == 2
+    assert transfer.source_file_error_policy == "STOP"
 
 
 @pytest.mark.asyncio

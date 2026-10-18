@@ -43,6 +43,7 @@ def skip_unavailable_reason(
     *,
     failure_stage: str | None,
     failure_attempt: int | None,
+    failure_retryable: bool | None = None,
 ) -> str | None:
     if transfer.source_provider_type != "MEGA":
         return "SOURCE_PROVIDER_UNSUPPORTED"
@@ -67,6 +68,11 @@ def skip_unavailable_reason(
             "STAGING",
             "DESTINATION",
             "INTEGRITY",
+            "SIZE_MISMATCH",
+            "OUTPUT_MISSING",
+            "TRANSIENT",
+            "RETRIES_EXHAUSTED",
+            "LOCAL_IO",
             "LISTING_INVALID",
             "OUTPUT_INVALID",
             "SOURCE_ITEM_NOT_FOUND",
@@ -77,6 +83,8 @@ def skip_unavailable_reason(
         return "FAILURE_STAGE_UNKNOWN_OR_UNSUPPORTED"
     if failure_attempt is None or failure_attempt != transfer.attempt_count:
         return "FAILURE_ATTEMPT_STALE_OR_UNKNOWN"
+    if failure_retryable is True:
+        return "TRANSIENT_FAILURE_NOT_OMITTABLE"
     return None
 
 
@@ -86,6 +94,7 @@ def can_skip_manifest_item(
     *,
     failure_stage: str | None,
     failure_attempt: int | None,
+    failure_retryable: bool | None = None,
 ) -> bool:
     return (
         skip_unavailable_reason(
@@ -93,6 +102,7 @@ def can_skip_manifest_item(
             item,
             failure_stage=failure_stage,
             failure_attempt=failure_attempt,
+            failure_retryable=failure_retryable,
         )
         is None
     )
@@ -104,7 +114,7 @@ def resolve_failure_evidence(
     events: list[dict[str, Any]],
     *,
     basename_matches: int,
-) -> tuple[str | None, int | None]:
+) -> tuple[str | None, int | None, bool | None]:
     """Resolve current-attempt per-file diagnostics without trusting raw provider output."""
     item_basename = PurePosixPath(item.source_path).name
     expected_id = str(item.id)
@@ -150,8 +160,10 @@ def resolve_failure_evidence(
             and item.last_failure_attempt != attempt
         ):
             continue
-        return failure_stage, attempt
-    return None, None
+        retryable_value = details.get("retryable")
+        retryable = retryable_value if isinstance(retryable_value, bool) else None
+        return failure_stage, attempt, retryable
+    return None, None, None
 
 
 def recovery_request_hash(

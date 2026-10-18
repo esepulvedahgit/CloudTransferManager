@@ -3,6 +3,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -114,4 +115,52 @@ def test_omission_migration_preserves_legacy_skipped_manifest_rows(tmp_path):
         ).one()
 
     assert tuple(row) == ("SKIPPED", 77, 0, None, None, None)
+    engine.dispose()
+
+
+def test_omission_migration_downgrade_refuses_to_erase_explicit_omissions(tmp_path):
+    migration_dir = Path(__file__).parents[1] / "migrations/versions"
+    migrations = [
+        runpy.run_path(str(path))
+        for path in sorted(migration_dir.glob("*.py"))
+        if path.name != "__init__.py"
+    ]
+    migration = next(item for item in migrations if item["revision"] == "20261018_0015")
+    previous = [item for item in migrations if item["revision"] != "20261018_0015"]
+    engine = create_engine(f"sqlite:///{tmp_path / 'explicit-omission-downgrade.sqlite'}")
+    transfer_id = "18a72d94-b7b1-4ecb-b77a-33cd7891e525"
+    item_id = "7bf9ff3e-9e5b-4c73-b2f6-4a58bc2f64f7"
+
+    with engine.begin() as connection:
+        with Operations.context(MigrationContext.configure(connection)):
+            for upgrade in previous:
+                upgrade["upgrade"]()
+            migration["upgrade"]()
+        connection.execute(
+            text(
+                "INSERT INTO transfer_manifest_items "
+                "(id, transfer_job_id, source_path, destination_path, source_path_digest, "
+                "is_dir, size_bytes, status, copy_started, destination_existed_before, "
+                "scan_complete, omission_kind, omitted_at) VALUES (:id, :transfer_id, "
+                "'/restricted.rar', '/archive/restricted.rar', :digest, 0, 77, 'SKIPPED', "
+                "0, 0, 1, 'USER_ACCEPTED_SOURCE_FAILURE', '2026-10-18T12:00:00Z')"
+            ),
+            {"id": item_id, "transfer_id": transfer_id, "digest": "b" * 64},
+        )
+        with Operations.context(MigrationContext.configure(connection)):
+            with pytest.raises(RuntimeError, match="explicit transfer omissions"):
+                migration["downgrade"]()
+        columns = {
+            column["name"]
+            for column in inspect(connection).get_columns("transfer_manifest_items")
+        }
+        row = connection.execute(
+            text(
+                "SELECT status, omission_kind FROM transfer_manifest_items WHERE id = :id"
+            ),
+            {"id": item_id},
+        ).one()
+
+    assert "omission_kind" in columns
+    assert tuple(row) == ("SKIPPED", "USER_ACCEPTED_SOURCE_FAILURE")
     engine.dispose()

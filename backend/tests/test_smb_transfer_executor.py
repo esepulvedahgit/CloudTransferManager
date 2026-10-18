@@ -278,6 +278,8 @@ async def test_smb_inventory_is_persisted_page_by_page_above_legacy_file_limit(t
         "copied": 0,
         "skipped": 0,
         "failed": 0,
+        "omitted": 0,
+        "omitted_bytes": 0,
     }
     first_page = await store.alist_transfer_manifest_items(
         transfer.id, statuses={"PENDING"}, after_id=None, limit=200

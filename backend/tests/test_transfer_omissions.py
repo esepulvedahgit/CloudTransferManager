@@ -92,18 +92,54 @@ def test_skip_eligibility_rejects_known_account_quota_and_destination_failures()
     )
 
 
+def test_skip_eligibility_rejects_exhausted_transient_source_failure():
+    store = MemoryStore()
+    user = store.add_user("transient-owner", "transient@example.test", "hash")
+    source = store.create_connection("MEGA", "MEGA", user.id)
+    destination = store.create_connection("Seafile", "SEAFILE", user.id)
+    transfer = store.create_transfer(user.id, source.id, destination.id, ["/x"], "/y")
+    transfer.source_provider_type = "MEGA"
+    transfer.status = "FAILED"
+    transfer.attempt_count = 2
+    item = TransferManifestItemRecord(
+        id=uuid.uuid4(),
+        transfer_id=transfer.id,
+        source_path="/x/file.rar",
+        destination_path="/y/file.rar",
+        is_dir=False,
+        status="FAILED",
+        error_code="MEGACMD_RETRIES_EXHAUSTED",
+    )
+
+    assert not transfer_omissions.can_skip_manifest_item(
+        transfer,
+        item,
+        failure_stage="SOURCE_DOWNLOAD",
+        failure_attempt=2,
+        failure_retryable=True,
+    )
+
+
 @pytest.mark.parametrize(
-    ("basename_matches", "event_stage", "created_at", "global_attempt", "expected"),
+    (
+        "basename_matches",
+        "event_stage",
+        "created_at",
+        "global_attempt",
+        "retryable",
+        "expected",
+    ),
     [
-        (1, "SOURCE_DOWNLOAD", datetime.now(UTC), None, ("SOURCE_DOWNLOAD", 2)),
-        (2, "SOURCE_DOWNLOAD", datetime.now(UTC), None, (None, None)),
-        (1, "SOURCE_DOWNLOAD", datetime(2026, 1, 1, tzinfo=UTC), None, (None, None)),
-        (1, "DESTINATION_UPLOAD", datetime.now(UTC), None, (None, None)),
-        (1, "SOURCE_DOWNLOAD", datetime.now(UTC), 1, (None, None)),
+        (1, "SOURCE_DOWNLOAD", datetime.now(UTC), None, False, ("SOURCE_DOWNLOAD", 2, False)),
+        (2, "SOURCE_DOWNLOAD", datetime.now(UTC), None, False, (None, None, None)),
+        (1, "SOURCE_DOWNLOAD", datetime(2026, 1, 1, tzinfo=UTC), None, False, (None, None, None)),
+        (1, "DESTINATION_UPLOAD", datetime.now(UTC), None, False, (None, None, None)),
+        (1, "SOURCE_DOWNLOAD", datetime.now(UTC), 1, False, (None, None, None)),
+        (1, "SOURCE_DOWNLOAD", datetime.now(UTC), 2, True, ("SOURCE_DOWNLOAD", 2, True)),
     ],
 )
 def test_historical_diagnostic_must_match_unique_file_current_attempt_and_stage(
-    basename_matches, event_stage, created_at, global_attempt, expected
+    basename_matches, event_stage, created_at, global_attempt, retryable, expected
 ):
     store = MemoryStore()
     user = store.add_user("history-owner", "history@example.test", "hash")
@@ -127,6 +163,7 @@ def test_historical_diagnostic_must_match_unique_file_current_attempt_and_stage(
         "provider": "MEGA",
         "provider_stage": event_stage,
         "destination_write_started": False,
+        "retryable": retryable,
     }
     if global_attempt is not None:
         details["transfer_attempt"] = global_attempt

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -14,6 +14,28 @@ class SkipAndResumeRequest(BaseModel):
     request_id: uuid.UUID
     reason: Literal["USER_ACCEPTED_SOURCE_FAILURE"]
     source_file_error_policy: SourceFileErrorPolicy | None = None
+
+    @field_validator("source_file_error_policy")
+    @classmethod
+    def automatic_omission_must_remain_disabled(
+        cls, value: SourceFileErrorPolicy | None
+    ) -> SourceFileErrorPolicy | None:
+        if value not in (None, SourceFileErrorPolicy.STOP):
+            raise ValueError("La omisión automática de archivos no está disponible todavía.")
+        return value
+
+
+class ResumeTransferRequest(BaseModel):
+    source_file_error_policy: SourceFileErrorPolicy | None = None
+
+    @field_validator("source_file_error_policy")
+    @classmethod
+    def automatic_omission_must_remain_disabled(
+        cls, value: SourceFileErrorPolicy | None
+    ) -> SourceFileErrorPolicy | None:
+        if value not in (None, SourceFileErrorPolicy.STOP):
+            raise ValueError("La omisión automática de archivos no está disponible todavía.")
+        return value
 
 
 class AcceptParentOmissionsRequest(BaseModel):
@@ -43,16 +65,19 @@ async def skip_and_resume_transfer(
     request: SkipAndResumeRequest,
 ) -> TransferRecord:
     """Run the audited state transition through the store's atomic unit of work."""
-    return await store.askip_transfer_item_and_resume(
-        transfer_id,
-        item_id,
-        actor_id=actor_id,
-        expected_attempt=request.expected_attempt,
-        request_id=request.request_id,
-        source_file_error_policy=(
-            request.source_file_error_policy.value
-            if request.source_file_error_policy is not None
-            else None
+    return cast(
+        TransferRecord,
+        await store.askip_transfer_item_and_resume(
+            transfer_id,
+            item_id,
+            actor_id=actor_id,
+            expected_attempt=request.expected_attempt,
+            request_id=request.request_id,
+            source_file_error_policy=(
+                request.source_file_error_policy.value
+                if request.source_file_error_policy is not None
+                else None
+            ),
         ),
     )
 
@@ -65,11 +90,14 @@ async def accept_parent_omissions(
     request: AcceptParentOmissionsRequest,
 ) -> TransferRecord:
     """Accept omissions from one specific successful parent attempt atomically."""
-    return await store.aaccept_parent_omissions(
-        child_id,
-        actor_id=actor_id,
-        expected_parent_attempt=request.expected_parent_attempt,
-        request_id=request.request_id,
+    return cast(
+        TransferRecord,
+        await store.aaccept_parent_omissions(
+            child_id,
+            actor_id=actor_id,
+            expected_parent_attempt=request.expected_parent_attempt,
+            request_id=request.request_id,
+        ),
     )
 
 
@@ -81,10 +109,13 @@ async def retry_omitted_transfer_items(
     request: RetryOmittedRequest,
 ) -> TransferRecord:
     """Requeue selected explicit omissions through the store's atomic unit of work."""
-    return await store.aretry_omitted_transfer_items(
-        transfer_id,
-        item_ids=request.item_ids,
-        actor_id=actor_id,
-        expected_attempt=request.expected_attempt,
-        request_id=request.request_id,
+    return cast(
+        TransferRecord,
+        await store.aretry_omitted_transfer_items(
+            transfer_id,
+            item_ids=request.item_ids,
+            actor_id=actor_id,
+            expected_attempt=request.expected_attempt,
+            request_id=request.request_id,
+        ),
     )

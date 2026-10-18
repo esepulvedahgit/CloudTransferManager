@@ -75,7 +75,15 @@ async def test_manifest_batches_are_idempotent_and_track_directory_and_file_resu
     )
     counts = await store.aget_transfer_manifest_counts(transfer.id)
 
-    assert counts == {"total": 2, "pending": 0, "copied": 1, "skipped": 0, "failed": 0}
+    assert counts == {
+        "total": 2,
+        "pending": 0,
+        "copied": 1,
+        "skipped": 0,
+        "failed": 0,
+        "omitted": 0,
+        "omitted_bytes": 0,
+    }
 
 
 @pytest.mark.asyncio

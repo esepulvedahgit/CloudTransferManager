@@ -2278,7 +2278,13 @@ class DatabaseStore:
                         select(AuditEvent).where(
                             AuditEvent.resource_type == "transfer",
                             AuditEvent.resource_id == str(child_id),
-                            AuditEvent.action == "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                            AuditEvent.action.in_(
+                                (
+                                    "TRANSFER_FILE_OMITTED",
+                                    "TRANSFER_OMITTED_FILES_RETRIED",
+                                    "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                                )
+                            ),
                         )
                     )
                 ).all()
@@ -2286,6 +2292,10 @@ class DatabaseStore:
                     metadata = prior.event_metadata or {}
                     if metadata.get("request_id") != str(request_id):
                         continue
+                    if prior.actor_user_id != actor_id:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used by another actor"
+                        )
                     if metadata.get("request_hash") != request_hash:
                         raise TransferRecoveryConflictError(
                             "Request id was already used for a different acceptance"
@@ -2415,7 +2425,13 @@ class DatabaseStore:
                         select(AuditEvent).where(
                             AuditEvent.resource_type == "transfer",
                             AuditEvent.resource_id == str(transfer_id),
-                            AuditEvent.action == "TRANSFER_OMITTED_FILES_RETRIED",
+                            AuditEvent.action.in_(
+                                (
+                                    "TRANSFER_FILE_OMITTED",
+                                    "TRANSFER_OMITTED_FILES_RETRIED",
+                                    "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                                )
+                            ),
                         )
                     )
                 ).all()
@@ -2423,6 +2439,10 @@ class DatabaseStore:
                     metadata = prior.event_metadata or {}
                     if metadata.get("request_id") != str(request_id):
                         continue
+                    if prior.actor_user_id != actor_id:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used by another actor"
+                        )
                     if metadata.get("request_hash") != request_hash:
                         raise TransferRecoveryConflictError(
                             "Request id was already used for a different retry"
@@ -2624,12 +2644,24 @@ class DatabaseStore:
                 if row is None:
                     raise TransferRecoveryNotFoundError("Transfer not found")
 
+                actor = await session.get(User, actor_id)
+                if actor is None or not actor.is_active:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                if actor.role != "ADMIN" and row.requested_by != actor_id:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+
                 prior_audits = (
                     await session.scalars(
                         select(AuditEvent).where(
                             AuditEvent.resource_type == "transfer",
                             AuditEvent.resource_id == str(transfer_id),
-                            AuditEvent.action == "TRANSFER_FILE_OMITTED",
+                            AuditEvent.action.in_(
+                                (
+                                    "TRANSFER_FILE_OMITTED",
+                                    "TRANSFER_OMITTED_FILES_RETRIED",
+                                    "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                                )
+                            ),
                         )
                     )
                 ).all()
@@ -2637,6 +2669,10 @@ class DatabaseStore:
                     metadata = prior.event_metadata or {}
                     if metadata.get("request_id") != str(request_id):
                         continue
+                    if prior.actor_user_id != actor_id:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used by another actor"
+                        )
                     if metadata.get("request_hash") != request_hash:
                         raise TransferRecoveryConflictError(
                             "Request id was already used for a different recovery action"
@@ -2645,11 +2681,6 @@ class DatabaseStore:
                     replay.idempotent_replay = True
                     return replay
 
-                actor = await session.get(User, actor_id)
-                if actor is None or not actor.is_active:
-                    raise TransferRecoveryNotFoundError("Transfer not found")
-                if actor.role != "ADMIN" and row.requested_by != actor_id:
-                    raise TransferRecoveryNotFoundError("Transfer not found")
                 if expected_attempt != row.attempt_count:
                     raise TransferRecoveryConflictError("Transfer attempt changed")
                 if row.status != "FAILED":
@@ -2751,7 +2782,7 @@ class DatabaseStore:
                 )
                 transfer = self._transfer(row)
                 transfer.source_provider_type = source.provider_type
-                failure_stage, failure_attempt = resolve_failure_evidence(
+                failure_stage, failure_attempt, failure_retryable = resolve_failure_evidence(
                     transfer,
                     self._manifest_item(item),
                     events,
@@ -2763,6 +2794,7 @@ class DatabaseStore:
                     manifest_item,
                     failure_stage=failure_stage,
                     failure_attempt=failure_attempt,
+                    failure_retryable=failure_retryable,
                 ):
                     raise TransferRecoveryConflictError(
                         skip_unavailable_reason(
@@ -2770,6 +2802,7 @@ class DatabaseStore:
                             manifest_item,
                             failure_stage=failure_stage,
                             failure_attempt=failure_attempt,
+                            failure_retryable=failure_retryable,
                         )
                         or "Transfer item cannot be omitted"
                     )
@@ -3520,12 +3553,27 @@ class DatabaseStore:
                 )
                 or 0
             )
+            omission_totals = (
+                await session.execute(
+                    select(
+                        func.count(),
+                        func.coalesce(
+                            func.sum(func.coalesce(TransferManifestItem.size_bytes, 0)), 0
+                        ),
+                    ).where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.omission_kind.is_not(None),
+                    )
+                )
+            ).one()
             return {
                 "total": sum(counts.values()),
                 "pending": counts.get("PENDING", 0) + pending_directories,
                 "copied": counts.get("COPIED", 0),
                 "skipped": counts.get("SKIPPED", 0),
                 "failed": counts.get("FAILED", 0),
+                "omitted": int(omission_totals[0]),
+                "omitted_bytes": int(omission_totals[1]),
             }
 
     async def alist_transfer_manifest_summaries(

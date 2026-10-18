@@ -97,6 +97,15 @@ async def test_login_mock_navigation_copy_progress_and_history():
             headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
         )
         assert rejected_legacy_policy.status_code == 422
+        rejected_automatic_omission = await client.post(
+            "/api/v1/transfers",
+            json={
+                **transfer_payload,
+                "source_file_error_policy": "SKIP_CONFIRMED_RESTRICTED",
+            },
+            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert rejected_automatic_omission.status_code == 422
 
         deadline = asyncio.get_running_loop().time() + 3
         while asyncio.get_running_loop().time() < deadline:

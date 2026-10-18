@@ -206,6 +206,9 @@ async def test_database_store_skip_and_resume_commits_manifest_and_audit_togethe
     )
     await store.create_schema()
     user = await store.acreate_user("recovery-owner", "recovery@example.test", "hash")
+    other_admin = await store.acreate_user(
+        "recovery-other-admin", "recovery-other-admin@example.test", "hash", role="ADMIN"
+    )
     source = await store.acreate_connection("MEGA", "MEGA", user.id, uuid.uuid4(), b"source")
     destination = await store.acreate_connection(
         "Seafile", "SEAFILE", user.id, uuid.uuid4(), b"destination"
@@ -299,6 +302,14 @@ async def test_database_store_skip_and_resume_commits_manifest_and_audit_togethe
         expected_attempt=2,
         request_id=request_id,
     )
+    with pytest.raises(TransferRecoveryConflictError, match="actor"):
+        await store.askip_transfer_item_and_resume(
+            transfer.id,
+            item.id,
+            actor_id=other_admin.id,
+            expected_attempt=2,
+            request_id=request_id,
+        )
     with pytest.raises(TransferRecoveryConflictError):
         await store.askip_transfer_item_and_resume(
             transfer.id,
@@ -322,12 +333,28 @@ async def test_database_store_skip_and_resume_commits_manifest_and_audit_togethe
         assert manifest_row.status == "SKIPPED"
         assert manifest_row.omission_kind == "USER_ACCEPTED_SOURCE_FAILURE"
         assert manifest_row.omitted_by == user.id
+    manifest_counts = await store.aget_transfer_manifest_counts(transfer.id)
+    async with store.sessions() as session:
+        row = await session.get(TransferJob, transfer.id)
+        assert row is not None
+        row.status = "COMPLETED_WITH_WARNINGS"
+        await session.commit()
+    with pytest.raises(TransferRecoveryConflictError, match="Request id"):
+        await store.aretry_omitted_transfer_items(
+            transfer.id,
+            item_ids=[item.id],
+            actor_id=user.id,
+            expected_attempt=3,
+            request_id=request_id,
+        )
     await store.aclose()
 
     assert resumed.status == "QUEUED" and resumed.attempt_count == 3
     assert replay.idempotent_replay is True
     assert replay.attempt_count == 3
     assert audit_actions == ["TRANSFER_FILE_OMITTED", "TRANSFER_RESUMED"]
+    assert manifest_counts["omitted"] == 1
+    assert manifest_counts["omitted_bytes"] == 686_289_042
 
 
 @pytest.mark.asyncio
@@ -779,7 +806,10 @@ async def test_postgres_skip_and_resume_serializes_concurrent_same_request():
         pytest.skip("CTM_TEST_POSTGRES_URL is not configured")
     store = DatabaseStore(Settings(database_url=database_url))
     await store.create_schema()
-    user = await store.acreate_user("pg-recovery", "pg-recovery@example.test", "hash")
+    suffix = uuid.uuid4().hex
+    user = await store.acreate_user(
+        f"pg-recovery-{suffix}", f"pg-recovery-{suffix}@example.test", "hash"
+    )
     source = await store.acreate_connection("MEGA", "MEGA", user.id, uuid.uuid4(), b"source")
     destination = await store.acreate_connection(
         "Seafile", "SEAFILE", user.id, uuid.uuid4(), b"destination"
@@ -854,11 +884,40 @@ async def test_postgres_skip_and_resume_serializes_concurrent_same_request():
             )
             or 0
         )
-    await store.aclose()
-
     assert attempt_count == 3
     assert audit_count == 1
     assert all(result.status == "QUEUED" and result.attempt_count == 3 for result in results)
+    async with store.sessions() as session:
+        async with session.begin():
+            await session.execute(
+                delete(AuditEvent).where(AuditEvent.resource_id == str(transfer.id))
+            )
+            await session.execute(
+                delete(TransferNotificationOutbox).where(
+                    TransferNotificationOutbox.transfer_job_id == transfer.id
+                )
+            )
+            await session.execute(
+                delete(TransferEvent).where(TransferEvent.transfer_job_id == transfer.id)
+            )
+            await session.execute(
+                delete(TransferEvaluation).where(
+                    TransferEvaluation.transfer_job_id == transfer.id
+                )
+            )
+            await session.execute(
+                delete(TransferManifestItem).where(
+                    TransferManifestItem.transfer_job_id == transfer.id
+                )
+            )
+            await session.execute(delete(TransferJob).where(TransferJob.id == transfer.id))
+            await session.execute(
+                delete(StorageConnection).where(
+                    StorageConnection.id.in_([source.id, destination.id])
+                )
+            )
+            await session.execute(delete(User).where(User.id == user.id))
+    await store.aclose()
 
 
 @pytest.mark.asyncio
