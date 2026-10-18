@@ -84,7 +84,7 @@ async def test_sse_reloads_transfer_after_subscribing_to_avoid_lost_terminal_eve
     assert '"status":"COMPLETED"' in frames[0]
     assert '"progress_percent":100.0' in frames[0]
     assert (
-        '"manifest_summary":{"copied":0,"failed":1,"skipped":0,"pending":0,"renamed":0}'
+        '"manifest_summary":{"copied":0,"failed":1,"skipped":0,"pending":0,"renamed":0,"omitted":0,"omitted_bytes":0}'
         in frames[0]
     )
 

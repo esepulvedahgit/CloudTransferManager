@@ -289,6 +289,198 @@ async def test_failed_or_cancelled_parent_omissions_cannot_be_accepted(
 
 
 @pytest.mark.asyncio
+async def test_retry_omitted_files_is_attempt_scoped_audited_and_idempotent(monkeypatch):
+    store = MemoryStore()
+    user = store.add_user(
+        "retry-omitted-owner",
+        "retry-omitted-owner@example.test",
+        PasswordService().hash("A-Strong-Password123!"),
+    )
+    source = store.create_connection("Source", "MEGA", user.id, encrypted_credentials=b"source")
+    destination = store.create_connection(
+        "Destination", "SEAFILE", user.id, encrypted_credentials=b"destination"
+    )
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/source"], "/destination"
+    )
+    transfer.status = "COMPLETED_WITH_WARNINGS"
+    transfer.attempt_count = 3
+    transfer.files_total = 3
+    transfer.files_completed = 3
+    transfer.bytes_total = 30
+    transfer.bytes_transferred = 10
+    transfer.warning_count = 2
+    transfer.completed_at = datetime.now(UTC)
+    await store.asave_transfer(transfer)
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": f"/source/{name}",
+                "destination_path": f"/destination/{name}",
+                "size_bytes": size,
+            }
+            for name, size in (("one.rar", 10), ("two.rar", 10), ("legacy.txt", 10))
+        ],
+    )
+    items = await store.alist_transfer_manifest_items(transfer.id, limit=10)
+    by_name = {item.source_path.rsplit("/", 1)[-1]: item for item in items}
+    for name in ("one.rar", "two.rar", "legacy.txt"):
+        by_name[name].status = "SKIPPED"
+    for name in ("one.rar", "two.rar"):
+        by_name[name].omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+        by_name[name].omitted_at = datetime.now(UTC)
+
+    app = create_app(
+        Settings(
+            app_env="production",
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+        ),
+        store=store,
+    )
+    app.state.event_bus = None
+    dispatches = []
+    monkeypatch.setattr(
+        "app.worker.dispatch_pending_transfers.delay", lambda: dispatches.append("transfer")
+    )
+    client = await logged_in_client(app, user.username)
+    request_id = uuid.uuid4()
+    body = {
+        "expected_attempt": 3,
+        "request_id": str(request_id),
+        "item_ids": [str(by_name["one.rar"].id)],
+    }
+    url = f"/api/v1/transfers/{transfer.id}/retry-omitted"
+    headers = {"X-CSRF-Token": client.cookies["ctm_csrf"]}
+    response = await client.post(url, json=body, headers=headers)
+    replay = await client.post(url, json=body, headers=headers)
+    reused = await client.post(
+        url,
+        json={**body, "item_ids": [str(by_name["two.rar"].id)]},
+        headers=headers,
+    )
+    duplicate = await client.post(
+        url,
+        json={**body, "request_id": str(uuid.uuid4()), "item_ids": [
+            str(by_name["one.rar"].id), str(by_name["one.rar"].id)
+        ]},
+        headers=headers,
+    )
+    await client.aclose()
+
+    summary = (await store.alist_transfer_manifest_summaries([transfer.id]))[transfer.id]
+    audits = await store.alist_audit_events(limit=100)
+    assert response.status_code == 202
+    assert response.json()["attempt_count"] == 4
+    assert replay.status_code == 202
+    assert reused.status_code == 409
+    assert duplicate.status_code == 422
+    assert dispatches == ["transfer"]
+    assert by_name["one.rar"].status == "PENDING"
+    assert by_name["one.rar"].omission_kind is None
+    assert by_name["two.rar"].status == "SKIPPED"
+    assert by_name["legacy.txt"].status == "SKIPPED"
+    assert transfer.status == "QUEUED"
+    assert transfer.attempt_count == 4
+    assert transfer.files_completed == 2
+    assert transfer.warning_count == 1
+    assert transfer.bytes_transferred == 10
+    assert transfer.source_file_error_policy == "STOP"
+    assert summary["omitted"] == 1
+    assert summary["pending"] == 1
+    assert any(
+        event["action"] == "TRANSFER_OMITTED_FILES_RETRIED" for event in audits
+    )
+
+
+@pytest.mark.asyncio
+async def test_manifest_marks_only_explicit_terminal_omissions_retryable():
+    store = MemoryStore()
+    user = store.add_user(
+        "retry-eligibility",
+        "retry-eligibility@example.test",
+        PasswordService().hash("A-Strong-Password123!"),
+    )
+    source = store.create_connection("Source", "MOCK", user.id)
+    destination = store.create_connection("Destination", "MOCK", user.id)
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/source"], "/destination"
+    )
+    transfer.status = "COMPLETED_WITH_WARNINGS"
+    await store.asave_transfer(transfer)
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {"source_path": "/source/omitted.rar", "destination_path": "/destination/omitted.rar"},
+            {"source_path": "/source/legacy.rar", "destination_path": "/destination/legacy.rar"},
+        ],
+    )
+    items = await store.alist_transfer_manifest_items(transfer.id, limit=10)
+    for item in items:
+        item.status = "SKIPPED"
+    explicit = next(item for item in items if item.source_path.endswith("omitted.rar"))
+    explicit.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+    explicit.omitted_at = datetime.now(UTC)
+    app = create_app(
+        Settings(app_secret_key="test-secret-key", session_cookie_secure=False), store=store
+    )
+    client = await logged_in_client(app, user.username)
+    response = await client.get(f"/api/v1/transfers/{transfer.id}/items")
+    await client.aclose()
+
+    assert response.status_code == 200
+    public_items = {row["source_path"]: row for row in response.json()["items"]}
+    assert public_items["/source/omitted.rar"]["can_retry_omission"] is True
+    assert public_items["/source/legacy.rar"]["can_retry_omission"] is False
+
+
+@pytest.mark.asyncio
+async def test_omissions_csv_is_terminal_only_and_returns_safe_csv():
+    store = MemoryStore()
+    user = store.add_user(
+        "report-user",
+        "report-user@example.test",
+        PasswordService().hash("A-Strong-Password123!"),
+    )
+    source = store.create_connection("Source", "MOCK", user.id)
+    destination = store.create_connection("Destination", "MOCK", user.id)
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/source"], "/destination"
+    )
+    transfer.status = "COMPLETED_WITH_WARNINGS"
+    await store.asave_transfer(transfer)
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": '/source/=HYPERLINK("https://example.invalid")',
+                "destination_path": "/destination/restricted.rar",
+                "size_bytes": 100,
+            }
+        ],
+    )
+    item = (await store.alist_transfer_manifest_items(transfer.id))[0]
+    item.status = "SKIPPED"
+    item.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+    item.omitted_at = datetime.now(UTC)
+    app = create_app(
+        Settings(app_secret_key="test-secret-key", session_cookie_secure=False), store=store
+    )
+    client = await logged_in_client(app, user.username)
+    response = await client.get(f"/api/v1/transfers/{transfer.id}/omissions.csv")
+    transfer.status = "RUNNING"
+    nonterminal = await client.get(f"/api/v1/transfers/{transfer.id}/omissions.csv")
+    await client.aclose()
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "'/source/=HYPERLINK" in response.text
+    assert "/destination/restricted.rar" in response.text
+    assert nonterminal.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_skip_and_resume_requires_csrf(monkeypatch):
     store = MemoryStore()
     user = store.add_user(

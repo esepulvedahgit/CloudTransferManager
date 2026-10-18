@@ -180,6 +180,23 @@ def parent_omissions_request_hash(*, child_id: uuid.UUID, expected_parent_attemp
     ).hexdigest()
 
 
+def retry_omissions_request_hash(
+    *,
+    transfer_id: uuid.UUID,
+    expected_attempt: int,
+    item_ids: list[uuid.UUID],
+) -> str:
+    payload = {
+        "action": "retry-omitted",
+        "transfer_id": str(transfer_id),
+        "expected_attempt": expected_attempt,
+        "item_ids": sorted(str(item_id) for item_id in item_ids),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     if isinstance(value, str):
         try:

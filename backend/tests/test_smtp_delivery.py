@@ -132,6 +132,31 @@ def test_smtp_delivery_uses_starttls_and_auth(monkeypatch):
     assert event_names[-1] == "quit"
 
 
+def test_transfer_email_includes_omission_counts_from_snapshot_without_file_paths():
+    transfer = SimpleNamespace(
+        public_id="TRF-2026-000001",
+        status="COMPLETED_WITH_WARNINGS",
+        bytes_transferred=1024,
+        omitted=1,
+        omitted_bytes=686_289_042,
+        created_at=None,
+        completed_at=None,
+    )
+
+    subject, body = notifications.render_transfer_email(
+        transfer,
+        "MEGA",
+        "Drive",
+        "https://transfer.example.test",
+    )
+
+    assert subject.endswith("COMPLETED_WITH_WARNINGS")
+    assert "Archivos omitidos: 1" in body
+    assert "Tamaño omitido: 654.5 MB" in body
+    assert "https://transfer.example.test" in body
+    assert "restricted.rar" not in body
+
+
 @pytest.mark.parametrize("failure_phase", ["connect", "starttls", "login"])
 def test_smtp_connection_sanitizes_transport_failures(monkeypatch, failure_phase):
     secret = "smtp-transport-secret"

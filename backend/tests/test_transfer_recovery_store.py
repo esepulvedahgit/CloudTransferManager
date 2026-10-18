@@ -495,6 +495,211 @@ async def test_database_accept_parent_omissions_is_attempt_scoped_and_idempotent
 
 
 @pytest.mark.asyncio
+async def test_database_retry_omitted_files_reopens_only_selected_rows_and_keeps_history(tmp_path):
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'retry-omitted.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("retry-omitted", "retry-omitted@example.test", "hash")
+    source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
+    await store.agrant_connection(user.id, source.id, user.id)
+    await store.agrant_connection(user.id, destination.id, user.id)
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/source"], "/destination"
+    )
+    transfer.status = "COMPLETED_WITH_WARNINGS"
+    transfer.attempt_count = 4
+    transfer.files_total = 4
+    transfer.files_completed = 4
+    transfer.bytes_total = 100
+    transfer.bytes_transferred = 10
+    transfer.warning_count = 3
+    transfer.completed_at = datetime.now(UTC)
+    await store.asave_transfer(transfer)
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": f"/source/{name}",
+                "destination_path": f"/destination/{name}",
+                "size_bytes": size,
+            }
+            for name, size in (
+                ("copied.bin", 10),
+                ("omitted-one.rar", 20),
+                ("omitted-two.rar", 21),
+                ("legacy-skip.bin", 7),
+            )
+        ],
+    )
+    items = await store.alist_transfer_manifest_items(transfer.id, limit=10)
+    by_name = {item.source_path.rsplit("/", 1)[-1]: item for item in items}
+    now = datetime.now(UTC)
+    async with store.sessions() as session:
+        async with session.begin():
+            transfer_row = await session.get(TransferJob, transfer.id)
+            assert transfer_row is not None
+            for name, status_value in (
+                ("copied.bin", "COPIED"),
+                ("omitted-one.rar", "SKIPPED"),
+                ("omitted-two.rar", "SKIPPED"),
+                ("legacy-skip.bin", "SKIPPED"),
+            ):
+                item_row = await session.get(TransferManifestItem, by_name[name].id)
+                assert item_row is not None
+                item_row.status = status_value
+                if name.startswith("omitted-"):
+                    item_row.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+                    item_row.omitted_at = now
+                    item_row.omitted_by = user.id
+            selected_row = await session.get(TransferManifestItem, by_name["omitted-one.rar"].id)
+            assert selected_row is not None
+            session.add(
+                AuditEvent(
+                    actor_user_id=user.id,
+                    action="TRANSFER_FILE_OMITTED",
+                    resource_type="transfer",
+                    resource_id=str(transfer.id),
+                    result="SUCCESS",
+                    event_metadata={"manifest_item_id": str(selected_row.id)},
+                )
+            )
+
+    request_id = uuid.uuid4()
+    result = await store.aretry_omitted_transfer_items(
+        transfer.id,
+        item_ids=[by_name["omitted-one.rar"].id],
+        actor_id=user.id,
+        expected_attempt=4,
+        request_id=request_id,
+    )
+    replay = await store.aretry_omitted_transfer_items(
+        transfer.id,
+        item_ids=[by_name["omitted-one.rar"].id],
+        actor_id=user.id,
+        expected_attempt=4,
+        request_id=request_id,
+    )
+    with pytest.raises(TransferRecoveryConflictError):
+        await store.aretry_omitted_transfer_items(
+            transfer.id,
+            item_ids=[by_name["omitted-two.rar"].id],
+            actor_id=user.id,
+            expected_attempt=4,
+            request_id=request_id,
+        )
+
+    async with store.sessions() as session:
+        selected_row = await session.get(TransferManifestItem, by_name["omitted-one.rar"].id)
+        untouched_row = await session.get(TransferManifestItem, by_name["omitted-two.rar"].id)
+        legacy_row = await session.get(TransferManifestItem, by_name["legacy-skip.bin"].id)
+        stored_transfer = await session.get(TransferJob, transfer.id)
+        audit_actions = list(
+            (
+                await session.scalars(
+                    select(AuditEvent.action).where(AuditEvent.resource_id == str(transfer.id))
+                )
+            ).all()
+        )
+        assert selected_row is not None
+        assert untouched_row is not None and legacy_row is not None and stored_transfer is not None
+        selected_state = (
+            selected_row.status,
+            selected_row.destination_path,
+            selected_row.omission_kind,
+            selected_row.omitted_at,
+            selected_row.omitted_by,
+        )
+        untouched_state = (untouched_row.status, untouched_row.omission_kind)
+        legacy_state = (legacy_row.status, legacy_row.omission_kind)
+        transfer_state = (
+            stored_transfer.status,
+            stored_transfer.attempt_count,
+            stored_transfer.files_completed,
+            stored_transfer.warning_count,
+            stored_transfer.bytes_transferred,
+            stored_transfer.source_file_error_policy,
+        )
+    await store.aclose()
+
+    assert result.attempt_count == replay.attempt_count == 5
+    assert replay.idempotent_replay is True
+    assert selected_state == ("PENDING", "/destination/omitted-one.rar", None, None, None)
+    assert untouched_state == ("SKIPPED", "USER_ACCEPTED_SOURCE_FAILURE")
+    assert legacy_state == ("SKIPPED", None)
+    assert transfer_state == ("QUEUED", 5, 3, 2, 10, "STOP")
+    assert audit_actions.count("TRANSFER_FILE_OMITTED") == 1
+    assert audit_actions.count("TRANSFER_OMITTED_FILES_RETRIED") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        ("active", TransferRecoveryConflictError),
+        ("reserved", TransferRecoveryConflictError),
+        ("credentials", TransferRecoveryConflictError),
+        ("copy_started", TransferRecoveryConflictError),
+        ("legacy_skip", TransferRecoveryConflictError),
+        ("foreign_item", TransferRecoveryNotFoundError),
+        ("duplicate_ids", TransferRecoveryConflictError),
+    ],
+)
+async def test_memory_retry_omitted_files_rejects_unsafe_state_and_selection(
+    failure, expected_error
+):
+    store = MemoryStore()
+    user = store.add_user(f"retry-{failure}", f"retry-{failure}@example.test", "hash")
+    source = store.create_connection("Source", "MOCK", user.id)
+    destination = store.create_connection("Destination", "MOCK", user.id)
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/source"], "/destination"
+    )
+    transfer.status = "COMPLETED_WITH_WARNINGS"
+    transfer.attempt_count = 2
+    await store.asave_transfer(transfer)
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {"source_path": "/source/omitted.rar", "destination_path": "/destination/omitted.rar"},
+            {"source_path": "/source/legacy.rar", "destination_path": "/destination/legacy.rar"},
+        ],
+    )
+    items = await store.alist_transfer_manifest_items(transfer.id, limit=10)
+    explicit = next(item for item in items if item.source_path.endswith("omitted.rar"))
+    legacy = next(item for item in items if item.source_path.endswith("legacy.rar"))
+    for item in items:
+        item.status = "SKIPPED"
+    explicit.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+    explicit.omitted_at = datetime.now(UTC)
+    selected_ids = [explicit.id]
+    if failure == "active":
+        transfer.status = "RUNNING"
+    elif failure == "reserved":
+        transfer.dispatch_token = uuid.uuid4()
+    elif failure == "credentials":
+        source.credential_version += 1
+    elif failure == "copy_started":
+        explicit.copy_started = True
+    elif failure == "legacy_skip":
+        selected_ids = [legacy.id]
+    elif failure == "foreign_item":
+        selected_ids = [uuid.uuid4()]
+    elif failure == "duplicate_ids":
+        selected_ids = [explicit.id, explicit.id]
+
+    with pytest.raises(expected_error):
+        await store.aretry_omitted_transfer_items(
+            transfer.id,
+            item_ids=selected_ids,
+            actor_id=user.id,
+            expected_attempt=2,
+            request_id=uuid.uuid4(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_memory_store_fences_concurrent_replays_and_revoked_connection_access():
     store = MemoryStore()
     user = store.add_user("private-owner", "private@example.test", "hash")
@@ -804,3 +1009,107 @@ async def test_postgres_parent_retry_racing_child_dispatch_requires_new_acceptan
     assert updated_child is not None
     assert updated_child.status == "QUEUED"
     assert updated_child.wait_reason == "BLOCKED_PARENT_OMISSIONS"
+
+
+@pytest.mark.asyncio
+async def test_postgres_retries_selected_omissions_once_for_concurrent_same_request():
+    database_url = os.environ.get("CTM_TEST_POSTGRES_URL")
+    if not database_url:
+        pytest.skip("CTM_TEST_POSTGRES_URL is not configured")
+    store = DatabaseStore(Settings(database_url=database_url))
+    await store.create_schema()
+    suffix = uuid.uuid4().hex
+    user = await store.acreate_user(
+        f"pg-omitted-retry-{suffix}", f"pg-omitted-retry-{suffix}@example.test", "hash"
+    )
+    source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
+    destination = await store.acreate_connection(
+        "Destination", "MOCK", user.id, uuid.uuid4(), b""
+    )
+    await store.agrant_connection(user.id, source.id, user.id)
+    await store.agrant_connection(user.id, destination.id, user.id)
+    transfer = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/source"], "/destination"
+    )
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": "/source/restricted.rar",
+                "destination_path": "/destination/restricted.rar",
+                "size_bytes": 100,
+            }
+        ],
+    )
+    item = (await store.alist_transfer_manifest_items(transfer.id))[0]
+    async with store.sessions() as session:
+        async with session.begin():
+            item_row = await session.get(TransferManifestItem, item.id)
+            assert item_row is not None
+            item_row.status = "SKIPPED"
+            item_row.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+            item_row.omitted_at = datetime.now(UTC)
+    terminal = await store.aget_transfer(transfer.id)
+    assert terminal is not None
+    terminal.status = "COMPLETED_WITH_WARNINGS"
+    terminal.attempt_count = 2
+    terminal.files_total = 1
+    terminal.files_completed = 1
+    terminal.bytes_total = 100
+    terminal.warning_count = 1
+    terminal.completed_at = datetime.now(UTC)
+    await store.asave_transfer(terminal)
+
+    request_id = uuid.uuid4()
+    results = await asyncio.gather(
+        *[
+            store.aretry_omitted_transfer_items(
+                transfer.id,
+                item_ids=[item.id],
+                actor_id=user.id,
+                expected_attempt=2,
+                request_id=request_id,
+            )
+            for _ in range(2)
+        ]
+    )
+    async with store.sessions() as session:
+        async with session.begin():
+            persisted_attempt = await session.scalar(
+                select(TransferJob.attempt_count).where(TransferJob.id == transfer.id)
+            )
+            audit_count = await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.resource_id == str(transfer.id),
+                    AuditEvent.action == "TRANSFER_OMITTED_FILES_RETRIED",
+                )
+            )
+            await session.execute(
+                delete(AuditEvent).where(AuditEvent.resource_id == str(transfer.id))
+            )
+            await session.execute(
+                delete(TransferNotificationOutbox).where(
+                    TransferNotificationOutbox.transfer_job_id == transfer.id
+                )
+            )
+            await session.execute(
+                delete(TransferEvent).where(TransferEvent.transfer_job_id == transfer.id)
+            )
+            await session.execute(
+                delete(TransferManifestItem).where(
+                    TransferManifestItem.transfer_job_id == transfer.id
+                )
+            )
+            await session.execute(delete(TransferJob).where(TransferJob.id == transfer.id))
+            await session.execute(
+                delete(StorageConnection).where(
+                    StorageConnection.id.in_([source.id, destination.id])
+                )
+            )
+            await session.execute(delete(User).where(User.id == user.id))
+    await store.aclose()
+
+    assert sum(result.idempotent_replay for result in results) == 1
+    assert all(result.attempt_count == 3 for result in results)
+    assert persisted_attempt == 3
+    assert audit_count == 1

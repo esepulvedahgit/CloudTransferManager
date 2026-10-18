@@ -32,6 +32,8 @@ def render_transfer_email(
         f"Origen: {source_name}\n"
         f"Destino: {destination_name}\n"
         f"Datos transferidos: {format_bytes(transfer.bytes_transferred)}\n"
+        f"Archivos omitidos: {getattr(transfer, 'omitted', 0)}\n"
+        f"Tamaño omitido: {format_bytes(getattr(transfer, 'omitted_bytes', 0))}\n"
     )
     if transfer.created_at and transfer.completed_at:
         elapsed = max(0, int((transfer.completed_at - transfer.created_at).total_seconds()))

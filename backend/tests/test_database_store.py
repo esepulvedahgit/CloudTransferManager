@@ -16,6 +16,7 @@ from app.models import (
     StorageConnection,
     TransferCounter,
     TransferJob,
+    TransferManifestItem,
     TransferNotificationOutbox,
     User,
 )
@@ -746,6 +747,81 @@ async def test_terminal_transfer_and_notification_intent_commit_together(tmp_pat
     await store.aclose()
 
     assert outbox_rows == [("PENDING", 1)]
+
+
+@pytest.mark.asyncio
+async def test_notification_outbox_keeps_terminal_omission_snapshot_after_later_retry(tmp_path):
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'omission-notification-outbox.sqlite'}",
+        session_cookie_secure=False,
+    )
+    store = DatabaseStore(settings)
+    await store.create_schema()
+    user = await store.acreate_user("omission-notify", "omission-notify@example.test", "hash")
+    source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
+    transfer = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/source"],
+        "/archive",
+        send_email_notification=True,
+    )
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": "/source/restricted.rar",
+                "destination_path": "/archive/restricted.rar",
+                "size_bytes": 686_289_042,
+            }
+        ],
+    )
+    omitted = (await store.alist_transfer_manifest_items(transfer.id))[0]
+    async with store.sessions() as session:
+        async with session.begin():
+            item_row = await session.get(TransferManifestItem, omitted.id)
+            assert item_row is not None
+            item_row.status = "SKIPPED"
+            item_row.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+            item_row.omitted_at = datetime.now(UTC)
+    terminal = await store.aget_transfer(transfer.id)
+    assert terminal is not None
+    terminal.status = "COMPLETED_WITH_WARNINGS"
+    terminal.completed_at = datetime.now(UTC)
+    await store.asave_transfer(terminal)
+
+    async with store.sessions() as session:
+        snapshot = await session.scalar(
+            select(TransferNotificationOutbox.snapshot).where(
+                TransferNotificationOutbox.transfer_job_id == transfer.id
+            )
+        )
+    assert snapshot is not None
+    async with store.sessions() as session:
+        async with session.begin():
+            transfer_row = await session.get(TransferJob, transfer.id)
+            item_row = await session.get(TransferManifestItem, omitted.id)
+            assert transfer_row is not None and item_row is not None
+            transfer_row.status = "QUEUED"
+            transfer_row.attempt_count += 1
+            item_row.status = "PENDING"
+            item_row.omission_kind = None
+            item_row.omitted_at = None
+
+    async with store.sessions() as session:
+        persisted_snapshot = await session.scalar(
+            select(TransferNotificationOutbox.snapshot).where(
+                TransferNotificationOutbox.transfer_job_id == transfer.id
+            )
+        )
+    await store.aclose()
+
+    assert snapshot["omitted"] == 1
+    assert snapshot["omitted_bytes"] == 686_289_042
+    assert persisted_snapshot == snapshot
+    assert "restricted.rar" not in str(snapshot)
 
 
 @pytest.mark.asyncio

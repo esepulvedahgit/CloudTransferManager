@@ -405,6 +405,8 @@ async def _send_notification(notification_id: uuid.UUID, dispatch_token: uuid.UU
                 public_id=snapshot["public_id"],
                 status=snapshot["status"],
                 bytes_transferred=snapshot["bytes_transferred"],
+                omitted=snapshot.get("omitted", 0),
+                omitted_bytes=snapshot.get("omitted_bytes", 0),
                 created_at=datetime.fromisoformat(snapshot["created_at"]),
                 completed_at=datetime.fromisoformat(snapshot["completed_at"]),
             )

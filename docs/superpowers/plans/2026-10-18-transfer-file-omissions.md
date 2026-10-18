@@ -117,12 +117,12 @@
 
 **Interfaces:** `RetryOmittedRequest(expected_attempt: int, request_id: UUID, item_ids: list[UUID])`, 1..100 IDs únicos. Store `aretry_omitted_transfer_items(transfer_id: UUID, *, item_ids: list[UUID], actor_id: UUID, expected_attempt: int, request_id: UUID) -> TransferRecord`. `iter_omissions_csv(store: Any, transfer_id: UUID) -> AsyncIterator[str]`, bajo autorización terminal previa.
 
-- [ ] Escribir pruebas fallidas: solo IDs omitidos seleccionados vuelven a `PENDING`, se limpian metadatos actuales de omisión pero se conserva auditoría; decrementan resueltos/avisos, preservan bytes y rutas, política `STOP`, nuevo intento una vez. Rechazar estados activos, reservas, IDs ajenos/duplicados, cambios de credenciales y `SKIPPED` históricos.
-- [ ] Ejecutar `cd backend && pytest tests/test_transfer_recovery_api.py tests/test_transfer_recovery_store.py tests/test_transfer_omission_report.py -q`.
-- [ ] Implementar `retry-omitted` con las mismas garantías transaccionales y de autorización que tarea 2; no habilitar reanudación general indiscriminada de `COMPLETED_WITH_WARNINGS`. Mantener referencias de auditoría a la omisión anterior.
-- [ ] Implementar informe CSV terminal con cursor, escape CSV y neutralización de fórmulas `=`, `+`, `-`, `@`, tab/CR. Probar Unicode, comillas, saltos, manifiesto multipágina y acceso denegado.
-- [ ] Añadir `omitted`/`omitted_bytes` a REST, snapshot SSE inicial y frames posteriores. Guardar conteos terminales en el snapshot del outbox; adaptar worker y renderer a snapshots nuevos/antiguos. Mostrar conteos y enlace al historial, sin rutas completas en el correo.
-- [ ] Probar outbox del intento previo tras reintentar omitidos: cuerpo/conteos permanecen los de su snapshot. Pasar `test_transfer_stream.py`, `test_smtp_delivery.py`, `test_audit.py` y `test_worker.py` junto a pruebas nuevas. Commit `feat: report and selectively retry omitted files`.
+- [x] Escribir pruebas fallidas: solo IDs omitidos seleccionados vuelven a `PENDING`, se limpian metadatos actuales de omisión pero se conserva auditoría; decrementan resueltos/avisos, preservan bytes y rutas, política `STOP`, nuevo intento una vez. Rechazar estados activos, reservas, IDs ajenos/duplicados, cambios de credenciales y `SKIPPED` históricos.
+- [x] Ejecutar `cd backend && pytest tests/test_transfer_recovery_api.py tests/test_transfer_recovery_store.py tests/test_transfer_omission_report.py -q`.
+- [x] Implementar `retry-omitted` con las mismas garantías transaccionales y de autorización que tarea 2; no habilitar reanudación general indiscriminada de `COMPLETED_WITH_WARNINGS`. Mantener referencias de auditoría a la omisión anterior.
+- [x] Implementar informe CSV terminal con cursor, escape CSV y neutralización de fórmulas `=`, `+`, `-`, `@`, tab/CR. Probar Unicode, comillas, saltos, manifiesto multipágina y acceso denegado.
+- [x] Añadir `omitted`/`omitted_bytes` a REST, snapshot SSE inicial y frames posteriores. Guardar conteos terminales en el snapshot del outbox; adaptar worker y renderer a snapshots nuevos/antiguos. Mostrar conteos y enlace al historial, sin rutas completas en el correo.
+- [x] Probar outbox del intento previo tras reintentar omitidos: cuerpo/conteos permanecen los de su snapshot. Pasar `test_transfer_stream.py`, `test_smtp_delivery.py`, `test_audit.py` y `test_worker.py` junto a pruebas nuevas. Commit `feat: report and selectively retry omitted files`.
 
 ## Task 6: Interfaz para recuperación y advertencias
 

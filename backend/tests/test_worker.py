@@ -464,7 +464,25 @@ async def test_worker_passes_resolved_smtp_config(monkeypatch, tmp_path):
         destination_path="/destination",
         send_email_notification=True,
     )
-    transfer.status = "COMPLETED"
+    await transfer_store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": "/private/restricted.rar",
+                "destination_path": "/archive/restricted.rar",
+                "size_bytes": 686_289_042,
+            }
+        ],
+    )
+    omitted = (await transfer_store.alist_transfer_manifest_items(transfer.id))[0]
+    omitted.status = "SKIPPED"
+    omitted.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+    transfer.status = "COMPLETED_WITH_WARNINGS"
+    await transfer_store.asave_transfer(transfer)
+    transfer.attempt_count += 1
+    transfer.status = "QUEUED"
+    omitted.status = "PENDING"
+    omitted.omission_kind = None
     await transfer_store.asave_transfer(transfer)
     notification_id, dispatch_token = (
         await transfer_store.adispatch_pending_notifications(datetime.now(UTC))
@@ -503,6 +521,10 @@ async def test_worker_passes_resolved_smtp_config(monkeypatch, tmp_path):
     assert captured["args"][1] == resolved
     assert captured["args"][2] == user.email
     assert captured["args"][3].public_id == transfer.public_id
+    assert captured["args"][3].omitted == 1
+    assert captured["args"][3].omitted_bytes == 686_289_042
+    snapshot = transfer_store.notification_outbox[notification_id]["snapshot"]
+    assert "restricted.rar" not in str(snapshot)
     assert transfer_store.notification_outbox[notification_id]["status"] == "SENT"
 
 

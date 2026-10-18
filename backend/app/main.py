@@ -65,6 +65,7 @@ from app.services.smtp_config import (
 )
 from app.services.transfer_evaluation import EvaluationConflictError
 from app.services.transfer_executor import TransferExecutor
+from app.services.transfer_omission_report import iter_omissions_csv
 from app.services.transfer_omissions import (
     SourceFileErrorPolicy,
     TransferRecoveryConflictError,
@@ -74,8 +75,10 @@ from app.services.transfer_omissions import (
 )
 from app.services.transfer_recovery import (
     AcceptParentOmissionsRequest,
+    RetryOmittedRequest,
     SkipAndResumeRequest,
     accept_parent_omissions,
+    retry_omitted_transfer_items,
     skip_and_resume_transfer,
 )
 from app.settings import Settings, get_settings
@@ -1932,6 +1935,41 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
         )
         return unavailable is None, unavailable
 
+    async def transfer_item_retry_omission_state(
+        record: TransferRecord,
+        item: Any,
+        user: UserAccount,
+    ) -> bool:
+        if record.status not in {"FAILED", "CANCELLED", "COMPLETED_WITH_WARNINGS"}:
+            return False
+        if item.is_dir or item.status != "SKIPPED" or item.omission_kind is None:
+            return False
+        if item.omitted_at is None or item.copy_started:
+            return False
+        if (
+            record.dispatch_token is not None
+            or record.dispatch_claimed_at is not None
+            or record.execution_started_at is not None
+            or record.execution_heartbeat_at is not None
+        ):
+            return False
+        source = await app.state.store.aget_connection(record.source_connection_id)
+        destination = await app.state.store.aget_connection(record.destination_connection_id)
+        if source is None or destination is None:
+            return False
+        if source.status != "ACTIVE" or destination.status != "ACTIVE":
+            return False
+        if (
+            source.credential_version != record.source_credential_version
+            or destination.credential_version != record.destination_credential_version
+        ):
+            return False
+        if user.role != "ADMIN":
+            for connection_id in (source.id, destination.id):
+                if not await app.state.store.ahas_connection_access(user.id, connection_id):
+                    return False
+        return True
+
     @app.get("/api/v1/transfers/capabilities")
     async def transfer_capabilities(
         _user: UserAccount = Depends(current_user),
@@ -2135,12 +2173,34 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             can_skip, unavailable_reason = await transfer_item_skip_state(record, item, user)
             public_item["can_skip"] = can_skip
             public_item["skip_unavailable_reason"] = unavailable_reason
+            public_item["can_retry_omission"] = await transfer_item_retry_omission_state(
+                record, item, user
+            )
             public_items.append(public_item)
         return {
             "items": public_items,
             "next_cursor": str(items[-1].id) if len(items) == limit else None,
             "counts": await app.state.store.aget_transfer_manifest_counts(record.id),
         }
+
+    @app.get("/api/v1/transfers/{transfer_id}/omissions.csv")
+    async def download_transfer_omissions_csv(
+        transfer_id: uuid.UUID,
+        user: UserAccount = Depends(current_user),
+    ) -> StreamingResponse:
+        record = await visible_transfer(transfer_id, user)
+        if record.status not in {"COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "CANCELLED"}:
+            raise HTTPException(
+                status_code=409,
+                detail="El informe de omisiones está disponible cuando termina la transferencia.",
+            )
+        return StreamingResponse(
+            iter_omissions_csv(app.state.store, record.id),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{record.public_id}-omissions.csv"'
+            },
+        )
 
     @app.post("/api/v1/transfers/{transfer_id}/resume", status_code=status.HTTP_202_ACCEPTED)
     async def resume_transfer(
@@ -2297,6 +2357,66 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             app.state.tasks.add(task)
             task.add_done_callback(app.state.tasks.discard)
         return resumed.public_dict()
+
+    @app.post(
+        "/api/v1/transfers/{transfer_id}/retry-omitted",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def retry_omitted_transfer_files(
+        transfer_id: uuid.UUID,
+        payload: RetryOmittedRequest,
+        user: UserAccount = Depends(current_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        await visible_transfer(transfer_id, user)
+        try:
+            retried = await retry_omitted_transfer_items(
+                app.state.store,
+                transfer_id,
+                actor_id=user.id,
+                request=payload,
+            )
+        except TransferRecoveryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Transferencia no encontrada") from exc
+        except (TransferRecoveryConflictError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        retried.manifest_summary = (
+            await app.state.store.alist_transfer_manifest_summaries([retried.id])
+        )[retried.id]
+        if retried.idempotent_replay:
+            return retried.public_dict()
+        if app.state.event_bus:
+            try:
+                await app.state.event_bus.clear_cancel(str(transfer_id))
+            except Exception:
+                pass
+        app.state.cancel_requests.discard(transfer_id)
+        await publish_transfer(retried)
+        if config.app_env.lower() == "production":
+            try:
+                from app.worker import dispatch_pending_transfers
+
+                dispatch_pending_transfers.delay()
+            except Exception:
+                # PostgreSQL keeps the queued attempt for the next Beat tick.
+                pass
+        elif retried.depends_on_transfer_id is None:
+
+            async def should_cancel_retried_transfer() -> bool:
+                return await cancel_requested(retried.id)
+
+            executor = TransferExecutor(
+                config,
+                app.state.store,
+                publish_transfer,
+                should_cancel_retried_transfer,
+            )
+            task = asyncio.create_task(executor.execute(retried.id))
+            app.state.tasks.add(task)
+            task.add_done_callback(app.state.tasks.discard)
+        return retried.public_dict()
 
     @app.post(
         "/api/v1/transfers/{transfer_id}/accept-parent-omissions",
