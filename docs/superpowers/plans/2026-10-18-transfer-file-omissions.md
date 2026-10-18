@@ -12,6 +12,8 @@
 
 **Estado:** aprobado para implementación por el usuario; el despliegue y la recuperación de la transferencia real siguen pendientes de revisión explícita.
 
+**Commits de la implementación:** `abfb928` (interfaz e informes), `7682f72` (diagnóstico conservador MEGA), `2904b08` (seguridad/idempotencia) y `5e57fbc` (documentación y validación).
+
 ## Global Constraints
 
 - «Solo operación `COPY`. Nunca eliminar ni alterar archivos en el almacenamiento de origen».
@@ -135,7 +137,7 @@
 - [x] Implementar componente e integración, contador de omitidos en activo/historial, advertencia persistente y fin de procesamiento distinto de cobertura de copia. El detalle conserva motivo/fecha; descarga CSV y selección 1..100 para reintentar omitidos.
 - [x] Añadir aviso y acción de aceptación de padre con omisiones, mostrando el intento que se acepta; llamada obsoleta refresca el estado sin despachar el hijo desde el navegador.
 - [x] Probar cero bytes, pestaña recargada, frames atrasados, error de red posterior al commit y reintento de la misma acción con el mismo `request_id`. Mantener la conducta existente de SSE/polling terminal y los controles de acceso del backend.
-- [ ] Crear commit `feat: surface file omission recovery and warnings` (pendiente de autorización de escritura en metadatos Git).
+- [x] Crear commit `feat: surface file omission recovery and warnings` (`abfb928`).
 
 ## Task 7: Omisión automática opt-in de restricciones MEGA confirmadas
 
@@ -149,7 +151,7 @@
 - [x] Implementar clasificación segura en memoria y predicados de seguridad, manteniendo deliberadamente todo diagnóstico actual como `UNKNOWN`. Crear y reanudar rechazan el opt-in automático; no se persiste una omisión automática ni se activa `CopyOutcome.SKIPPED` por clasificador.
 - [x] Conservar por separado el circuito actual de fallos seguros; ningún error MEGAcmd desconocido altera la cuenta ni omite archivos.
 - [ ] Habilitar la política automática, UI de opt-in y persistencia `MEGA_FILE_RESTRICTED` solo cuando se compruebe una firma individual de la versión instalada y se agreguen pruebas de esa versión. La entrega manual A permanece utilizable.
-- [ ] Crear commit `feat: optionally skip confirmed restricted MEGA files` (pendiente de autorización de escritura en metadatos Git).
+- [x] Crear commit `feat: add conservative MEGA failure diagnostics` (`7682f72`); la activación automática sigue pendiente de confirmar una firma individual de la versión instalada.
 
 ## Task 8: Verificación final, documentación y preparación de despliegue
 
@@ -161,7 +163,7 @@
 - [x] Auto-revisar el diff contra los nueve criterios del diseño y los cinco focos de revisión; verificar que no se alteró la lista blanca de comandos ni se incluyeron secretos. Las revisiones resolvieron los seis hallazgos; no quedan hallazgos abiertos.
 - [ ] Preparar despliegue coordinado para revisión: respaldo verificado, detener nuevas admisiones, drenar copias, aplicar migración, actualizar API/workers/Beat coherentemente y comprobar salud; después habilitar admisiones. El downgrade se bloquea mientras existan omisiones explícitas. Mantener esquema y retener/atender trabajos afectados antes de volver a un ejecutor antiguo.
 - [ ] Presentar diff y evidencia al usuario. Solo tras autorización de despliegue ejecutar el procedimiento. Recuperar la transferencia real mediante la acción de UI/API con comprobación fresca de intento, fila y reservas; nunca mediante UPDATE manual. La acción concreta de omitir/reanudar se revisa con el usuario antes de iniciarla.
-- [ ] Commit de documentación `docs: document transfer omission operations and validation`.
+- [x] Commit de documentación `docs: document transfer omission operations and validation` (`5e57fbc`).
 
 ## Revisión del plan realizada
 
