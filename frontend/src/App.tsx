@@ -53,6 +53,8 @@ import { z } from 'zod';
 import { apiRequest, ApiError } from './api';
 import DocumentationSection from './DocumentationSection';
 import ScheduledTransferEvaluation, { type TransferEvaluation } from './ScheduledTransferEvaluation';
+import TransferFileReport from './TransferFileReport';
+import type { TransferManifestPage, TransferRecord } from './transferTypes';
 import './styles.css';
 
 type User = { id: string; username: string; email: string; role: 'ADMIN' | 'USER'; must_change_password?: boolean };
@@ -87,61 +89,10 @@ type StorageItem = {
   parent_object_id?: string | null;
 };
 type ItemPage = { items: StorageItem[]; next_cursor: string | null; total_count: number };
-export type Transfer = {
-  id: string;
-  public_id: string;
-  status: string;
-  source_connection_id?: string;
-  destination_connection_id: string;
-  source_paths?: string[];
-  conflict_policy?: string;
-  warning_count?: number;
-  destination_path: string;
-  progress_percent: number;
-  files_completed: number;
-  files_total: number;
-  bytes_transferred: number;
-  bytes_total: number;
-  current_item: string | null;
-  average_speed_bps: number | null;
-  current_speed_bps: number | null;
-  attempt_count?: number;
-  estimated_remaining_seconds?: number | null;
-  created_at?: string | null;
-  started_at?: string | null;
-  completed_at?: string | null;
-  scheduled_at?: string | null;
-  schedule_timezone?: string;
-  execution_mode?: 'AUTO' | 'EXCLUSIVE';
-  depends_on_transfer_id?: string | null;
-  wait_reason?: string | null;
-  can_edit_schedule?: boolean;
-  evaluation?: TransferEvaluation;
-  manifest_summary?: { copied: number; failed: number; skipped: number; pending: number; renamed?: number };
-};
+export type Transfer = TransferRecord;
 type TransferListPage = { items: Transfer[]; total_count: number };
 type TransferCapabilities = {
   max_files_by_source_provider: { default: number; SMB: number };
-};
-type TransferManifestItem = {
-  id: string;
-  source_path: string;
-  source_object_id: string | null;
-  destination_path: string;
-  requested_destination_path: string;
-  rename_reason: string | null;
-  is_dir: boolean;
-  size_bytes: number | null;
-  modified_at: string | null;
-  scan_complete: boolean;
-  status: 'DIRECTORY' | 'PENDING' | 'COPIED' | 'SKIPPED' | 'FAILED';
-  error_code: string | null;
-  verified_by: string | null;
-};
-type TransferManifestPage = {
-  items: TransferManifestItem[];
-  next_cursor: string | null;
-  counts: { total: number; pending: number; copied: number; skipped: number; failed: number };
 };
 const terminalTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED'];
 const successfulTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS'];
@@ -203,6 +154,26 @@ export function mergeTransferState(current: Transfer, incoming: Transfer): Trans
       || incoming.bytes_transferred < current.bytes_transferred
     ) merged = current;
     else merged = incoming;
+  }
+  if (incomingAttempt === currentAttempt && current.manifest_summary) {
+    const summary = merged.manifest_summary ?? current.manifest_summary;
+    const omitted = Math.max(
+      current.manifest_summary.omitted ?? 0,
+      incoming.manifest_summary?.omitted ?? 0,
+    );
+    const omittedBytes = Math.max(
+      current.manifest_summary.omitted_bytes ?? 0,
+      incoming.manifest_summary?.omitted_bytes ?? 0,
+    );
+    merged = {
+      ...merged,
+      manifest_summary: {
+        ...summary,
+        omitted,
+        omitted_bytes: omittedBytes,
+        skipped: Math.max(summary.skipped, omitted),
+      },
+    };
   }
   if (merged.evaluation === latestEvaluation) return merged;
   return { ...merged, evaluation: latestEvaluation };
@@ -1860,6 +1831,12 @@ function TransferWorkspace({
     refetchIntervalInBackground: false,
   });
   const [reportTransferId, setReportTransferId] = useState<string | null>(null);
+  const [parentOmissionPrompt, setParentOmissionPrompt] = useState<{
+    child: Transfer;
+    parent: Transfer;
+    requestId: string;
+  } | null>(null);
+  const [acceptingParentOmissions, setAcceptingParentOmissions] = useState(false);
   const [backgroundPopoverAnchor, setBackgroundPopoverAnchor] = useState<HTMLButtonElement | null>(null);
   const [accountMenuAnchor, setAccountMenuAnchor] = useState<HTMLButtonElement | null>(null);
   const transferManifestQuery = useInfiniteQuery({
@@ -1934,6 +1911,9 @@ function TransferWorkspace({
   if (visibleActiveTransfer && !historyTransfers.some((transfer) => transfer.id === visibleActiveTransfer.id)) {
     historyTransfers.unshift(visibleActiveTransfer);
   }
+  const reportTransfer = reportTransferId
+    ? historyTransfers.find((transfer) => transfer.id === reportTransferId) ?? null
+    : null;
   const liveTransfers = historyTransfers.filter((transfer) => (
     ['VALIDATING', 'RUNNING', 'RETRYING', 'CANCELLING'].includes(transfer.status)
     || visibleActiveTransfer?.id === transfer.id
@@ -2362,6 +2342,118 @@ function TransferWorkspace({
     }
   };
 
+  const refreshTransferReport = (transferId: string) => {
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['transfer-manifest', transferId] }),
+    ]);
+  };
+
+  const skipReportItemAndResume = async (itemId: string, requestId: string) => {
+    if (!reportTransfer) return;
+    const updated = await apiRequest<Transfer>(
+      `/api/v1/transfers/${reportTransfer.id}/items/${itemId}/skip-and-resume`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_attempt: reportTransfer.attempt_count ?? 1,
+          request_id: requestId,
+          reason: 'USER_ACCEPTED_SOURCE_FAILURE',
+        }),
+      },
+    );
+    setActiveTransfer((current) => current?.id === updated.id ? updated : current);
+    setNotice('Archivo omitido. La transferencia continuará con los archivos restantes.');
+    setNoticeSeverity('warning');
+    refreshTransferReport(reportTransfer.id);
+  };
+
+  const retryOmittedReportItems = async (itemIds: string[], requestId: string) => {
+    if (!reportTransfer) return;
+    const updated = await apiRequest<Transfer>(
+      `/api/v1/transfers/${reportTransfer.id}/retry-omitted`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_attempt: reportTransfer.attempt_count ?? 1,
+          request_id: requestId,
+          item_ids: itemIds,
+        }),
+      },
+    );
+    setActiveTransfer((current) => current?.id === updated.id ? updated : current);
+    setNotice('Se reintentará la selección de archivos omitidos.');
+    setNoticeSeverity('info');
+    refreshTransferReport(reportTransfer.id);
+  };
+
+  const downloadOmissionReport = () => {
+    if (!reportTransfer) return;
+    const link = document.createElement('a');
+    link.href = `/api/v1/transfers/${reportTransfer.id}/omissions.csv`;
+    link.download = `${reportTransfer.public_id}-omissions.csv`;
+    link.click();
+  };
+
+  const openParentOmissionPrompt = async (child: Transfer) => {
+    if (!child.depends_on_transfer_id) return;
+    try {
+      const parent = await apiRequest<Transfer>(
+        `/api/v1/transfers/${child.depends_on_transfer_id}`,
+      );
+      if (
+        !terminalTransferStatuses.includes(parent.status)
+        || (parent.manifest_summary?.omitted ?? 0) === 0
+        || parent.attempt_count === undefined
+      ) {
+        setNotice('El padre cambió o ya no tiene omisiones pendientes de aceptación. Se actualizará la cola.');
+        setNoticeSeverity('info');
+        refreshTransferReport(child.id);
+        return;
+      }
+      setParentOmissionPrompt({ child, parent, requestId: crypto.randomUUID() });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo revisar la transferencia padre.');
+      setNoticeSeverity('error');
+    }
+  };
+
+  const acceptCurrentParentOmissions = async () => {
+    if (!parentOmissionPrompt) return;
+    const { child, parent, requestId } = parentOmissionPrompt;
+    setAcceptingParentOmissions(true);
+    try {
+      await apiRequest<Transfer>(
+        `/api/v1/transfers/${child.id}/accept-parent-omissions`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            expected_parent_attempt: parent.attempt_count,
+            request_id: requestId,
+          }),
+        },
+      );
+      setParentOmissionPrompt(null);
+      setNotice(`Se aceptaron las omisiones del intento ${parent.attempt_count} del padre. La cola revisará la dependencia.`);
+      setNoticeSeverity('info');
+      refreshTransferReport(child.id);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        setParentOmissionPrompt(null);
+        setNotice('El intento del padre cambió. Revisa de nuevo sus omisiones antes de aceptar.');
+        setNoticeSeverity('warning');
+        refreshTransferReport(child.id);
+      } else {
+        setNotice(error instanceof Error ? error.message : 'No se pudieron aceptar las omisiones del padre.');
+        setNoticeSeverity('error');
+      }
+    } finally {
+      setAcceptingParentOmissions(false);
+    }
+  };
+
   const archiveConnection = async (connection: Connection) => {
     await apiRequest<void>(`/api/v1/connections/${connection.id}`, { method: 'DELETE' });
     queryClient.setQueryData<{ items: Connection[] }>(['connections'], (current) => current && ({
@@ -2598,6 +2690,40 @@ function TransferWorkspace({
           </Button>
         </Box>
       </Popover>
+      <Dialog
+        open={Boolean(parentOmissionPrompt)}
+        onClose={() => !acceptingParentOmissions && setParentOmissionPrompt(null)}
+      >
+        <DialogTitle>Aceptar omisiones de la transferencia padre</DialogTitle>
+        <DialogContent>
+          {parentOmissionPrompt && (
+            <Stack spacing={1}>
+              <Typography>
+                {parentOmissionPrompt.parent.public_id} terminó con {parentOmissionPrompt.parent.manifest_summary?.omitted ?? 0}{' '}
+                {(parentOmissionPrompt.parent.manifest_summary?.omitted ?? 0) === 1 ? 'archivo omitido.' : 'archivos omitidos.'}
+              </Typography>
+              <Alert severity="warning">
+                Esta aceptación aplica solo al intento {parentOmissionPrompt.parent.attempt_count ?? 1}. Si el padre inicia otro intento, deberás revisarlo y aceptarlo de nuevo.
+              </Alert>
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button disabled={acceptingParentOmissions} onClick={() => setParentOmissionPrompt(null)}>
+            Cancelar
+          </Button>
+          {parentOmissionPrompt && (
+            <Button
+              variant="contained"
+              disabled={acceptingParentOmissions}
+              onClick={() => void acceptCurrentParentOmissions()}
+            >
+              {acceptingParentOmissions && <CircularProgress size={16} sx={{ mr: 1 }} />}
+              Aceptar omisiones del intento {parentOmissionPrompt.parent.attempt_count ?? 1}
+            </Button>
+          )}
+        </DialogActions>
+      </Dialog>
       <Container maxWidth="xl" className="workspace-container">
         <Box className="page-heading">
           <Box>
@@ -2723,6 +2849,11 @@ function TransferWorkspace({
                         {transferWaitReasonLabel(transfer.wait_reason)}
                       </Typography>
                     )}
+                    {transfer.wait_reason === 'BLOCKED_PARENT_OMISSIONS' && (
+                      <Alert severity="warning" sx={{ mt: 1 }}>
+                        La transferencia padre terminó con archivos omitidos. Revisa el intento vigente antes de liberar esta dependencia.
+                      </Alert>
+                    )}
                     <ScheduledTransferEvaluation
                       evaluation={transfer.evaluation ?? notRequiredEvaluation}
                       onRetry={() => void retryTransferEvaluation(transfer)}
@@ -2730,6 +2861,15 @@ function TransferWorkspace({
                     />
                   </Box>
                   <Stack className="scheduled-transfer-actions" direction="row" spacing={0.75}>
+                    {transfer.wait_reason === 'BLOCKED_PARENT_OMISSIONS' && (
+                      <Button
+                        size="small"
+                        disabled={acceptingParentOmissions}
+                        onClick={() => void openParentOmissionPrompt(transfer)}
+                      >
+                        Revisar omisiones del padre
+                      </Button>
+                    )}
                     {editable && (
                       <Button size="small" onClick={() => openScheduleDialog(transfer)}>
                         Reprogramar
@@ -2875,6 +3015,11 @@ function TransferWorkspace({
               <Typography variant="caption" color="text.secondary">Si ya existe</Typography>
               <Typography variant="body2" fontWeight={650}>Conservar ambos · numerar la copia</Typography>
             </Box>
+            {sourceConnection?.provider_type === 'MEGA' && (
+              <Alert severity="info" sx={{ py: 0.25 }}>
+                La omisión automática de archivos MEGA está deshabilitada hasta validar una firma de restricción por archivo para la versión instalada de MEGAcmd. El informe permite revisar los fallos y omitir manualmente los elegibles.
+              </Alert>
+            )}
             <FormControlLabel
               control={<Checkbox checked={sendEmailNotification} onChange={(_event, checked) => setSendEmailNotification(checked)} size="small" />}
               label={<Typography variant="caption">Avisarme por correo al terminar</Typography>}
@@ -2921,8 +3066,20 @@ function TransferWorkspace({
               )}
               <LinearProgress variant={transfer.bytes_total ? 'determinate' : 'indeterminate'} value={transfer.progress_percent} sx={{ mt: 2, mb: 1 }} />
               <Typography variant="caption" color="text.secondary">
-                {formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)} · {transfer.conflict_policy === 'KEEP_BOTH' && connections.find((connection) => connection.id === transfer.source_connection_id)?.provider_type !== 'MOCK' ? `${transfer.manifest_summary?.copied ?? 0}/${transfer.files_total} copiados · ${transfer.manifest_summary?.failed ?? 0} con error · ${transfer.manifest_summary?.pending ?? transfer.files_total} pendientes` : `${transfer.files_completed}/${transfer.files_total} archivos`}
+                {formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)} · {transfer.conflict_policy === 'KEEP_BOTH' && connections.find((connection) => connection.id === transfer.source_connection_id)?.provider_type !== 'MOCK' ? `${transfer.manifest_summary?.copied ?? 0}/${transfer.files_total} copiados · ${transfer.manifest_summary?.omitted ?? 0} omitidos · ${transfer.manifest_summary?.failed ?? 0} con error · ${Math.max(0, (transfer.manifest_summary?.skipped ?? 0) - (transfer.manifest_summary?.omitted ?? 0))} SKIPPED históricos · ${transfer.manifest_summary?.pending ?? transfer.files_total} pendientes` : `${transfer.files_completed}/${transfer.files_total} archivos`}
               </Typography>
+              {(transfer.manifest_summary?.omitted ?? 0) > 0 && (
+                <Alert severity="warning" sx={{ mt: 1 }}>
+                  {transfer.status === 'FAILED'
+                    ? `Transferencia detenida con ${transfer.manifest_summary?.omitted} archivos omitidos.`
+                    : transfer.status === 'CANCELLED'
+                      ? `Transferencia cancelada con ${transfer.manifest_summary?.omitted} archivos omitidos.`
+                      : terminalTransferStatuses.includes(transfer.status)
+                        ? `Procesamiento finalizado con advertencias: ${transfer.manifest_summary?.omitted} omitidos.`
+                        : `Se omitieron ${transfer.manifest_summary?.omitted} archivos; la transferencia continúa.`}
+                  {' '}Cobertura de copia: {formatProgressPercent(transfer.progress_percent)}%.
+                </Alert>
+              )}
               <Typography variant="caption" color="text.secondary" display="block">
                 {transfer.current_speed_bps === null ? 'Velocidad calculándose' : `${formatBytes(transfer.current_speed_bps)}/s`}
                 {transfer.estimated_remaining_seconds === null || transfer.estimated_remaining_seconds === undefined
@@ -2936,52 +3093,26 @@ function TransferWorkspace({
           </Card>
         ))}
 
-        {reportTransferId && (
+        {reportTransferId && reportTransfer && (
           <Card className="progress-card" variant="outlined" aria-label="Resultado de transferencia">
             <CardContent>
-              <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2}>
-                <Box>
-                  <Typography variant="overline" color="text.secondary">ARCHIVOS Y NOMBRES ASIGNADOS</Typography>
-                  <Typography variant="h6">
-                    {historyTransfers.find((transfer) => transfer.id === reportTransferId)?.public_id}
-                  </Typography>
-                </Box>
+              <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2} sx={{ mb: 1 }}>
+                <Typography variant="overline" color="text.secondary">INFORME DE TRANSFERENCIA</Typography>
                 <Button size="small" onClick={() => setReportTransferId(null)}>Cerrar</Button>
               </Stack>
-              {transferManifestQuery.data?.pages[0]?.counts && (
-                <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
-                  {transferManifestQuery.data.pages[0].counts.copied} copiados · {transferManifestQuery.data.pages[0].counts.skipped} omitidos · {transferManifestQuery.data.pages[0].counts.failed} con error
-                </Typography>
-              )}
-              {transferManifestQuery.isLoading && <LinearProgress sx={{ mt: 1 }} />}
-              {transferManifestQuery.isError && <Alert severity="error" sx={{ mt: 1 }}>No se pudo cargar el resultado de la transferencia.</Alert>}
-              <Stack spacing={0.75} sx={{ mt: 1.5 }}>
-                {transferManifestQuery.data?.pages.flatMap((page) => page.items).map((item) => (
-                  <Box key={item.id} className="history-row">
-                    <Chip size="small" label={item.status === 'DIRECTORY' ? 'Carpeta' : item.status} color={item.status === 'FAILED' ? 'error' : item.status === 'COPIED' ? 'success' : 'default'} />
-                    <Box className="history-label">
-                      <Typography variant="body2" title={item.source_path}>{item.source_path}</Typography>
-                      {item.requested_destination_path !== item.destination_path && (
-                        <Typography variant="caption" color="text.secondary" title={item.requested_destination_path}>
-                          Nombre solicitado: {item.requested_destination_path}
-                        </Typography>
-                      )}
-                      <Typography variant="caption" color="text.secondary" title={item.destination_path}>{item.destination_path}</Typography>
-                    </Box>
-                    {item.error_code && <Typography variant="caption" color="error">{item.error_code}</Typography>}
-                  </Box>
-                ))}
-              </Stack>
-              {transferManifestQuery.hasNextPage && (
-                <Button
-                  size="small"
-                  sx={{ mt: 1 }}
-                  disabled={transferManifestQuery.isFetchingNextPage}
-                  onClick={() => void transferManifestQuery.fetchNextPage()}
-                >
-                  {transferManifestQuery.isFetchingNextPage ? <CircularProgress size={18} /> : 'Cargar más resultados'}
-                </Button>
-              )}
+              <TransferFileReport
+                transfer={reportTransfer}
+                pages={transferManifestQuery.data?.pages ?? []}
+                isLoading={transferManifestQuery.isLoading}
+                isError={transferManifestQuery.isError}
+                hasNextPage={Boolean(transferManifestQuery.hasNextPage)}
+                isFetchingNextPage={transferManifestQuery.isFetchingNextPage}
+                onLoadMore={() => void transferManifestQuery.fetchNextPage()}
+                onSkipAndResume={skipReportItemAndResume}
+                onRetryOmitted={retryOmittedReportItems}
+                onDownloadOmissions={downloadOmissionReport}
+                onConflictRefresh={() => refreshTransferReport(reportTransfer.id)}
+              />
             </CardContent>
           </Card>
         )}
@@ -3001,6 +3132,11 @@ function TransferWorkspace({
               ? connectionById.get(transfer.source_connection_id)
               : undefined;
             const destinationConnection = connectionById.get(transfer.destination_connection_id);
+            const omittedCount = transfer.manifest_summary?.omitted ?? 0;
+            const historicalSkipped = Math.max(
+              0,
+              (transfer.manifest_summary?.skipped ?? 0) - omittedCount,
+            );
             return (
             <Box className="history-row" key={transfer.id}>
               <Box className="history-status-dot" data-status={transfer.status} />
@@ -3018,11 +3154,19 @@ function TransferWorkspace({
                 </Box>
                 <Typography variant="caption" color="text.secondary" className="history-counts">
                   {transfer.conflict_policy === 'KEEP_BOTH' && sourceConnection?.provider_type !== 'MOCK'
-                    ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${transfer.manifest_summary?.failed ?? 0} con error · ${transfer.manifest_summary?.skipped ?? 0} omitidos · ${transfer.manifest_summary?.pending ?? transfer.files_total} pendientes · ${transfer.manifest_summary?.renamed ?? 0} nombres numerados · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
+                    ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${omittedCount} omitidos · ${transfer.manifest_summary?.failed ?? 0} con error · ${historicalSkipped} SKIPPED históricos · ${transfer.manifest_summary?.pending ?? transfer.files_total} pendientes · ${transfer.manifest_summary?.renamed ?? 0} nombres numerados · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
                     : sourceConnection?.provider_type === 'SMB'
-                    ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${transfer.manifest_summary?.failed ?? 0} con error · ${transfer.manifest_summary?.skipped ?? 0} omitidos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
+                    ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${omittedCount} omitidos · ${transfer.manifest_summary?.failed ?? 0} con error · ${historicalSkipped} SKIPPED históricos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
                     : `${transfer.files_completed} de ${transfer.files_total} archivos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`}
                 </Typography>
+                {(transfer.manifest_summary?.omitted ?? 0) > 0 && (
+                  <Typography variant="caption" color="warning.dark" display="block">
+                    {terminalTransferStatuses.includes(transfer.status)
+                      ? 'Procesamiento finalizado con advertencias'
+                      : 'Archivos omitidos; procesamiento en curso'}
+                    {' '}· cobertura de copia {formatProgressPercent(transfer.progress_percent)}%
+                  </Typography>
+                )}
                 <Box className="history-meta">
                   {formatRequestedAt(transfer.created_at) && (
                     <Typography component="time" dateTime={transfer.created_at ?? undefined} variant="caption" color="text.secondary">

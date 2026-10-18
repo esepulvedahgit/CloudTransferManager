@@ -181,7 +181,7 @@ describe('Cloud Transfer Manager', () => {
 
     await signIn(fetchMock);
 
-    expect(await screen.findByText(/2 copiados · 1 con error · 3 omitidos/)).toBeVisible();
+    expect(await screen.findByText(/2 copiados · 0 omitidos · 1 con error · 3 SKIPPED históricos/)).toBeVisible();
     expect(screen.getByText('99%')).toBeVisible();
     expect(document.querySelector('[aria-label="Avance 99 por ciento"]')).toBeVisible();
     expect(screen.queryByText('100%')).not.toBeInTheDocument();
@@ -235,7 +235,7 @@ describe('Cloud Transfer Manager', () => {
 
     await signIn(fetchMock);
 
-    expect(await screen.findByText(/2 copiados · 1 con error · 3 omitidos/)).toBeVisible();
+    expect(await screen.findByText(/2 copiados · 0 omitidos · 1 con error · 3 SKIPPED históricos/)).toBeVisible();
     expect(screen.getByText('99%')).toBeVisible();
     expect(document.querySelector('[aria-label="Avance 99 por ciento"]')).toBeVisible();
     expect(screen.getByText(/7 nombres numerados/)).toBeVisible();
@@ -600,6 +600,24 @@ describe('Cloud Transfer Manager', () => {
     expect(stale.bytes_transferred).toBe(400);
     expect(newGeneration.evaluation?.files_found).toBe(0);
     expect(newGeneration.bytes_transferred).toBe(400);
+  });
+
+  it('does not lose omission warnings when a delayed SSE frame arrives for the same attempt', () => {
+    const current: Transfer = {
+      id: 'merge-omission', public_id: 'TRF-2026-000210', status: 'RUNNING',
+      progress_percent: 75, files_completed: 7, files_total: 9,
+      bytes_transferred: 700, bytes_total: 900, current_item: null,
+      average_speed_bps: null, current_speed_bps: null,
+      destination_connection_id: 'destination', destination_path: '/', attempt_count: 4,
+      manifest_summary: { copied: 7, failed: 0, skipped: 1, pending: 1, omitted: 1, omitted_bytes: 10 },
+    };
+    const delayed = mergeTransferState(current, {
+      ...current,
+      manifest_summary: { copied: 7, failed: 0, skipped: 0, pending: 2, omitted: 0, omitted_bytes: 0 },
+    });
+
+    expect(delayed.manifest_summary?.omitted).toBe(1);
+    expect(delayed.manifest_summary?.omitted_bytes).toBe(10);
   });
 
   it('loads older active transfers after the first 200 scheduled background jobs', async () => {
@@ -1224,7 +1242,7 @@ describe('Cloud Transfer Manager', () => {
     expect(screen.queryByRole('button', { name: /Agregar conexión/i })).not.toBeInTheDocument();
   });
 
-  it('summarizes the selected route, providers and destination before transfer', async () => {
+  it('summarizes a MEGA route and explains that automatic omission remains disabled', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
       if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
@@ -1236,8 +1254,8 @@ describe('Cloud Transfer Manager', () => {
         return jsonResponse({ id: 'user-1', username: 'user', email: 'user@example.test', role: 'USER' });
       }
       if (path.endsWith('/connections')) return jsonResponse({ items: [
-        { id: 'source', name: 'Drive de operaciones', provider_type: 'GOOGLE_DRIVE', status: 'ACTIVE', credentials_configured: true },
-        { id: 'destination', name: 'MEGA de respaldo', provider_type: 'MEGA', status: 'ACTIVE', credentials_configured: true },
+        { id: 'source', name: 'MEGA de operaciones', provider_type: 'MEGA', status: 'ACTIVE', credentials_configured: true },
+        { id: 'destination', name: 'Drive de respaldo', provider_type: 'GOOGLE_DRIVE', status: 'ACTIVE', credentials_configured: true },
       ] });
       if (isTransferCollectionRequest(path)) return jsonResponse({ items: [] });
       if (path.includes('/connections/source/items')) return jsonResponse({
@@ -1258,12 +1276,13 @@ describe('Cloud Transfer Manager', () => {
     expect(within(summary).getByRole('img', { name: 'Transferencia de archivos' })).toBeVisible();
     expect(summary.querySelector('.cloud-network-mark')).not.toBeInTheDocument();
     expect(within(summary).getByText('1 elemento listo para copiar')).toBeVisible();
-    expect(within(summary).getByRole('img', { name: 'Google Drive' })).toBeVisible();
     expect(within(summary).getByRole('img', { name: 'MEGA' })).toBeVisible();
-    expect(within(summary).getByText('Drive de operaciones')).toBeVisible();
-    expect(within(summary).getByText('MEGA de respaldo')).toBeVisible();
+    expect(within(summary).getByRole('img', { name: 'Google Drive' })).toBeVisible();
+    expect(within(summary).getByText('MEGA de operaciones')).toBeVisible();
+    expect(within(summary).getByText('Drive de respaldo')).toBeVisible();
     expect(within(summary).getByText('Carpeta raíz')).toBeVisible();
     expect(within(summary).getByText('Conservar ambos · numerar la copia')).toBeVisible();
+    expect(within(summary).getByText(/La omisión automática de archivos MEGA está deshabilitada/)).toBeVisible();
     expect(within(summary).getByText('Avisarme por correo al terminar')).toBeVisible();
   });
 
@@ -2024,5 +2043,186 @@ describe('Cloud Transfer Manager', () => {
 
     await waitFor(() => expect(resumed).toBe(true));
     expect(await screen.findByText('La transferencia se reanudó.')).toBeVisible();
+  });
+
+  it('omits a confirmed source failure through the audited retry endpoint', async () => {
+    vi.stubGlobal('EventSource', TestEventSource);
+    const failedTransfer = {
+      id: 'mega-transfer',
+      public_id: 'TRF-2026-000013',
+      status: 'FAILED',
+      attempt_count: 2,
+      progress_percent: 45,
+      files_total: 3,
+      files_completed: 1,
+      bytes_total: 110,
+      bytes_transferred: 100,
+      current_item: null,
+      average_speed_bps: null,
+      current_speed_bps: null,
+      estimated_remaining_seconds: null,
+      source_connection_id: 'mega',
+      destination_connection_id: 'seafile',
+      source_paths: ['/Cursos'],
+      destination_path: '/Archive',
+      conflict_policy: 'KEEP_BOTH',
+      manifest_summary: { copied: 1, failed: 1, skipped: 0, pending: 1, omitted: 0, omitted_bytes: 0 },
+    };
+    const failedManifest = {
+      items: [{
+        id: 'mega-manifest-item',
+        source_path: '/Cursos/Curso Pimsleur.rar',
+        destination_path: '/Archive/Cursos/Curso Pimsleur.rar',
+        requested_destination_path: '/Archive/Cursos/Curso Pimsleur.rar',
+        rename_reason: null,
+        is_dir: false,
+        size_bytes: 10,
+        modified_at: null,
+        scan_complete: true,
+        status: 'FAILED',
+        error_code: 'MEGA_FILE_RESTRICTED',
+        verified_by: null,
+        can_skip: true,
+        skip_unavailable_reason: null,
+        can_retry_omission: false,
+        omission_kind: null,
+        omitted_at: null,
+      }],
+      next_cursor: null,
+      counts: { total: 3, pending: 1, copied: 1, skipped: 0, failed: 1, omitted: 0, omitted_bytes: 0 },
+    };
+    let currentTransfer = failedTransfer;
+    let skipPayload: Record<string, unknown> | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/connections')) {
+        return jsonResponse({ items: [
+          { id: 'mega', name: 'MEGA', provider_type: 'MEGA', status: 'ACTIVE', credentials_configured: true },
+          { id: 'seafile', name: 'Seafile', provider_type: 'SEAFILE', status: 'ACTIVE', credentials_configured: true },
+        ] });
+      }
+      if (path.endsWith('/items?limit=100')) return jsonResponse(failedManifest);
+      if (path.endsWith('/items/mega-manifest-item/skip-and-resume') && init?.method === 'POST') {
+        skipPayload = JSON.parse(String(init.body)) as Record<string, unknown>;
+        currentTransfer = {
+          ...failedTransfer,
+          status: 'QUEUED',
+          attempt_count: 3,
+          files_completed: 2,
+          manifest_summary: { copied: 1, failed: 0, skipped: 1, pending: 1, omitted: 1, omitted_bytes: 10 },
+        };
+        return jsonResponse(currentTransfer, 202);
+      }
+      if (isTransferCollectionRequest(path)) return jsonResponse({ items: [currentTransfer] });
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(await screen.findByRole('button', { name: /Ver archivos de TRF-2026-000013/i }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Omitir este archivo y continuar' }));
+    const dialog = await screen.findByRole('dialog', { name: /Confirmar omisión del archivo/i });
+    expect(within(dialog).getByText(
+      'Este archivo no se copiará. Los archivos ya copiados se conservarán y la transferencia continuará con los restantes',
+    )).toBeVisible();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirmar omisión' }));
+
+    await waitFor(() => expect(skipPayload).not.toBeNull());
+    expect(skipPayload).toMatchObject({
+      expected_attempt: 2,
+      reason: 'USER_ACCEPTED_SOURCE_FAILURE',
+      request_id: expect.stringMatching(/[0-9a-f-]{36}/i),
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/transfers/mega-transfer/items/mega-manifest-item/skip-and-resume',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(await screen.findByText(/Archivo omitido\. La transferencia continuará/i)).toBeVisible();
+  });
+
+  it('accepts parent omissions for the displayed attempt and leaves dispatch to the queue', async () => {
+    const child = {
+      id: 'child-transfer',
+      public_id: 'TRF-2026-000300',
+      status: 'QUEUED',
+      attempt_count: 1,
+      progress_percent: 0,
+      files_total: 1,
+      files_completed: 0,
+      bytes_total: 10,
+      bytes_transferred: 0,
+      current_item: null,
+      average_speed_bps: null,
+      current_speed_bps: null,
+      estimated_remaining_seconds: null,
+      source_connection_id: 'source',
+      destination_connection_id: 'destination',
+      source_paths: ['/child'],
+      destination_path: '/Archive',
+      scheduled_at: null,
+      execution_mode: 'AUTO',
+      depends_on_transfer_id: 'parent-transfer',
+      wait_reason: 'BLOCKED_PARENT_OMISSIONS',
+    };
+    const parent = {
+      ...child,
+      id: 'parent-transfer',
+      public_id: 'TRF-2026-000299',
+      status: 'COMPLETED_WITH_WARNINGS',
+      attempt_count: 7,
+      depends_on_transfer_id: null,
+      wait_reason: null,
+      manifest_summary: { copied: 9, failed: 0, skipped: 1, pending: 0, omitted: 1, omitted_bytes: 0 },
+    };
+    let acceptance: Record<string, unknown> | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/auth/me')) return jsonResponse({ detail: 'Autenticación requerida' }, 401);
+      if (path.endsWith('/auth/csrf')) {
+        document.cookie = 'ctm_csrf=csrf-value; path=/';
+        return jsonResponse({ csrf_token: 'csrf-value' });
+      }
+      if (path.endsWith('/auth/login')) {
+        return jsonResponse({ id: 'user-1', username: 'admin', email: 'admin@example.test', role: 'ADMIN' });
+      }
+      if (path.endsWith('/connections')) return jsonResponse({ items: [] });
+      if (path === '/api/v1/transfers/parent-transfer') return jsonResponse(parent);
+      if (path.endsWith('/accept-parent-omissions') && init?.method === 'POST') {
+        acceptance = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return jsonResponse(child, 202);
+      }
+      if (isTransferCollectionRequest(path)) {
+        if (path.includes('pending_only=true')) return jsonResponse({ items: [child], total_count: 1 });
+        if (path.includes('background_only=true')) return jsonResponse({ items: [child], total_count: 1 });
+        return jsonResponse({ items: [], total_count: 0 });
+      }
+      return jsonResponse({ detail: 'Not found' }, 404);
+    });
+
+    await signIn(fetchMock);
+    fireEvent.click(screen.getByRole('tab', { name: 'Programaciones' }));
+    fireEvent.click(await screen.findByRole('button', { name: /Revisar omisiones del padre/i }));
+    const dialog = await screen.findByRole('dialog', { name: /Aceptar omisiones de la transferencia padre/i });
+    expect(within(dialog).getByText(/TRF-2026-000299 terminó con 1 archivo omitido/i)).toBeVisible();
+    expect(within(dialog).getByText(/Esta aceptación aplica solo al intento 7/i)).toBeVisible();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Aceptar omisiones del intento 7' }));
+
+    await waitFor(() => expect(acceptance).not.toBeNull());
+    expect(acceptance).toMatchObject({
+      expected_parent_attempt: 7,
+      request_id: expect.stringMatching(/[0-9a-f-]{36}/i),
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/transfers/child-transfer/accept-parent-omissions',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/dispatch'))).toBe(false);
   });
 });
