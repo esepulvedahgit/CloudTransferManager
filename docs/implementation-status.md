@@ -1,6 +1,6 @@
 # Estado de implementación
 
-**Revisión del repositorio: 2026-10-17.** Este documento resume lo que existe en el código y separa esa evidencia de la validación que depende de CI, credenciales o redes de una instalación.
+**Revisión del repositorio: 2026-10-18.** Este documento resume lo que existe en el código y separa esa evidencia de la validación que depende de CI, credenciales o redes de una instalación.
 
 ## Estado por área
 
@@ -10,7 +10,7 @@
 | Conexiones y credenciales | Implementado | Administración, asignación privada, OAuth de Google, cifrado AES-GCM y respuestas públicas sin credenciales. El archivado es lógico y rechaza conexiones con trabajos activos. Véanse `backend/app/main.py`, `backend/app/security/credentials.py` y las migraciones. |
 | Proveedores | Implementado con validación externa | MEGA usa MEGAcmd; Google Drive usa Rclone/OAuth; Seafile ofrece adaptadores Rclone o API explícito; la UI usa SMB/NAS como origen; Nextcloud usa Rclone WebDAV con URL y credenciales administradas por conexión. Cada instalación necesita sus credenciales, permisos y rutas de red. La compatibilidad de Seafile API se acota inicialmente a CE 13.x. Nextcloud requiere prueba real por instalación antes de activarlo. |
 | Explorador | Implementado | Navegación, búsqueda, selección múltiple y destino por carpeta existente; paneles coordinados en escritorio y pasos separados en pantallas estrechas. No hay creación manual de carpetas desde la UI. Véanse `frontend/src/App.tsx` y `docs/specs/03-file-explorer-spec.md`. |
-| Transferencias | Implementado en código; migración y validación pendientes | Las transferencias nuevas usan `KEEP_BOTH` global, inventario por identidad, asignación de nombres `_01`, `_02`, manifiesto común y staging por archivo. Rclone no reemplaza objetos existentes; Seafile API solicita `replace=false`; los resultados de escritura ambiguos solo se aceptan tras reconciliar SHA-256. La reanudación manual se amplía a trabajos nuevos con manifiesto. Las migraciones `20261016_0012` y `20261017_0013` aún no están aplicadas y no se han validado estas rutas contra servicios reales. |
+| Transferencias | Implementado en código; migración y validación real pendientes | Las transferencias nuevas usan `KEEP_BOTH` global, inventario por identidad, asignación de nombres `_01`, `_02`, manifiesto común y staging por archivo. La recuperación manual puede omitir explícitamente un fallo elegible, conserva las copias verificadas y continúa con los restantes; el CSV, el reintento selectivo y la aceptación por intento de omisiones del padre están disponibles. `SKIPPED` histórico se distingue de `omitted`. La política automática MEGA sigue deshabilitada: no se verificó una firma por archivo ligada a la versión instalada, así que las fallas quedan `UNKNOWN`. Rclone no reemplaza objetos existentes; Seafile API solicita `replace=false`; los resultados de escritura ambiguos solo se aceptan tras reconciliar SHA-256. Las migraciones pendientes incluyen `20261018_0015`; estas rutas no se validaron contra servicios reales. |
 | Programaciones | Implementado en código; despliegue pendiente | Ejecuciones futuras de una sola vez, zonas IANA, modos `AUTO`/`EXCLUSIVE`, dependencias y despacho durable vía PostgreSQL, Celery Beat y `control-worker`. Las tareas programadas muestran conteo parcial/completo y motivo de espera en Programaciones; evaluaciones bloqueadas no reservan copias y el dispatcher mantiene el preflight final. Compose incluye `evaluation-worker` aislado y `/health/evaluations` separado de readiness. La migración `20261017_0013` y el despliegue coordinado aún están pendientes; no hay validación con proveedores reales. Detalle en `docs/integrations/transfer-scheduling.md`. |
 | Progreso e historial | Implementado | SSE sobre Redis en despliegue, reconciliación monotónica entre SSE, polling e historial, paginación SQL y resultados por archivo para manifiestos SMB. Véanse `docs/specs/05-realtime-telemetry-spec.md` y el contrato API. |
 | Auditoría y SMTP | Implementado con límite por confirmar | Registro de eventos, sanitización, configuración/prueba SMTP desde Administración, secretos SMTP cifrados y outbox transaccional por intento terminal. La creación de transferencias y su evento de auditoría comparten transacción; el envío usa worker/cola aislados, tokens de despacho y de intento, reintentos durables y vista ADMIN de estados sin correo del destinatario. `/health/notifications` vigila el worker sin degradar readiness de copias. SMTP no garantiza exactamente una entrega si el proceso cae tras la aceptación remota. La aplicación escribe auditoría append-only, pero su inmutabilidad no está impuesta por trigger/permisos de PostgreSQL. |
@@ -26,6 +26,7 @@
 - Configuración SMTP desde Administración y menú de cuenta que agrupa administración, cambio de contraseña y cierre de sesión.
 - CI de backend/frontend y análisis Trivy de repositorio, configuración e imágenes.
 - Conservación y numeración de nombres ocupados en las transferencias nuevas de todos los proveedores reales admitidos; el contenido igual también recibe un nombre numerado. Mock sigue simulando progreso sin modelar escrituras.
+- Omisiones manuales auditadas de fallos MEGA elegibles, continuidad por manifiesto, informe CSV, reintento selectivo, avisos de progreso/correo y aceptación explícita de omisiones del intento padre. La omisión automática está protegida y rechazada hasta demostrar una firma individual de MEGAcmd para la versión instalada.
 
 ## Remediación de resiliencia (2026-10-14)
 
@@ -74,13 +75,22 @@ Antes de declarar una versión lista para una instalación concreta, falta regis
 
 La evidencia local de esta revisión no equivale a un resultado de CI sobre un commit ni valida una instalación concreta. El alcance de las pruebas y los límites de proveedor/despliegue quedan registrados abajo.
 
-## Evidencia de validación (2026-10-17)
+## Evidencia de validación previa (2026-10-17)
 
 - Backend: `pytest -v --tb=short`: **486 pasaron, 9 omitidas**. Se ejecutaron además los archivos de persistencia y store con PostgreSQL 16 desechable: **41 pasaron**, incluidas las carreras de reserva/recovery. La base temporal no publicó puertos ni usó volúmenes persistentes.
 - Calidad backend: `ruff check .` pasó; `mypy app` no encontró problemas en 44 archivos.
 - Frontend: `npm test`: **53 pasaron**; `npm run lint` y `npm run build` pasaron. Vite reportó avisos de anotaciones de comentarios en dependencias `zod`, sin impedir el build.
 - Compose: `docker compose config --quiet` y `scripts/check_compose_network.py` pasaron; el worker de evaluación no expone puertos y mantiene su cola separada.
 - Alcance de la evidencia: se probaron proveedores simulados y SQLite/PostgreSQL desechables. No se aplicó la migración `20261017_0013` a la base de la instalación, no se recrearon servicios activos y no se hicieron copias con cuentas reales. La ejecución de la migración y el despliegue coordinado siguen pendientes.
+
+## Evidencia de validación de omisiones (2026-10-18)
+
+- Backend completo: `pytest -q`: **565 pasaron, 11 omitidas**. `ruff check .` pasó y `mypy app` no encontró problemas en 48 archivos.
+- PostgreSQL 16 desechable: **3 pasaron** para omitir/reanudar idempotente, carrera entre reintento del padre y despacho del hijo, y reintento concurrente de omisiones. También pasó `alembic upgrade head`, incluida `20261018_0015`. Las DB usaron redes Docker internas sin puertos publicados y se retiraron al terminar.
+- Frontend completo: **63 pasaron**; `npm run lint` y `npm run build` pasaron. Rollup mostró dos avisos de anotaciones de comentarios en dependencias `zod`, sin impedir el build.
+- Revisión de código: los hallazgos sobre fallos transitorios/de integridad, downgrade, conteos paginados, idempotencia entre acciones y replays ligados al actor quedaron corregidos; no hay hallazgos abiertos en la revisión final.
+- `docker compose config --quiet` pasó usando `.env.example` solo para resolver la configuración local.
+- Las pruebas y build se ejecutaron en contenedores temporales. No se aplicaron migraciones en la instalación, no se reiniciaron servicios, no se accedió al manifiesto real ni se actuó sobre `TRF-2026-000013`. La migración `20261018_0015` y el despliegue coordinado siguen pendientes. No se verificó una versión concreta de MEGAcmd instalada en el servicio, así que la omisión automática permanece deshabilitada.
 
 ## Fases del plan original
 

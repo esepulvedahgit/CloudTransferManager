@@ -281,6 +281,7 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 - SMB solo se admite como origen de migración; el API rechaza una conexión SMB como destino con `422`.
 - `scheduled_at` opcional acepta una fecha futura con offset; el servidor la normaliza a UTC. `schedule_timezone` debe ser una zona IANA y conserva la zona mostrada en la interfaz. Si no se envía `scheduled_at`, el trabajo queda en la cola normal.
 - `execution_mode` opcional admite `AUTO` (predeterminado) o `EXCLUSIVE`. `depends_on_transfer_id` es opcional y solo libera el trabajo cuando el padre finaliza correctamente, incluso con advertencias.
+- `source_file_error_policy` se fija en `STOP`. La opción `SKIP_CONFIRMED_RESTRICTED` se rechaza con `422` hasta validar una firma de restricción individual para la versión instalada de MEGAcmd; los errores sin esa evidencia nunca se omiten automáticamente.
 - Una solicitud con fecha futura crea `evaluation` en estado `PENDING` dentro de la misma transacción. La evaluación recorre metadatos del origen antes de la hora programada, no descarga ni copia datos y no reserva capacidad de ejecución.
 - Si el conteo supera el límite configurado, la evaluación queda `BLOCKED` y la transferencia permanece en Programaciones sin reservar una copia. Las transferencias inmediatas conservan el preflight del worker; si falla, pasan a `FAILED`. En ambos casos se conserva la validación final al comenzar la copia.
 - El worker de copia aplica `TRANSFER_MAX_FILES` (predeterminado 5000), `SMB_TRANSFER_MAX_FILES` para orígenes SMB (predeterminado 100000), el límite opcional `TRANSFER_MAX_FILE_BYTES` (0 = sin límite fijo) y la reserva de staging antes de escribir en destino. Los errores se consultan en `/api/v1/transfers/{transfer_id}/events`.
@@ -301,6 +302,7 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
   "scheduled_at": "2026-11-20T18:45:00-03:00",
   "schedule_timezone": "America/Santiago",
   "execution_mode": "AUTO",
+  "source_file_error_policy": "STOP",
   "depends_on_transfer_id": null
 }
 ```
@@ -357,7 +359,7 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 - `background_only=true` limita la lista a tareas administradas por **Programaciones** que sigan en estados no terminales: `SCHEDULED`, `QUEUED`, `VALIDATING`, `RUNNING`, `RETRYING` o `CANCELLING`. Una tarea pertenece a Programaciones cuando tiene `scheduled_at`, `wait_reason`, modo `EXCLUSIVE` o una transferencia padre (`depends_on_transfer_id`). La respuesta conserva `total_count` después de aplicar el filtro de propietario.
 - `exclude_background=true` omite únicamente esas tareas no terminales de Programaciones. Las transferencias terminales, incluidas las programadas, siguen disponibles en la lista general.
 - Las respuestas de creación, detalle, listado y SSE incluyen `evaluation`. Si no se requiere evaluación anticipada, el estado es `NOT_REQUIRED`. Un conteo nulo significa que la cantidad todavía se desconoce; solo `count_complete=true` confirma el total.
-- Cada elemento incluye `manifest_summary`: `copied` son archivos copiados y verificados, `failed` son archivos con error, `skipped` son archivos omitidos por conflicto y `pending` son archivos aún no resueltos. Los cuatro contadores excluyen entradas de directorio. En SMB, `files_completed` cuenta elementos resueltos y no equivale a `copied`.
+- Cada elemento incluye `manifest_summary`: `copied` son archivos copiados y verificados, `failed` son archivos con error, `skipped` cuenta archivos omitidos, `omitted` identifica el subconjunto con omisión explícita y `pending` son archivos aún no resueltos. `omitted_bytes` suma el tamaño conocido de ese subconjunto y no se agrega a bytes transferidos. Los contadores de archivos excluyen entradas de directorio. En SMB, `files_completed` cuenta elementos resueltos y no equivale a `copied`.
 
 ### `GET /api/v1/transfers/{transfer_id}`
 - Devuelve el estado y métricas actuales de la transferencia visible para el usuario.
@@ -366,12 +368,28 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 - Devuelve eventos auditables con categorías de error y detalles técnicos sanitizados; solo el solicitante o ADMIN puede consultarlos.
 
 ### `GET /api/v1/transfers/{transfer_id}/items`
-- Devuelve una página del manifiesto común (entradas de directorio y estados `PENDING`, `COPIED`, `SKIPPED` o `FAILED`). Las filas incluyen identidad de origen, `requested_destination_path`, `destination_path` asignada y `rename_reason` cuando aplica.
-- Acepta `after_id` como cursor y `limit` de 1 a 200; la respuesta incluye `next_cursor` y los conteos agregados.
+- Devuelve una página del manifiesto común (entradas de directorio y estados `PENDING`, `COPIED`, `SKIPPED` o `FAILED`). Las filas incluyen identidad de origen, `requested_destination_path`, `destination_path` asignada y `rename_reason` cuando aplica. `can_skip` y `skip_unavailable_reason` describen la elegibilidad actual de omisión manual; `can_retry_omission` marca solo omisiones explícitas reintentables.
+- Acepta `after_id` como cursor y `limit` de 1 a 200; la respuesta incluye `next_cursor` y conteos agregados, incluido `omitted` y `omitted_bytes`.
+
+### `POST /api/v1/transfers/{transfer_id}/items/{item_id}/skip-and-resume`
+- Requiere CSRF y cuerpo `{ "expected_attempt": 2, "request_id": "<UUID>", "reason": "USER_ACCEPTED_SOURCE_FAILURE" }`. Omite un archivo elegible y reanuda la transferencia de manera atómica e idempotente. La respuesta es `202 Accepted`; `409` indica estado, intento o evidencia obsoletos; `404` oculta transferencias o filas fuera del alcance del usuario.
+- La confirmación significa que ese archivo no será copiado. `source_file_error_policy` puede omitirse o ser `STOP`; pedir `SKIP_CONFIRMED_RESTRICTED` responde `422` mientras la clasificación automática siga deshabilitada.
+
+### `POST /api/v1/transfers/{transfer_id}/retry-omitted`
+- Requiere CSRF. Cuerpo: `{ "expected_attempt": 3, "request_id": "<UUID>", "item_ids": ["<UUID>"] }`, con entre 1 y 100 UUID únicos. Reintenta únicamente omisiones explícitas seleccionadas de una transferencia terminal, conserva la auditoría previa y responde `202 Accepted`.
+- `409` indica estado/intento obsoleto, reserva activa o fila no reintentable. La misma clave de solicitud y el mismo contenido son idempotentes.
+
+### `GET /api/v1/transfers/{transfer_id}/omissions.csv`
+- Descarga CSV paginado de las omisiones explícitas de una transferencia terminal. Solo el propietario o ADMIN puede acceder. Se escapan celdas y se neutralizan prefijos de fórmula; el endpoint no está disponible antes del estado terminal (`409`).
 
 ### `POST /api/v1/transfers/{transfer_id}/resume`
 - Disponible para transferencias nuevas `KEEP_BOTH` y para trabajos SMB históricos en estado `FAILED` o `CANCELLED`, cuando el manifiesto conserva archivos pendientes/fallidos y ambas conexiones siguen activas.
+- Acepta sin cuerpo las llamadas existentes; opcionalmente `{ "source_file_error_policy": "STOP" }`. Rechaza con `422` `SKIP_CONFIRMED_RESTRICTED` hasta verificar una firma individual de la versión instalada de MEGAcmd.
 - Requiere las mismas versiones de credenciales capturadas por el trabajo y, para SMB, la misma raíz del NAS. Reutiliza los nombres ya asignados y responde `202 Accepted`. Las escrituras ambiguas se verifican por SHA-256 o se detienen para evitar duplicar.
+
+### `POST /api/v1/transfers/{transfer_id}/accept-parent-omissions`
+- Para una transferencia hija bloqueada por `BLOCKED_PARENT_OMISSIONS`, requiere CSRF y cuerpo `{ "expected_parent_attempt": 3, "request_id": "<UUID>" }`. Acepta explícitamente las omisiones del intento indicado del padre terminal y responde `202 Accepted`; no despacha el trabajo desde el navegador.
+- Una repetición del padre invalida la aceptación previa. `409` indica que el hijo, padre o intento ya cambió; evaluación, dispatcher y worker comprueban de nuevo el intento aceptado.
 
 ### `POST /api/v1/transfers/{transfer_id}/cancel`
 - Para una transferencia pendiente sin reserva, la cancela de inmediato. Si ya fue admitida, envía la orden al worker y pasa a `CANCELLING`.
@@ -401,4 +419,4 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 
 ### Resumen de manifiesto (extensión compatible, 2026-10-16)
 
-Los listados, detalle y eventos de progreso de transferencias incluyen `manifest_summary`: `{copied, failed, skipped, pending, renamed}` (enteros no negativos). El primer snapshot SSE lo incluye también para trabajos terminales. `renamed` cuenta nombres asignados por conflictos/límites, incluidos directorios; no equivale a `warning_count`. `files_completed` continúa contando elementos resueltos para compatibilidad. Los consumidores muestran copiados desde `manifest_summary.copied` y no declaran 100% con elementos sin copiar. No se agregan endpoints ni estados.
+Los listados, detalle y eventos de progreso de transferencias incluyen `manifest_summary`: `{copied, failed, skipped, pending, renamed, omitted, omitted_bytes}` (enteros no negativos). El primer snapshot SSE lo incluye también para trabajos terminales. `renamed` cuenta nombres asignados por conflictos/límites, incluidos directorios; no equivale a `warning_count`. `omitted` es el subconjunto explícito de `skipped`; los conflictos históricos no se pueden reintentar mediante el endpoint de omisiones. `files_completed` continúa contando elementos resueltos para compatibilidad. Los consumidores muestran copiados desde `manifest_summary.copied` y no declaran 100% con elementos sin copiar.

@@ -42,7 +42,7 @@ Proporcionar una experiencia fluida y transparente en la interfaz web mostrando 
   "current_item": "/Proyectos/video_demo.mp4",
   "error_count": 0,
   "attempt_count": 1,
-  "manifest_summary": {"copied": 12, "failed": 0, "skipped": 0, "pending": 8, "renamed": 1},
+  "manifest_summary": {"copied": 12, "failed": 0, "skipped": 0, "pending": 8, "renamed": 1, "omitted": 0, "omitted_bytes": 0},
   "evaluation": {
     "status": "EVALUATING",
     "generation": 1,
@@ -75,6 +75,8 @@ El primer frame es un snapshot tomado después de suscribirse al bus e incluye `
 - **Evaluación anticipada:** El snapshot, listado y eventos incluyen el DTO público de evaluación. El conteo de archivos se presenta aparte del avance de copia. El frontend combina `generation` y `sequence` para ignorar eventos atrasados; una cantidad menor se acepta cuando empieza una generación nueva. El polling de 15 segundos recupera el último estado persistido tras perder SSE o recargar la página.
 - **Suscripción y recuperación:** El cliente abre SSE para transferencias activas, incluidas las programadas que ya comenzaron. Al llegar a estado terminal, quita el trabajo del indicador y actualiza el historial. Las listas de historial, programadas y segundo plano se recuperan cada 15 segundos mientras la pestaña está visible; el polling se pausa en pestañas de fondo. Así, una terminalización cuyo evento SSE se perdió aparece en el historial en el siguiente ciclo de recuperación.
 - **Conteo SMB en historial:** Para transferencias SMB, presentar los contadores agregados del manifiesto (`copied`, `failed`, `skipped`) junto a los bytes. `files_completed` es un conteo de elementos resueltos y no debe rotularse como número de copias exitosas.
+- **Omisiones explícitas:** Todo snapshot REST/SSE incluye `manifest_summary.omitted` y `omitted_bytes`; las omisiones no cuentan como copias ni como bytes transferidos. Una omisión reduce la cobertura de copia aunque se haya resuelto el procesamiento. Dentro del mismo `attempt_count`, el frontend conserva el máximo observado de omisiones para que un frame SSE atrasado no borre una advertencia; un intento nuevo puede reiniciar esos contadores.
+- El historial y el detalle diferencian `SKIPPED` por conflicto histórico de omisiones explícitas. Los estados `FAILED` y `CANCELLED` muestran que el procesamiento se detuvo aunque haya omisiones; `COMPLETED_WITH_WARNINGS` indica que terminó con advertencias.
 
 ---
 

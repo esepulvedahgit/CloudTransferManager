@@ -130,12 +130,12 @@
 
 **Interfaces:** `TransferFileReport` recibe `transfer`, páginas del manifiesto y callbacks `onSkipAndResume`, `onRetryOmitted`, `onDownloadOmissions`; tipos compartidos corresponden a DTOs de las tareas 1–5. Conservar fetch autenticado/CSRF y manejo de errores mediante `api.ts`.
 
-- [ ] Escribir pruebas fallidas de extracción del informe existente sin perder paginación y rutas asignadas. Botón «Omitir este archivo y continuar» solo cuando `can_skip`; confirmación con el texto exacto del diseño, deshabilitación durante envío y refresco ante `409`.
-- [ ] Ejecutar `cd frontend && npm test -- --run src/TransferFileReport.test.tsx src/App.test.tsx`.
-- [ ] Implementar componente e integración, contador de omitidos en activo/historial, advertencia persistente y fin de procesamiento distinto de cobertura de copia. El detalle conserva motivo/fecha; descarga CSV y selección 1..100 para reintentar omitidos.
-- [ ] Añadir aviso y acción de aceptación de padre con omisiones, mostrando el intento que se acepta; llamada obsoleta refresca el estado sin despachar el hijo desde el navegador.
-- [ ] Probar cero bytes, pestaña recargada, frames atrasados, error de red posterior al commit y reintento de la misma acción con el mismo `request_id`. Mantener la conducta existente de SSE/polling terminal y los controles de acceso del backend.
-- [ ] Pasar pruebas enfocadas y crear commit `feat: surface file omission recovery and warnings`.
+- [x] Escribir pruebas fallidas de extracción del informe existente sin perder paginación y rutas asignadas. Botón «Omitir este archivo y continuar» solo cuando `can_skip`; confirmación con el texto exacto del diseño, deshabilitación durante envío y refresco ante `409`.
+- [x] Ejecutar `cd frontend && npm test -- --run src/TransferFileReport.test.tsx src/App.test.tsx`.
+- [x] Implementar componente e integración, contador de omitidos en activo/historial, advertencia persistente y fin de procesamiento distinto de cobertura de copia. El detalle conserva motivo/fecha; descarga CSV y selección 1..100 para reintentar omitidos.
+- [x] Añadir aviso y acción de aceptación de padre con omisiones, mostrando el intento que se acepta; llamada obsoleta refresca el estado sin despachar el hijo desde el navegador.
+- [x] Probar cero bytes, pestaña recargada, frames atrasados, error de red posterior al commit y reintento de la misma acción con el mismo `request_id`. Mantener la conducta existente de SSE/polling terminal y los controles de acceso del backend.
+- [ ] Crear commit `feat: surface file omission recovery and warnings` (pendiente de autorización de escritura en metadatos Git).
 
 ## Task 7: Omisión automática opt-in de restricciones MEGA confirmadas
 
@@ -143,23 +143,23 @@
 
 **Interfaces:** `MegaFailureCategory = RESOURCE_RESTRICTED | ACCOUNT_RESTRICTED | AUTHENTICATION | QUOTA | LOCAL_IO | TRANSIENT | UNKNOWN`; `MegaFailureScope = FILE | ACCOUNT | UNKNOWN`; `classify_megacmd_failure(return_code: int, output: bytes) -> MegaFailureDiagnostic`, dataclass inmutable con `category`, `scope`, `retryable`, `safe_code`. La excepción guarda solo este diagnóstico seguro; no conserva salida cruda.
 
-- [ ] Obtener evidencia autorizada del error de un único archivo mediante el wrapper permitido, con descarga acotada a staging privado y limpieza garantizada. Contrastar versión instalada y fuente/documentación oficial del CLI; extraer únicamente una fixture sin credenciales/rutas/handles privados. No descargar el árbol ni activar copias al destino para diagnosticar.
-- [ ] Escribir pruebas fallidas con una firma explícita y verificada de restricción individual, más cuenta bloqueada, cuota, autenticación, salida desconocida y código positivo 16 aislado. Solo la primera produce alcance `FILE`. Si no es posible demostrar la firma individual, todos esos casos quedan `UNKNOWN`/no automáticos y se mantiene disponible la entrega A.
-- [ ] Ejecutar `cd backend && pytest tests/test_megacmd_runner.py tests/test_megacmd_provider.py tests/test_transfer_omissions.py tests/test_transfer_executor.py -q`.
-- [ ] Implementar clasificación acotada en memoria y política: `STOP` detiene; `SKIP_CONFIRMED_RESTRICTED` omite exclusivamente categoría `RESOURCE_RESTRICTED`, scope `FILE`, etapa `SOURCE_DOWNLOAD`, escritura no iniciada y cleanup exitoso. Persistir `MEGA_FILE_RESTRICTED`, actor NULL, evento seguro, continuar con `CopyOutcome.SKIPPED`.
-- [ ] Mantener separados los contadores de omisiones automáticas y fallos seguros consecutivos. Probar tres restricciones consecutivas → stop; una copia verificada/reconciliada reinicia la cuenta. Nunca omitir automáticamente después de invocar upload ni ante fallo de staging/cleanup.
-- [ ] Añadir política explícita a creación/reanudación y sus DTOs, hash de idempotencia y UI. Rechazar opt-in en proveedores/políticas incompatibles. Trabajos existentes siguen `STOP`; manual no cambia política salvo elección explícita. Probar API/UI y persistencia tras reinicio.
-- [ ] Pasar pruebas enfocadas y crear commit `feat: optionally skip confirmed restricted MEGA files`.
+- [x] Contrastar documentación oficial de MEGAcmd/SDK. No se confirmó en la instalación una versión ni un mapeo del código de salida CLI a una restricción de archivo; no se inspeccionaron credenciales ni transferencias reales.
+- [x] Probar código positivo 16 aislado, marcadores SDK, cuenta bloqueada, cuota, autenticación, transitorio, error local y salida desconocida: todos quedan `UNKNOWN`, sin retener salida/rutas. La puerta de política también exige MEGA, etapa `SOURCE_DOWNLOAD`, escritura no iniciada y limpieza exitosa.
+- [x] Ejecutar suite backend completa, `ruff`, `mypy` y pruebas PostgreSQL desechables; todas pasan según la evidencia de tarea 8.
+- [x] Implementar clasificación segura en memoria y predicados de seguridad, manteniendo deliberadamente todo diagnóstico actual como `UNKNOWN`. Crear y reanudar rechazan el opt-in automático; no se persiste una omisión automática ni se activa `CopyOutcome.SKIPPED` por clasificador.
+- [x] Conservar por separado el circuito actual de fallos seguros; ningún error MEGAcmd desconocido altera la cuenta ni omite archivos.
+- [ ] Habilitar la política automática, UI de opt-in y persistencia `MEGA_FILE_RESTRICTED` solo cuando se compruebe una firma individual de la versión instalada y se agreguen pruebas de esa versión. La entrega manual A permanece utilizable.
+- [ ] Crear commit `feat: optionally skip confirmed restricted MEGA files` (pendiente de autorización de escritura en metadatos Git).
 
 ## Task 8: Verificación final, documentación y preparación de despliegue
 
 **Files:** `docs/specs/04-transfers-engine-spec.md`, `05-realtime-telemetry-spec.md`, `06-audit-notifications-spec.md`, `docs/api/openapi-contracts.md`, `docs/integrations/transfer-scheduling.md`, `docs/implementation-status.md`, este plan.
 
-- [ ] Actualizar especificaciones/contratos y guía operativa con semántica de `SKIPPED`, defaults, endpoints, cortacircuitos y aceptación de dependencias. Registrar evidencia real separada de validación simulada.
-- [ ] Ejecutar backend completo: `cd backend && pytest -v --tb=short`, `ruff check .`, `mypy app`. Ejecutar las pruebas de concurrencia y migración con PostgreSQL 16 desechable usando las fixtures del proyecto, sin publicar puertos ni apuntar al servicio de instalación.
-- [ ] Ejecutar frontend completo: `cd frontend && npm test -- --run`, `npm run lint`, `npm run build`. Revisar el flujo manual visible con datos simulados y advertencias, sin cambiar la transferencia real.
-- [ ] Auto-revisar el diff contra los nueve criterios del diseño y los cinco focos de revisión; verificar que no se alteró la lista blanca de comandos ni se incluyeron secretos. Registrar resultados, fallos o validaciones externas pendientes.
-- [ ] Preparar despliegue coordinado para revisión: respaldo verificado, detener nuevas admisiones, drenar copias, aplicar migración, actualizar API/workers/Beat coherentemente y comprobar salud; después habilitar admisiones. Reversión conserva esquema/columnas y requiere no volver a un ejecutor que reprocese omisiones explícitas; drenar/retener trabajos afectados antes de revertir.
+- [x] Actualizar especificaciones/contratos y guía operativa con semántica de `SKIPPED`, defaults, endpoints, cortacircuitos y aceptación de dependencias. Registrar evidencia real separada de validación simulada.
+- [x] Ejecutar backend completo: `pytest -q` (565 pasaron, 11 omitidas), `ruff check .` y `mypy app`. Las tres carreras de recuperación pasaron en PostgreSQL 16 desechable; `alembic upgrade head` también pasó. El downgrade ahora se protege si hay omisiones explícitas.
+- [x] Ejecutar frontend completo: `npm test -- --run` (63 pasaron), `npm run lint` y `npm run build`. El recorrido de omisión y avisos se verificó con datos simulados.
+- [x] Auto-revisar el diff contra los nueve criterios del diseño y los cinco focos de revisión; verificar que no se alteró la lista blanca de comandos ni se incluyeron secretos. Las revisiones resolvieron los seis hallazgos; no quedan hallazgos abiertos.
+- [ ] Preparar despliegue coordinado para revisión: respaldo verificado, detener nuevas admisiones, drenar copias, aplicar migración, actualizar API/workers/Beat coherentemente y comprobar salud; después habilitar admisiones. El downgrade se bloquea mientras existan omisiones explícitas. Mantener esquema y retener/atender trabajos afectados antes de volver a un ejecutor antiguo.
 - [ ] Presentar diff y evidencia al usuario. Solo tras autorización de despliegue ejecutar el procedimiento. Recuperar la transferencia real mediante la acción de UI/API con comprobación fresca de intento, fila y reservas; nunca mediante UPDATE manual. La acción concreta de omitir/reanudar se revisa con el usuario antes de iniciarla.
 - [ ] Commit de documentación `docs: document transfer omission operations and validation`.
 

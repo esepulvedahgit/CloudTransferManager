@@ -47,7 +47,11 @@ Las transferencias nuevas `KEEP_BOTH` de cualquier par consumen el cupo comparti
 
 ## Dependencias
 
-Una transferencia hija comienza después de que su padre termina en `COMPLETED` o `COMPLETED_WITH_WARNINGS`. Si el padre falla o se cancela, el hijo queda bloqueado por seguridad. Reprograma el hijo para elegir otro padre o cancélalo; si corresponde reanudar el padre, el dispatcher volverá a evaluar la dependencia.
+Una transferencia hija comienza después de que su padre termina en `COMPLETED` o `COMPLETED_WITH_WARNINGS` sin omisiones explícitas. Si el padre tiene archivos omitidos, el hijo queda en `BLOCKED_PARENT_OMISSIONS`; si el padre falla o se cancela, permanece bloqueado por seguridad. Revisa el informe del padre y acepta explícitamente las omisiones del intento mostrado si la copia parcial es válida para el hijo. La aceptación queda ligada a ese `attempt_count`; si se reanuda o reintenta el padre, el hijo vuelve a requerir revisión. Evaluación, dispatcher y worker revalidan el permiso antes de iniciar.
+
+Una omisión manual desde el informe de archivos confirma que ese archivo no se copiará y reanuda el trabajo conservando las copias verificadas. El historial muestra `omitted` separado de `SKIPPED` por conflictos anteriores y de `failed`. En transferencias terminales se puede descargar el CSV de omisiones o reintentar selectivamente hasta 100 archivos explícitamente omitidos; no se reabren automáticamente omisiones históricas.
+
+La omisión automática de archivos MEGA permanece deshabilitada hasta validar una firma individual de la versión MEGAcmd instalada. Por ahora los diagnósticos no clasificados conservan `STOP`; el informe permite recuperación manual con confirmación del usuario.
 
 Los horarios no cambian la disponibilidad de la red. Para copiar desde un SMB, el host/contenedor del worker debe poder alcanzar el NAS al ejecutarse. Cloud Transfer Manager no levanta ni administra la VPN.
 
@@ -60,7 +64,7 @@ El scheduler calcula la admisión usando `TRANSFER_MAX_CONCURRENT`, que debe coi
 ## Despliegue de la evaluación anticipada
 
 1. Respaldar PostgreSQL y abrir una ventana sin nuevas admisiones. Pausar Beat y `control-worker`, y esperar a que terminen las copias ya admitidas.
-2. Aplicar la migración `20261017_0013` con Alembic; el backfill solo crea evaluaciones para programaciones pendientes que todavía no reservaron ni iniciaron una copia.
+2. Aplicar las migraciones pendientes en orden, incluida `20261017_0013` para evaluaciones y `20261018_0015` para recuperación por archivo; comprobar el head esperado y el respaldo antes de reanudar admisiones.
 3. Desplegar API y los workers `transfers`, `control` y `evaluations` con la misma versión, manteniendo Beat detenido. Comprobar `/health/ready` y `/health/evaluations`.
 4. Iniciar una sola instancia de Beat y reanudar el despacho. Revisar una programación de prueba y confirmar que su conteo aparece en Programaciones antes de la hora de ejecución.
 

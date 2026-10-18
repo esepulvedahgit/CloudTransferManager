@@ -37,6 +37,7 @@ La aplicación agrega eventos y expone solo una consulta administrativa; no tien
 - Creación, modificación y desactivación de usuarios.
 - Creación, prueba, edición y desactivación de conexiones.
 - Creación, cancelación y reintento de transferencias.
+- Omisión manual de archivo (`TRANSFER_FILE_OMITTED`), reanudación resultante, aceptación de omisiones de un intento padre (`TRANSFER_PARENT_OMISSIONS_ACCEPTED`) y reintento selectivo (`TRANSFER_OMITTED_FILES_RETRIED`). Estas transiciones comparten la transacción con su auditoría y conservan la referencia UUID al manifiesto; los reintentos mantienen la omisión anterior en el historial de eventos.
 - Modificación de ajustes de sistema o configuración SMTP.
 - Accesos no autorizados (intentos 403 / 401).
 
@@ -93,6 +94,8 @@ CREATE TABLE transfer_events (
 - El envío de correos se procesa en segundo plano como una tarea Celery separada.
 - Un fallo en el servidor SMTP **NUNCA** debe marcar una transferencia exitosa como fallida.
 - Los correos no contienen rutas temporales locales ni stack traces técnicos.
+- El snapshot terminal del outbox fija `omitted` y `omitted_bytes` junto con estado y bytes transferidos. Una notificación pendiente describe el intento que la creó aunque luego se vuelvan a intentar omisiones. El correo presenta cantidades agregadas y no incluye las rutas de los archivos omitidos.
+- Diagnósticos MEGAcmd guardan solo código de salida, categoría/cobertura segura y reintentabilidad; no se persiste texto crudo de stdout/stderr ni rutas locales/remotas obtenidas de la salida.
 
 ---
 

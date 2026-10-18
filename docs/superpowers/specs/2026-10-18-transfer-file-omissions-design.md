@@ -1,6 +1,6 @@
 # Omisión controlada de archivos y continuidad de transferencias
 
-Estado: propuesta para revisión del usuario; no implementada ni desplegada.
+Estado: entrega manual implementada y preparada para revisión; no desplegada. La entrega automática MEGA sigue cerrada porque no se verificó una firma individual ligada a la versión de MEGAcmd instalada.
 
 ## Objetivo y alcance
 
