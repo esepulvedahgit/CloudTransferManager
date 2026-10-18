@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal
 
 from app.security.sanitize import sanitize_data
@@ -124,6 +125,7 @@ class TransferRecord:
     depends_on_transfer_id: uuid.UUID | None = None
     source_file_error_policy: str = "STOP"
     accepted_parent_omissions_attempt: int | None = None
+    source_provider_type: str | None = field(default=None, repr=False, compare=False)
     wait_reason: str | None = None
     dispatch_token: uuid.UUID | None = None
     dispatch_claimed_at: datetime | None = None
@@ -274,6 +276,7 @@ class MemoryStore:
         self.audit_events: list[dict[str, Any]] = []
         self._evaluation_claim_lock = asyncio.Lock()
         self._transfer_execution_locks: dict[uuid.UUID, asyncio.Lock] = {}
+        self._transfer_recovery_locks: dict[uuid.UUID, asyncio.Lock] = {}
 
     async def acheck(self) -> bool:
         return True
@@ -1455,6 +1458,235 @@ class MemoryStore:
         transfer.cancel_requested_at = None
         return transfer
 
+    async def askip_transfer_item_and_resume(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        actor_id: uuid.UUID,
+        expected_attempt: int,
+        request_id: uuid.UUID,
+        source_file_error_policy: str | None = None,
+    ) -> TransferRecord:
+        from app.services.transfer_omissions import (
+            OmissionKind,
+            TransferRecoveryConflictError,
+            TransferRecoveryNotFoundError,
+            can_skip_manifest_item,
+            normalize_source_file_error_policy,
+            recovery_request_hash,
+            resolve_failure_evidence,
+            skip_unavailable_reason,
+        )
+
+        lock = self._transfer_recovery_locks.setdefault(transfer_id, asyncio.Lock())
+        async with lock:
+            transfer = self.transfers.get(transfer_id)
+            if transfer is None:
+                raise TransferRecoveryNotFoundError("Transfer not found")
+            request_hash = recovery_request_hash(
+                item_id=item_id,
+                expected_attempt=expected_attempt,
+                source_file_error_policy=source_file_error_policy,
+            )
+            for event in self.audit_events:
+                if (
+                    event.get("resource_type") == "transfer"
+                    and event.get("resource_id") == str(transfer_id)
+                    and event.get("action") == "TRANSFER_FILE_OMITTED"
+                    and event.get("metadata", {}).get("request_id") == str(request_id)
+                ):
+                    if event.get("metadata", {}).get("request_hash") != request_hash:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used for a different recovery action"
+                        )
+                    transfer.idempotent_replay = True
+                    return transfer
+
+            actor = self.users.get(actor_id)
+            if actor is None or not actor.is_active:
+                raise TransferRecoveryNotFoundError("Transfer not found")
+            if actor.role != "ADMIN" and transfer.requested_by != actor_id:
+                raise TransferRecoveryNotFoundError("Transfer not found")
+            if expected_attempt != transfer.attempt_count:
+                raise TransferRecoveryConflictError("Transfer attempt changed")
+            if transfer.status != "FAILED":
+                raise TransferRecoveryConflictError("Transfer is not failed")
+            if (
+                transfer.dispatch_token is not None
+                or transfer.dispatch_claimed_at is not None
+                or transfer.execution_started_at is not None
+                or transfer.execution_heartbeat_at is not None
+                or (
+                    execution_lock := self._transfer_execution_locks.get(transfer_id)
+                )
+                is not None
+                and execution_lock.locked()
+            ):
+                raise TransferRecoveryConflictError("Transfer execution is still active")
+
+            source = self.connections.get(transfer.source_connection_id)
+            destination = self.connections.get(transfer.destination_connection_id)
+            if source is None or destination is None or source.deleted_at or destination.deleted_at:
+                raise TransferRecoveryConflictError("A transfer connection is unavailable")
+            if source.status != "ACTIVE" or destination.status != "ACTIVE":
+                raise TransferRecoveryConflictError("A transfer connection is inactive")
+            if (
+                source.credential_version != transfer.source_credential_version
+                or destination.credential_version != transfer.destination_credential_version
+            ):
+                raise TransferRecoveryConflictError("Transfer credentials changed")
+            if actor.role != "ADMIN":
+                if not source.is_global and (actor_id, source.id) not in self.connection_grants:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                if (
+                    not destination.is_global
+                    and (actor_id, destination.id) not in self.connection_grants
+                ):
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+
+            item = self._manifest_item(transfer_id, item_id)
+            if item is None:
+                raise TransferRecoveryNotFoundError("Manifest item not found")
+            if source_file_error_policy is not None:
+                policy = normalize_source_file_error_policy(source_file_error_policy)
+                if policy != "STOP":
+                    raise TransferRecoveryConflictError(
+                        "Automatic source omission is not enabled"
+                    )
+
+            all_items = [
+                candidate
+                for (candidate_transfer_id, _), candidate in self.transfer_manifest_items.items()
+                if candidate_transfer_id == transfer_id
+            ]
+            events = self.transfer_events.get(transfer_id, [])
+            basename = PurePosixPath(item.source_path).name
+            basename_matches = sum(
+                1
+                for candidate in all_items
+                if not candidate.is_dir and PurePosixPath(candidate.source_path).name == basename
+            )
+            transfer.source_provider_type = source.provider_type
+            failure_stage, failure_attempt = resolve_failure_evidence(
+                transfer,
+                item,
+                events,
+                basename_matches=basename_matches,
+            )
+            if not can_skip_manifest_item(
+                transfer,
+                item,
+                failure_stage=failure_stage,
+                failure_attempt=failure_attempt,
+            ):
+                raise TransferRecoveryConflictError(
+                    skip_unavailable_reason(
+                        transfer,
+                        item,
+                        failure_stage=failure_stage,
+                        failure_attempt=failure_attempt,
+                    )
+                    or "Transfer item cannot be omitted"
+                )
+
+            key = next(
+                key
+                for key, candidate in self.transfer_manifest_items.items()
+                if key[0] == transfer_id and candidate.id == item_id
+            )
+            previous_transfer = replace(transfer)
+            previous_item = replace(item)
+            event_count = len(events)
+            audit_count = len(self.audit_events)
+            old_attempt = transfer.attempt_count
+            now = datetime.now(UTC)
+            try:
+                item.status = "SKIPPED"
+                item.omission_kind = OmissionKind.USER_ACCEPTED_SOURCE_FAILURE.value
+                item.omitted_at = now
+                item.omitted_by = actor_id
+                item.last_failure_stage = failure_stage
+                item.last_failure_attempt = failure_attempt
+                transfer.error_count = max(0, transfer.error_count - 1)
+                transfer.status = "QUEUED"
+                transfer.attempt_count += 1
+                transfer.completed_at = None
+                transfer.started_at = None
+                transfer.current_item = None
+                transfer.current_speed_bps = None
+                transfer.estimated_remaining_seconds = None
+                transfer.wait_reason = None
+                transfer.dispatch_token = None
+                transfer.dispatch_claimed_at = None
+                transfer.execution_started_at = None
+                transfer.execution_heartbeat_at = None
+                transfer.cancel_requested_at = None
+                if source_file_error_policy is not None:
+                    transfer.source_file_error_policy = normalize_source_file_error_policy(
+                        source_file_error_policy
+                    )
+                metadata = {
+                    "public_id": transfer.public_id,
+                    "request_id": str(request_id),
+                    "request_hash": request_hash,
+                    "manifest_item_id": str(item.id),
+                    "omission_kind": item.omission_kind,
+                    "failure_attempt": failure_attempt,
+                    "attempt_count": old_attempt,
+                }
+                await self.aadd_audit_event(
+                    actor_user_id=actor_id,
+                    action="TRANSFER_FILE_OMITTED",
+                    resource_type="transfer",
+                    resource_id=str(transfer_id),
+                    result="SUCCESS",
+                    metadata=metadata,
+                )
+                await self.aadd_audit_event(
+                    actor_user_id=actor_id,
+                    action="TRANSFER_RESUMED",
+                    resource_type="transfer",
+                    resource_id=str(transfer_id),
+                    result="SUCCESS",
+                    metadata={
+                        "public_id": transfer.public_id,
+                        "request_id": str(request_id),
+                        "request_hash": request_hash,
+                        "attempt_count": transfer.attempt_count,
+                    },
+                )
+                await self.aadd_transfer_event(
+                    transfer_id,
+                    level="WARNING",
+                    event_type="TRANSFER_FILE_OMITTED",
+                    message="Se omitió un archivo del origen por decisión del usuario.",
+                    technical_details={
+                        "manifest_item_id": str(item.id),
+                        "omission_kind": item.omission_kind,
+                        "failure_attempt": failure_attempt,
+                        "attempt_count": old_attempt,
+                    },
+                    provider_error_code=item.error_code,
+                    item_path=item.source_path,
+                )
+                await self.aadd_transfer_event(
+                    transfer_id,
+                    level="INFO",
+                    event_type="TRANSFER_RESUMED",
+                    message="La transferencia continuará con los archivos restantes.",
+                    technical_details={"attempt_count": transfer.attempt_count},
+                )
+            except Exception:
+                self.transfers[transfer_id] = previous_transfer
+                self.transfer_manifest_items[key] = previous_item
+                del self.transfer_events[transfer_id][event_count:]
+                del self.audit_events[audit_count:]
+                raise
+            summaries = await self.alist_transfer_manifest_summaries([transfer_id])
+            transfer.manifest_summary = summaries[transfer_id]
+            return transfer
+
     async def adispatch_due_transfers(
         self,
         now: datetime,
@@ -1808,6 +2040,17 @@ class MemoryStore:
             and (after_id is None or item.id.int > after_id.int)
         ]
         return sorted(rows, key=lambda item: item.id.int)[:limit]
+
+    async def acount_transfer_manifest_basename_matches(
+        self, transfer_id: uuid.UUID, basename: str
+    ) -> int:
+        return sum(
+            1
+            for (candidate_transfer_id, _), item in self.transfer_manifest_items.items()
+            if candidate_transfer_id == transfer_id
+            and not item.is_dir
+            and PurePosixPath(item.source_path).name == basename
+        )
 
     async def aupdate_transfer_manifest_item(
         self,

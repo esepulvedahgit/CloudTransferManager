@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -65,7 +65,14 @@ from app.services.smtp_config import (
 )
 from app.services.transfer_evaluation import EvaluationConflictError
 from app.services.transfer_executor import TransferExecutor
-from app.services.transfer_omissions import SourceFileErrorPolicy
+from app.services.transfer_omissions import (
+    SourceFileErrorPolicy,
+    TransferRecoveryConflictError,
+    TransferRecoveryNotFoundError,
+    resolve_failure_evidence,
+    skip_unavailable_reason,
+)
+from app.services.transfer_recovery import SkipAndResumeRequest, skip_and_resume_transfer
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -1865,6 +1872,61 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             raise HTTPException(status_code=404, detail="Transferencia no encontrada")
         return cast(TransferRecord, record)
 
+    async def transfer_item_skip_state(
+        record: TransferRecord,
+        item: Any,
+        user: UserAccount,
+    ) -> tuple[bool, str | None]:
+        if record.status != "FAILED":
+            return False, "TRANSFER_NOT_FAILED"
+        if item.is_dir:
+            return False, "DIRECTORIES_CANNOT_BE_OMITTED"
+        if item.status != "FAILED":
+            return False, "ITEM_NOT_FAILED"
+        if item.copy_started:
+            return False, "DESTINATION_WRITE_MAY_HAVE_STARTED"
+        source = await app.state.store.aget_connection(record.source_connection_id)
+        destination = await app.state.store.aget_connection(record.destination_connection_id)
+        if source is None or destination is None:
+            return False, "CONNECTION_UNAVAILABLE"
+        record.source_provider_type = source.provider_type
+        if source.status != "ACTIVE" or destination.status != "ACTIVE":
+            return False, "CONNECTION_INACTIVE"
+        if (
+            source.credential_version != record.source_credential_version
+            or destination.credential_version != record.destination_credential_version
+        ):
+            return False, "CREDENTIALS_CHANGED"
+        if (
+            record.dispatch_token is not None
+            or record.dispatch_claimed_at is not None
+            or record.execution_started_at is not None
+            or record.execution_heartbeat_at is not None
+        ):
+            return False, "TRANSFER_EXECUTION_ACTIVE"
+        if user.role != "ADMIN":
+            for connection_id in (source.id, destination.id):
+                if not await app.state.store.ahas_connection_access(user.id, connection_id):
+                    return False, "CONNECTION_ACCESS_CHANGED"
+        events = await app.state.store.alist_transfer_events(record.id)
+        basename = PurePosixPath(item.source_path).name
+        basename_matches = await app.state.store.acount_transfer_manifest_basename_matches(
+            record.id, basename
+        )
+        failure_stage, failure_attempt = resolve_failure_evidence(
+            record,
+            item,
+            events,
+            basename_matches=basename_matches,
+        )
+        unavailable = skip_unavailable_reason(
+            record,
+            item,
+            failure_stage=failure_stage,
+            failure_attempt=failure_attempt,
+        )
+        return unavailable is None, unavailable
+
     @app.get("/api/v1/transfers/capabilities")
     async def transfer_capabilities(
         _user: UserAccount = Depends(current_user),
@@ -2062,8 +2124,15 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             limit=limit,
             include_directories=True,
         )
+        public_items = []
+        for item in items:
+            public_item = item.public_dict()
+            can_skip, unavailable_reason = await transfer_item_skip_state(record, item, user)
+            public_item["can_skip"] = can_skip
+            public_item["skip_unavailable_reason"] = unavailable_reason
+            public_items.append(public_item)
         return {
-            "items": [item.public_dict() for item in items],
+            "items": public_items,
             "next_cursor": str(items[-1].id) if len(items) == limit else None,
             "counts": await app.state.store.aget_transfer_manifest_counts(record.id),
         }
@@ -2160,6 +2229,69 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             app.state.tasks.add(task)
             task.add_done_callback(app.state.tasks.discard)
         return record.public_dict()
+
+    @app.post(
+        "/api/v1/transfers/{transfer_id}/items/{item_id}/skip-and-resume",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def skip_transfer_item_and_resume(
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        payload: SkipAndResumeRequest,
+        user: UserAccount = Depends(current_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        await visible_transfer(transfer_id, user)
+        try:
+            resumed = await skip_and_resume_transfer(
+                app.state.store,
+                transfer_id,
+                item_id,
+                actor_id=user.id,
+                request=payload,
+            )
+        except TransferRecoveryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Transferencia no encontrada") from exc
+        except (TransferRecoveryConflictError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if resumed.idempotent_replay:
+            resumed.manifest_summary = (
+                await app.state.store.alist_transfer_manifest_summaries([resumed.id])
+            )[resumed.id]
+            return resumed.public_dict()
+
+        if app.state.event_bus:
+            try:
+                await app.state.event_bus.clear_cancel(str(transfer_id))
+            except Exception:
+                pass
+        app.state.cancel_requests.discard(transfer_id)
+        await publish_transfer(resumed)
+        if config.app_env.lower() == "production":
+            try:
+                from app.worker import dispatch_pending_transfers
+
+                dispatch_pending_transfers.delay()
+            except Exception:
+                # PostgreSQL keeps the queued attempt for the next Beat tick.
+                pass
+        else:
+
+            async def should_cancel_recovered_transfer() -> bool:
+                return await cancel_requested(resumed.id)
+
+            executor = TransferExecutor(
+                config,
+                app.state.store,
+                publish_transfer,
+                should_cancel_recovered_transfer,
+            )
+            task = asyncio.create_task(executor.execute(resumed.id))
+            app.state.tasks.add(task)
+            task.add_done_callback(app.state.tasks.discard)
+        return resumed.public_dict()
 
     @app.get("/api/v1/transfers/{transfer_id}/stream")
     async def stream_transfer(

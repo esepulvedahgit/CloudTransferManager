@@ -5,6 +5,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import PurePosixPath
 from typing import Any
 
 from sqlalchemy import and_, case, delete, exists, func, or_, select, text, update
@@ -47,7 +48,16 @@ from app.services.transfer_evaluation import (
     EvaluationRecord,
     restart_evaluation,
 )
-from app.services.transfer_omissions import normalize_source_file_error_policy
+from app.services.transfer_omissions import (
+    OmissionKind,
+    TransferRecoveryConflictError,
+    TransferRecoveryNotFoundError,
+    can_skip_manifest_item,
+    normalize_source_file_error_policy,
+    recovery_request_hash,
+    resolve_failure_evidence,
+    skip_unavailable_reason,
+)
 from app.services.transfer_progress import smb_manifest_progress_percent
 from app.services.transfer_scheduling import (
     DispatchBatch,
@@ -2125,6 +2135,278 @@ class DatabaseStore:
                 await session.flush()
                 return self._transfer(row)
 
+    async def askip_transfer_item_and_resume(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        actor_id: uuid.UUID,
+        expected_attempt: int,
+        request_id: uuid.UUID,
+        source_file_error_policy: str | None = None,
+    ) -> TransferRecord:
+        request_hash = recovery_request_hash(
+            item_id=item_id,
+            expected_attempt=expected_attempt,
+            source_file_error_policy=source_file_error_policy,
+        )
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(TransferJob.id == transfer_id)
+                    .with_for_update()
+                )
+                if row is None:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+
+                prior_audits = (
+                    await session.scalars(
+                        select(AuditEvent).where(
+                            AuditEvent.resource_type == "transfer",
+                            AuditEvent.resource_id == str(transfer_id),
+                            AuditEvent.action == "TRANSFER_FILE_OMITTED",
+                        )
+                    )
+                ).all()
+                for prior in prior_audits:
+                    metadata = prior.event_metadata or {}
+                    if metadata.get("request_id") != str(request_id):
+                        continue
+                    if metadata.get("request_hash") != request_hash:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used for a different recovery action"
+                        )
+                    replay = self._transfer(row)
+                    replay.idempotent_replay = True
+                    return replay
+
+                actor = await session.get(User, actor_id)
+                if actor is None or not actor.is_active:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                if actor.role != "ADMIN" and row.requested_by != actor_id:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                if expected_attempt != row.attempt_count:
+                    raise TransferRecoveryConflictError("Transfer attempt changed")
+                if row.status != "FAILED":
+                    raise TransferRecoveryConflictError("Transfer is not failed")
+                if (
+                    row.dispatch_token is not None
+                    or row.dispatch_claimed_at is not None
+                    or row.execution_started_at is not None
+                    or row.execution_heartbeat_at is not None
+                ):
+                    raise TransferRecoveryConflictError("Transfer execution is still active")
+
+                connection_ids = sorted(
+                    {row.source_connection_id, row.destination_connection_id}
+                )
+                connections = (
+                    await session.scalars(
+                        select(StorageConnection)
+                        .where(StorageConnection.id.in_(connection_ids))
+                        .order_by(StorageConnection.id)
+                        .with_for_update()
+                    )
+                ).all()
+                by_id = {connection.id: connection for connection in connections}
+                source = by_id.get(row.source_connection_id)
+                destination = by_id.get(row.destination_connection_id)
+                if (
+                    source is None
+                    or destination is None
+                    or source.deleted_at is not None
+                    or destination.deleted_at is not None
+                ):
+                    raise TransferRecoveryConflictError("A transfer connection is unavailable")
+                if source.status != "ACTIVE" or destination.status != "ACTIVE":
+                    raise TransferRecoveryConflictError("A transfer connection is inactive")
+                if (
+                    source.credential_version != row.source_credential_version
+                    or destination.credential_version != row.destination_credential_version
+                ):
+                    raise TransferRecoveryConflictError("Transfer credentials changed")
+                if actor.role != "ADMIN":
+                    for connection in (source, destination):
+                        if not connection.is_global and await session.get(
+                            UserConnectionGrant, (actor_id, connection.id)
+                        ) is None:
+                            raise TransferRecoveryNotFoundError("Transfer not found")
+
+                item = await session.scalar(
+                    select(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.id == item_id,
+                    )
+                    .with_for_update()
+                )
+                if item is None:
+                    raise TransferRecoveryNotFoundError("Manifest item not found")
+                if source_file_error_policy is not None:
+                    policy = normalize_source_file_error_policy(source_file_error_policy)
+                    if policy != "STOP":
+                        raise TransferRecoveryConflictError(
+                            "Automatic source omission is not enabled"
+                        )
+
+                event_rows = (
+                    await session.scalars(
+                        select(TransferEvent)
+                        .where(
+                            TransferEvent.transfer_job_id == transfer_id,
+                            TransferEvent.event_type == "FAILURE_DIAGNOSTIC",
+                        )
+                        .order_by(TransferEvent.created_at)
+                    )
+                ).all()
+                events = [
+                    {
+                        "event_type": event.event_type,
+                        "technical_details": event.technical_details,
+                        "provider_error_code": event.provider_error_code,
+                        "created_at": event.created_at,
+                    }
+                    for event in event_rows
+                ]
+                basename = PurePosixPath(item.source_path).name
+                basename_matches = int(
+                    await session.scalar(
+                        select(func.count(TransferManifestItem.id)).where(
+                            TransferManifestItem.transfer_job_id == transfer_id,
+                            TransferManifestItem.is_dir.is_(False),
+                            or_(
+                                TransferManifestItem.source_path == basename,
+                                TransferManifestItem.source_path.endswith(
+                                    f"/{basename}", autoescape=True
+                                ),
+                            ),
+                        )
+                    )
+                    or 0
+                )
+                transfer = self._transfer(row)
+                transfer.source_provider_type = source.provider_type
+                failure_stage, failure_attempt = resolve_failure_evidence(
+                    transfer,
+                    self._manifest_item(item),
+                    events,
+                    basename_matches=basename_matches,
+                )
+                manifest_item = self._manifest_item(item)
+                if not can_skip_manifest_item(
+                    transfer,
+                    manifest_item,
+                    failure_stage=failure_stage,
+                    failure_attempt=failure_attempt,
+                ):
+                    raise TransferRecoveryConflictError(
+                        skip_unavailable_reason(
+                            transfer,
+                            manifest_item,
+                            failure_stage=failure_stage,
+                            failure_attempt=failure_attempt,
+                        )
+                        or "Transfer item cannot be omitted"
+                    )
+
+                now = datetime.now(UTC)
+                previous_attempt = row.attempt_count
+                item.status = "SKIPPED"
+                item.omission_kind = OmissionKind.USER_ACCEPTED_SOURCE_FAILURE.value
+                item.omitted_at = now
+                item.omitted_by = actor_id
+                item.last_failure_stage = failure_stage
+                item.last_failure_attempt = failure_attempt
+                row.error_count = max(0, row.error_count - 1)
+                row.status = "QUEUED"
+                row.attempt_count += 1
+                row.completed_at = None
+                row.started_at = None
+                row.current_item = None
+                row.current_speed_bps = None
+                row.estimated_remaining_seconds = None
+                row.wait_reason = None
+                row.dispatch_token = None
+                row.dispatch_claimed_at = None
+                row.execution_started_at = None
+                row.execution_heartbeat_at = None
+                row.cancel_requested_at = None
+                if source_file_error_policy is not None:
+                    row.source_file_error_policy = normalize_source_file_error_policy(
+                        source_file_error_policy
+                    )
+
+                metadata = {
+                    "public_id": row.public_id,
+                    "request_id": str(request_id),
+                    "request_hash": request_hash,
+                    "manifest_item_id": str(item.id),
+                    "omission_kind": item.omission_kind,
+                    "failure_attempt": failure_attempt,
+                    "attempt_count": previous_attempt,
+                }
+                session.add(
+                    AuditEvent(
+                        actor_user_id=actor_id,
+                        action="TRANSFER_FILE_OMITTED",
+                        resource_type="transfer",
+                        resource_id=str(transfer_id),
+                        result="SUCCESS",
+                        event_metadata=sanitize_data(metadata),
+                        correlation_id=request_id,
+                    )
+                )
+                session.add(
+                    AuditEvent(
+                        actor_user_id=actor_id,
+                        action="TRANSFER_RESUMED",
+                        resource_type="transfer",
+                        resource_id=str(transfer_id),
+                        result="SUCCESS",
+                        event_metadata=sanitize_data(
+                            {
+                                "public_id": row.public_id,
+                                "request_id": str(request_id),
+                                "request_hash": request_hash,
+                                "attempt_count": row.attempt_count,
+                            }
+                        ),
+                        correlation_id=request_id,
+                    )
+                )
+                session.add_all(
+                    [
+                        TransferEvent(
+                            transfer_job_id=transfer_id,
+                            level="WARNING",
+                            event_type="TRANSFER_FILE_OMITTED",
+                            message="Se omitió un archivo del origen por decisión del usuario.",
+                            technical_details=sanitize_data(
+                                {
+                                    "manifest_item_id": str(item.id),
+                                    "omission_kind": item.omission_kind,
+                                    "failure_attempt": failure_attempt,
+                                    "attempt_count": previous_attempt,
+                                }
+                            ),
+                            provider_error_code=item.error_code,
+                            item_path=item.source_path,
+                            correlation_id=request_id,
+                        ),
+                        TransferEvent(
+                            transfer_job_id=transfer_id,
+                            level="INFO",
+                            event_type="TRANSFER_RESUMED",
+                            message="La transferencia continuará con los archivos restantes.",
+                            technical_details={"attempt_count": row.attempt_count},
+                            correlation_id=request_id,
+                        ),
+                    ]
+                )
+                await session.flush()
+                return self._transfer(row)
+
     async def astart_transfer_dispatch(
         self, transfer_id: uuid.UUID, dispatch_token: uuid.UUID, now: datetime
     ) -> bool:
@@ -2605,6 +2887,26 @@ class DatabaseStore:
                 )
             ).all()
             return [self._manifest_item(row) for row in rows]
+
+    async def acount_transfer_manifest_basename_matches(
+        self, transfer_id: uuid.UUID, basename: str
+    ) -> int:
+        async with self.sessions() as session:
+            return int(
+                await session.scalar(
+                    select(func.count(TransferManifestItem.id)).where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.is_dir.is_(False),
+                        or_(
+                            TransferManifestItem.source_path == basename,
+                            TransferManifestItem.source_path.endswith(
+                                f"/{basename}", autoescape=True
+                            ),
+                        ),
+                    )
+                )
+                or 0
+            )
 
     async def aupdate_transfer_manifest_item(
         self,
