@@ -2916,6 +2916,8 @@ class DatabaseStore:
         status: str,
         verified_by: str | None = None,
         error_code: str | None = None,
+        failure_stage: str | None = None,
+        failure_attempt: int | None = None,
     ) -> None:
         if status not in {"COPIED", "SKIPPED", "FAILED", "PENDING"}:
             raise ValueError("Invalid manifest result")
@@ -2940,6 +2942,8 @@ class DatabaseStore:
                     old_status == status
                     and item.verified_by == verified_by
                     and item.error_code == error_code
+                    and (status != "FAILED" or item.last_failure_stage == failure_stage)
+                    and (status != "FAILED" or item.last_failure_attempt == failure_attempt)
                 ):
                     return
                 terminal = {"COPIED", "SKIPPED", "FAILED"}
@@ -2966,6 +2970,12 @@ class DatabaseStore:
                 item.status = status
                 item.verified_by = verified_by
                 item.error_code = error_code
+                if status == "FAILED":
+                    item.last_failure_stage = failure_stage
+                    item.last_failure_attempt = failure_attempt
+                elif status in {"COPIED", "PENDING"}:
+                    item.last_failure_stage = None
+                    item.last_failure_attempt = None
                 # For SMB manifests, warning_count tracks failed and skipped file outcomes.
                 transfer.progress_percent = smb_manifest_progress_percent(
                     bytes_transferred=transfer.bytes_transferred,

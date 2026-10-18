@@ -72,6 +72,18 @@ async def test_memory_store_round_trips_omission_fields_and_safe_defaults():
     assert item.last_failure_stage is None
     assert item.last_failure_attempt is None
 
+    await store.aupdate_transfer_manifest_item(
+        transfer.id,
+        item.id,
+        status="FAILED",
+        error_code="MEGACMD_COMMAND_FAILED",
+        failure_stage="SOURCE_DOWNLOAD",
+        failure_attempt=3,
+    )
+    failed_item = (await store.alist_transfer_manifest_items(transfer.id, statuses={"FAILED"}))[0]
+    assert failed_item.last_failure_stage == "SOURCE_DOWNLOAD"
+    assert failed_item.last_failure_attempt == 3
+
     omitted_at = datetime.now(UTC)
     item.status = "SKIPPED"
     item.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
@@ -136,6 +148,18 @@ async def test_database_store_round_trips_omission_fields_and_safe_defaults(tmp_
     assert item.omitted_by is None
     assert item.last_failure_stage is None
     assert item.last_failure_attempt is None
+
+    await store.aupdate_transfer_manifest_item(
+        transfer.id,
+        item.id,
+        status="FAILED",
+        error_code="MEGACMD_COMMAND_FAILED",
+        failure_stage="SOURCE_DOWNLOAD",
+        failure_attempt=3,
+    )
+    failed_item = (await store.alist_transfer_manifest_items(transfer.id, statuses={"FAILED"}))[0]
+    assert failed_item.last_failure_stage == "SOURCE_DOWNLOAD"
+    assert failed_item.last_failure_attempt == 3
 
     omitted_at = datetime.now(UTC)
     async with store.sessions() as session:

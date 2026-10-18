@@ -1,8 +1,10 @@
 import asyncio
+import shutil
 import smtplib
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,7 @@ import app.worker as worker
 from app.security.credentials import CredentialCipher
 from app.services.memory_store import MemoryStore, SMTPSettingsRecord
 from app.services.smtp_config import SMTPServerConfig
+from app.services.staging import temporary_staging_area
 from app.services.transfer_evaluation import EvaluationClaim
 from app.settings import Settings
 from app.worker import celery_app
@@ -163,15 +166,20 @@ async def test_redelivered_transfer_does_not_run_or_clear_active_cancellation(mo
 
 @pytest.mark.asyncio
 async def test_progress_publish_failure_does_not_fail_a_completed_transfer(monkeypatch):
+    reservation = {"active": False, "active_when_completed_was_published": None}
+
     class WorkerStore(MemoryStore):
         @asynccontextmanager
         async def transfer_execution_lock(self, _transfer_id):
             yield True
 
         async def astart_transfer_dispatch(self, _transfer_id, _token, _now):
+            reservation["active"] = True
             return True
 
         async def afinish_transfer_dispatch(self, _transfer_id, _token):
+            assert reservation["active"] is True
+            reservation["active"] = False
             return None
 
         async def afail_transfer_dispatch(self, transfer_id, _token, **_kwargs):
@@ -186,6 +194,7 @@ async def test_progress_publish_failure_does_not_fail_a_completed_transfer(monke
 
         async def publish_progress(self, _transfer_id, event):
             if event["status"] == "COMPLETED":
+                reservation["active_when_completed_was_published"] = reservation["active"]
                 raise ConnectionError("Redis is unavailable")
 
         async def clear_cancel(self, _transfer_id):
@@ -207,6 +216,98 @@ async def test_progress_publish_failure_does_not_fail_a_completed_transfer(monke
     await worker._execute_transfer(transfer.id, uuid.uuid4())
 
     assert (await store.aget_transfer(transfer.id)).status == "COMPLETED"
+    assert reservation["active_when_completed_was_published"] is True
+    assert reservation["active"] is False
+
+
+@pytest.mark.asyncio
+async def test_worker_keeps_reservation_until_failed_staging_cleanup_finishes(
+    monkeypatch, tmp_path
+):
+    reservation = {"active": False, "active_during_failure": None, "active_at_finish": None}
+    settings = Settings(transfer_staging_path=str(tmp_path / "staging"))
+
+    class WorkerStore(MemoryStore):
+        @asynccontextmanager
+        async def transfer_execution_lock(self, _transfer_id):
+            yield True
+
+        async def astart_transfer_dispatch(self, transfer_id, token, now):
+            reservation["active"] = True
+            transfer = self.transfers[transfer_id]
+            transfer.dispatch_token = token
+            transfer.execution_started_at = now
+            return True
+
+        async def afail_transfer_dispatch(self, transfer_id, _token, **_kwargs):
+            transfer = self.transfers[transfer_id]
+            reservation["active_during_failure"] = reservation["active"]
+            assert transfer.execution_started_at is not None
+            transfer.status = "FAILED"
+
+        async def afinish_transfer_dispatch(self, transfer_id, _token):
+            transfer = self.transfers[transfer_id]
+            reservation["active_at_finish"] = reservation["active"]
+            reservation["active"] = False
+            transfer.dispatch_token = None
+            transfer.execution_started_at = None
+
+        async def aclose(self):
+            return None
+
+    class EventBus:
+        def __init__(self, _client):
+            pass
+
+        async def clear_cancel(self, _transfer_id):
+            return None
+
+        async def aclose(self):
+            return None
+
+    class CleanupFailingExecutor:
+        def __init__(self, current_settings, _store, _publish, _should_cancel):
+            self.settings = current_settings
+
+        async def execute(self, transfer_id):
+            async with temporary_staging_area(
+                Path(self.settings.transfer_staging_path),
+                transfer_id=transfer_id,
+                expected_size=None,
+            ):
+                pass
+
+    store = WorkerStore(settings)
+    user = store.add_user("cleanup-owner", "cleanup@example.test", "hash")
+    source = store.create_connection("Source", "MOCK", user.id)
+    destination = store.create_connection("Destination", "MOCK", user.id)
+    transfer = store.create_transfer(user.id, source.id, destination.id, ["/source"], "/dest")
+    real_rmtree = shutil.rmtree
+
+    def fail_cleanup(path, *args, **kwargs):
+        if Path(path).name.startswith("transfer-"):
+            raise OSError("staging cleanup failed")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    monkeypatch.setattr(worker, "DatabaseStore", lambda _settings: store)
+    monkeypatch.setattr(worker.Redis, "from_url", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(worker, "RedisEventBus", EventBus)
+    monkeypatch.setattr(worker, "TransferExecutor", CleanupFailingExecutor)
+    monkeypatch.setattr("app.services.staging.shutil.rmtree", fail_cleanup)
+
+    await worker._execute_transfer(transfer.id, uuid.uuid4())
+
+    monkeypatch.setattr("app.services.staging.shutil.rmtree", real_rmtree)
+    assert reservation == {
+        "active": False,
+        "active_during_failure": True,
+        "active_at_finish": True,
+    }
+    assert (await store.aget_transfer(transfer.id)).status == "FAILED"
+    leftover_areas = list(Path(settings.transfer_staging_path).iterdir())
+    assert len(leftover_areas) == 1
+    real_rmtree(leftover_areas[0])
 
 
 @pytest.mark.asyncio

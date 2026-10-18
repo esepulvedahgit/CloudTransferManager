@@ -16,6 +16,10 @@ class StagingSpaceError(OSError):
     """Raised when a staging copy would violate its free-space reserve."""
 
 
+class StagingCleanupError(OSError):
+    """Raised when a private transfer staging area cannot be removed."""
+
+
 def cleanup_orphaned_transfer_staging_areas(
     root: Path,
     *,
@@ -115,8 +119,13 @@ async def temporary_staging_area(
         try:
             await asyncio.shield(cleanup_task)
         except asyncio.CancelledError:
-            await cleanup_task
+            try:
+                await cleanup_task
+            except OSError:
+                raise StagingCleanupError("No se pudo limpiar el área temporal.") from None
             raise
+        except OSError:
+            raise StagingCleanupError("No se pudo limpiar el área temporal.") from None
 
 
 def _reject_symlink_components(path: Path) -> None:

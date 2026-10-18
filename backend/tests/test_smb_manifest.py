@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import pytest
 
 from app.services.memory_store import MemoryStore, TransferRecord
+from app.services.transfer_progress import smb_manifest_progress_percent
 
 
 def manifest_entry(
@@ -28,6 +29,17 @@ def transfer_record(transfer_id: uuid.UUID) -> TransferRecord:
         source_paths=["/"],
         destination_path="/archive",
     )
+
+
+def test_zero_byte_omission_prevents_full_progress_when_bytes_are_complete():
+    progress = smb_manifest_progress_percent(
+        bytes_transferred=100,
+        bytes_total=100,
+        files_total=4317,
+        counts={"copied": 4316, "omitted": 1},
+    )
+
+    assert progress == 99.99
 
 
 @pytest.mark.asyncio

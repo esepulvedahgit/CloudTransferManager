@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import shutil
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,8 @@ from app.services.megacmd import (
 from app.services.memory_store import MemoryStore
 from app.services.rclone import RcloneCancelledError, RcloneCommandError, RcloneRunner
 from app.services.transfer_executor import TransferExecutor
+from app.services.transfer_omissions import skip_unavailable_reason
+from app.services.transfer_outcomes import CopyOutcome, FileCopyResult
 from app.settings import Settings
 
 
@@ -1775,11 +1779,13 @@ async def test_mega_source_missing_output_retries_once_before_upload(tmp_path, m
     assert transfer.status == "COMPLETED"
     assert source.download_attempts == 2
     assert runner.upload_attempts == 1
-    assert transfer.attempt_count == 2
+    assert transfer.attempt_count == 1
     retry_events = [event for event in events if event["event_type"] == "RETRY_SCHEDULED"]
     assert len(retry_events) == 1
     assert retry_events[0]["provider_error_code"] == "MEGACMD_DOWNLOAD_OUTPUT_MISSING"
     assert retry_events[0]["technical_details"]["provider_stage"] == "SOURCE_DOWNLOAD"
+    assert retry_events[0]["technical_details"]["attempt"] == 1
+    assert retry_events[0]["technical_details"]["file_attempt"] == 1
     assert retry_events[0]["technical_details"]["expected_output_created"] is False
 
 
@@ -1814,8 +1820,10 @@ async def test_mega_source_missing_output_stops_after_one_retry_with_diagnostics
     assert transfer.status == "FAILED"
     assert source.download_attempts == 2
     assert runner.upload_attempts == 0
-    assert transfer.attempt_count == 2
+    assert transfer.attempt_count == 1
     assert details["provider_stage"] == "SOURCE_DOWNLOAD"
+    assert details["attempt"] == 1
+    assert details["file_attempt"] == 2
     assert details["return_code"] == 0
     assert details["retryable"] is True
     assert details["expected_output_created"] is False
@@ -1863,6 +1871,299 @@ async def test_safe_source_failure_continues_and_resume_skips_copied(
 
 
 @pytest.mark.asyncio
+async def test_versioned_resume_preserves_explicit_omissions_and_retries_other_rows(tmp_path):
+    source_items = [
+        _item("/already-copied.bin", size=2, provider="GOOGLE_DRIVE"),
+        _item("/omitted.rar", size=8, provider="GOOGLE_DRIVE"),
+        _item("/failed.bin", size=3, provider="GOOGLE_DRIVE"),
+        _item("/pending.bin", size=4, provider="GOOGLE_DRIVE"),
+        _item("/legacy-skipped.bin", size=3, provider="GOOGLE_DRIVE"),
+    ]
+    executor, transfer, _providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="SEAFILE",
+        source_items=source_items,
+        source_paths=[item.path for item in source_items],
+    )
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": item.path,
+                "destination_path": f"/backup/{item.name}",
+                "size_bytes": item.size_bytes,
+            }
+            for item in source_items
+        ],
+    )
+    rows = {
+        item.source_path: item
+        for item in await store.alist_transfer_manifest_items(
+            transfer.id,
+            statuses={"PENDING"},
+        )
+    }
+    await store.aupdate_transfer_manifest_item(
+        transfer.id, rows["/already-copied.bin"].id, status="COPIED"
+    )
+    await store.aupdate_transfer_manifest_item(
+        transfer.id, rows["/omitted.rar"].id, status="SKIPPED", error_code="SOURCE_RESTRICTED"
+    )
+    omitted = store._manifest_item(transfer.id, rows["/omitted.rar"].id)
+    omitted.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+    omitted.omitted_at = datetime.now(UTC)
+    omitted.destination_path = "/backup/assigned-omitted.rar"
+    await store.aupdate_transfer_manifest_item(
+        transfer.id,
+        rows["/failed.bin"].id,
+        status="FAILED",
+        error_code="TRANSFER_FILE_COPY_FAILED",
+    )
+    await store.aupdate_transfer_manifest_item(
+        transfer.id,
+        rows["/legacy-skipped.bin"].id,
+        status="SKIPPED",
+        error_code="LEGACY_SKIP",
+    )
+    transfer.status = "QUEUED"
+    transfer.attempt_count = 2
+
+    await executor.execute(transfer.id)
+
+    manifest = {
+        item.source_path: item
+        for item in await store.alist_transfer_manifest_items(
+            transfer.id,
+            statuses={"COPIED", "SKIPPED", "FAILED", "PENDING"},
+        )
+    }
+    assert manifest["/already-copied.bin"].status == "COPIED"
+    assert manifest["/omitted.rar"].status == "SKIPPED"
+    assert manifest["/omitted.rar"].omission_kind == "USER_ACCEPTED_SOURCE_FAILURE"
+    assert manifest["/omitted.rar"].destination_path == "/backup/assigned-omitted.rar"
+    assert manifest["/failed.bin"].status == "COPIED"
+    assert manifest["/pending.bin"].status == "COPIED"
+    assert manifest["/legacy-skipped.bin"].status == "COPIED"
+    assert runner.upload_attempts == 3
+    assert len(runner.downloaded) == 3
+    assert "omitted.rar" not in str(runner.downloaded)
+    assert "omitted.rar" not in str(runner.uploaded)
+    assert transfer.files_completed == 5
+    assert transfer.bytes_transferred == 12
+    assert transfer.status == "COMPLETED_WITH_WARNINGS"
+    assert transfer.progress_percent < 100
+
+    await executor.execute(transfer.id)
+    assert runner.upload_attempts == 3
+    assert manifest["/omitted.rar"].omission_kind == "USER_ACCEPTED_SOURCE_FAILURE"
+
+
+@pytest.mark.asyncio
+async def test_zero_byte_omission_does_not_report_full_file_coverage(tmp_path):
+    executor, transfer, _providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="GOOGLE_DRIVE",
+        destination_type="SEAFILE",
+        source_items=[_item("/zero-byte.rar", size=0, provider="GOOGLE_DRIVE")],
+        source_paths=["/zero-byte.rar"],
+    )
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": "/zero-byte.rar",
+                "destination_path": "/backup/zero-byte.rar",
+                "size_bytes": 0,
+            }
+        ],
+    )
+    row = (await store.alist_transfer_manifest_items(transfer.id, statuses={"PENDING"}))[0]
+    await store.aupdate_transfer_manifest_item(
+        transfer.id, row.id, status="SKIPPED", error_code="SOURCE_RESTRICTED"
+    )
+    omitted = store._manifest_item(transfer.id, row.id)
+    omitted.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+    omitted.omitted_at = datetime.now(UTC)
+
+    await executor.execute(transfer.id)
+
+    assert transfer.status == "COMPLETED_WITH_WARNINGS"
+    assert transfer.progress_percent < 100
+    assert runner.downloaded == []
+    assert runner.uploaded == []
+
+
+@pytest.mark.asyncio
+async def test_staging_cleanup_failure_is_not_eligible_for_manual_omission(
+    tmp_path, monkeypatch
+):
+    executor, transfer, providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=[_item("/source.rar", size=4, provider="MEGA")],
+        source_paths=["/source.rar"],
+    )
+    real_rmtree = shutil.rmtree
+    cleanup_calls = []
+    cleanup_area = None
+
+    def fail_transfer_area_cleanup(path, *args, **kwargs):
+        nonlocal cleanup_area
+        candidate = Path(path)
+        if candidate.name.startswith("transfer-"):
+            cleanup_calls.append(str(path))
+        if candidate.name.startswith("transfer-") and len(cleanup_calls) == 2:
+            cleanup_area = candidate
+            raise OSError("staging cleanup failed")
+        return real_rmtree(path, *args, **kwargs)
+
+    async def fail_source_download(*args, **kwargs):
+        raise MegaCmdDownloadOutputMissingError()
+
+    monkeypatch.setattr(executor, "_download_versioned_source", fail_source_download)
+    monkeypatch.setattr("app.services.staging.shutil.rmtree", fail_transfer_area_cleanup)
+    await executor.execute(transfer.id)
+    monkeypatch.setattr("app.services.staging.shutil.rmtree", real_rmtree)
+
+    item = (await store.alist_transfer_manifest_items(transfer.id, statuses={"FAILED"}))[0]
+    transfer.source_provider_type = "MEGA"
+    assert transfer.status == "FAILED"
+    assert len(cleanup_calls) == 2
+    assert runner.upload_attempts == 0
+    assert item.error_code == "TRANSFER_STAGING_CLEANUP_FAILED"
+    assert item.last_failure_stage == "STAGING_CLEANUP"
+    assert skip_unavailable_reason(
+        transfer,
+        item,
+        failure_stage=item.last_failure_stage,
+        failure_attempt=item.last_failure_attempt,
+    ) is not None
+    assert cleanup_area is not None and cleanup_area.exists()
+    real_rmtree(cleanup_area)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_after_verified_copy_preserves_copied_manifest_row(
+    tmp_path, monkeypatch
+):
+    executor, transfer, _providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=[_item("/source.bin", size=4, provider="MEGA")],
+        source_paths=["/source.bin"],
+    )
+    real_rmtree = shutil.rmtree
+    cleanup_calls = []
+    cleanup_area = None
+
+    def fail_file_area_cleanup(path, *args, **kwargs):
+        nonlocal cleanup_area
+        candidate = Path(path)
+        if candidate.name.startswith("transfer-"):
+            cleanup_calls.append(candidate)
+            if len(cleanup_calls) == 2:
+                cleanup_area = candidate
+                raise OSError("staging cleanup failed")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr("app.services.staging.shutil.rmtree", fail_file_area_cleanup)
+    await executor.execute(transfer.id)
+    monkeypatch.setattr("app.services.staging.shutil.rmtree", real_rmtree)
+
+    item = (await store.alist_transfer_manifest_items(transfer.id, statuses={"COPIED"}))[0]
+    failure = _failure_diagnostic(
+        await store.alist_transfer_events(transfer.id), "TRANSFER_STAGING_CLEANUP_FAILED"
+    )
+    assert transfer.status == "FAILED"
+    assert runner.upload_attempts == 1
+    assert transfer.bytes_transferred == 4
+    assert len(cleanup_calls) == 2
+    assert item.copy_started is True
+    assert failure["technical_details"]["manifest_item_id"] == str(item.id)
+    assert failure["technical_details"]["attempt"] == transfer.attempt_count
+    assert cleanup_area is not None and cleanup_area.exists()
+    real_rmtree(cleanup_area)
+
+
+@pytest.mark.asyncio
+async def test_omitted_mega_manifest_item_still_requires_matching_source_identity(tmp_path):
+    source_item = _item("/current.rar", size=8, provider="MEGA")
+    source_item.object_id = "H:StableObject"
+    executor, transfer, _providers, runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=[source_item],
+        source_paths=[source_item.path],
+    )
+    await store.aadd_transfer_manifest_items(
+        transfer.id,
+        [
+            {
+                "source_path": "/old.rar",
+                "source_object_id": source_item.object_id,
+                "destination_path": "/backup/old-assignment.rar",
+                "size_bytes": 8,
+            }
+        ],
+    )
+    row = (await store.alist_transfer_manifest_items(transfer.id, statuses={"PENDING"}))[0]
+    await store.aupdate_transfer_manifest_item(
+        transfer.id, row.id, status="SKIPPED", error_code="SOURCE_RESTRICTED"
+    )
+    omitted = store._manifest_item(transfer.id, row.id)
+    omitted.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+    omitted.omitted_at = datetime.now(UTC)
+
+    await executor.execute(transfer.id)
+
+    assert transfer.status == "FAILED"
+    assert runner.upload_attempts == 0
+    _failure_diagnostic(
+        await store.alist_transfer_events(transfer.id), "MEGA_MANIFEST_REBUILD_REQUIRED"
+    )
+
+
+@pytest.mark.asyncio
+async def test_versioned_failure_records_global_and_file_attempt_separately(tmp_path, monkeypatch):
+    executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=[_item("/restricted.rar", size=8, provider="MEGA")],
+        source_paths=["/restricted.rar"],
+    )
+    transfer.attempt_count = 3
+    executor.settings.transfer_max_retries = 2
+    original = executor._download_versioned_source
+
+    async def transient_then_missing(record, connection, source, item, area, **kwargs):
+        if item.path == "/restricted.rar":
+            raise MegaCmdCommandError(7, b"temporary failure")
+        return await original(record, connection, source, item, area, **kwargs)
+
+    async def no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(executor, "_download_versioned_source", transient_then_missing)
+    executor.sleep = no_delay
+    await executor.execute(transfer.id)
+
+    events = await store.alist_transfer_events(transfer.id)
+    failure = _failure_diagnostic(events, "MEGACMD_RETRIES_EXHAUSTED")
+    item = (await store.alist_transfer_manifest_items(transfer.id, statuses={"FAILED"}))[0]
+    assert item.last_failure_stage == "SOURCE_DOWNLOAD"
+    assert item.last_failure_attempt == 3
+    assert failure["technical_details"]["manifest_item_id"] == str(item.id)
+    assert failure["technical_details"]["attempt"] == 3
+    assert failure["technical_details"]["file_attempt"] == 3
+    assert transfer.attempt_count == 3
+
+
+@pytest.mark.asyncio
 async def test_repeated_safe_failure_stops_after_three_files(tmp_path, monkeypatch):
     items = [_item(f"/{n}.bin", size=0, provider="MEGA") for n in range(5)]
     executor, transfer, _, _, _, store = _cross_provider_executor(
@@ -1883,6 +2184,61 @@ async def test_repeated_safe_failure_stops_after_three_files(tmp_path, monkeypat
     assert transfer.progress_percent < 100
     events = await store.alist_transfer_events(transfer.id)
     _failure_diagnostic(events, "TRANSFER_REPEATED_FILE_FAILURE")
+
+
+@pytest.mark.asyncio
+async def test_explicit_skip_outcome_does_not_reset_consecutive_safe_failure_circuit(
+    tmp_path, monkeypatch
+):
+    items = [_item(f"/{index}.bin", size=1, provider="MEGA") for index in range(5)]
+    executor, transfer, _providers, _runner, _snapshots, store = _cross_provider_executor(
+        tmp_path,
+        source_type="MEGA",
+        destination_type="SEAFILE",
+        source_items=items,
+        source_paths=[item.path for item in items],
+    )
+    outcomes = [
+        CopyOutcome.FAILED_SAFE,
+        CopyOutcome.SKIPPED,
+        CopyOutcome.FAILED_SAFE,
+        CopyOutcome.FAILED_SAFE,
+        CopyOutcome.FAILED_SAFE,
+    ]
+
+    async def return_outcome(
+        record, _source_connection, _destination_connection, _source, _destination, item, row
+    ):
+        outcome = outcomes.pop(0)
+        status = "SKIPPED" if outcome == CopyOutcome.SKIPPED else "FAILED"
+        await store.aupdate_transfer_manifest_item(
+            record.id,
+            row.id,
+            status=status,
+            error_code=(
+                "MEGA_FILE_RESTRICTED"
+                if outcome == CopyOutcome.SKIPPED
+                else "SOURCE_RESTRICTED"
+            ),
+            failure_stage="SOURCE_DOWNLOAD" if outcome != CopyOutcome.SKIPPED else None,
+            failure_attempt=record.attempt_count if outcome != CopyOutcome.SKIPPED else None,
+        )
+        if outcome == CopyOutcome.FAILED_SAFE:
+            return FileCopyResult(outcome, "SOURCE_RESTRICTED", "SOURCE_DOWNLOAD")
+        return FileCopyResult(outcome)
+
+    monkeypatch.setattr(executor, "_copy_versioned_file", return_outcome)
+
+    await executor.execute(transfer.id)
+
+    counts = await store.aget_transfer_manifest_counts(transfer.id)
+    assert counts["failed"] == 3
+    assert counts["skipped"] == 1
+    assert counts["pending"] == 1
+    assert transfer.status == "FAILED"
+    _failure_diagnostic(
+        await store.alist_transfer_events(transfer.id), "TRANSFER_REPEATED_FILE_FAILURE"
+    )
 
 
 @pytest.mark.asyncio

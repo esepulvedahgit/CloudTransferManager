@@ -51,7 +51,7 @@ from app.services.source_inventory import (
     InventoryProgress,
     SourceInventoryScanner,
 )
-from app.services.staging import StagingSpaceError, temporary_staging_area
+from app.services.staging import StagingCleanupError, StagingSpaceError, temporary_staging_area
 from app.services.telemetry import parse_mega_progress_line, parse_rclone_stats_line
 from app.services.transfer_naming import allocate_available_name, collision_key
 from app.services.transfer_outcomes import CopyOutcome, FileCopyResult, SourceFileError
@@ -2035,6 +2035,8 @@ class TransferExecutor:
             consecutive_failures = 0
             for item, _relative_path in files:
                 row = row_by_identity[(False, self._versioned_identity(item))]
+                if row.omission_kind is not None:
+                    continue
                 if row.status == "COPIED":
                     continue
                 if await self.should_cancel():
@@ -2102,6 +2104,8 @@ class TransferExecutor:
                 )
                 if result.outcome == CopyOutcome.STOPPED:
                     return
+                if result.outcome == CopyOutcome.SKIPPED:
+                    continue
                 if result.outcome == CopyOutcome.FAILED_SAFE:
                     failure = (result.error_code, result.provider_stage)
                     consecutive_failures = (
@@ -2441,7 +2445,6 @@ class TransferExecutor:
             if await self.should_cancel():
                 await self._cancel(record)
                 return FileCopyResult(CopyOutcome.STOPPED)
-            record.attempt_count = max(record.attempt_count, attempt)
             record.status = "RUNNING" if attempt == 1 else "RETRYING"
             record.current_item = item.path
             record.current_speed_bps = None
@@ -2591,6 +2594,9 @@ class TransferExecutor:
                         status="COPIED",
                         verified_by=verified_by,
                     )
+                    manifest_item.status = "COPIED"
+                    manifest_item.verified_by = verified_by
+                    manifest_item.error_code = None
                     await self._refresh_versioned_record(record)
                     record.current_item = item.path
                     if record.bytes_total:
@@ -2613,19 +2619,61 @@ class TransferExecutor:
             ):
                 await self._cancel(record)
                 return FileCopyResult(CopyOutcome.STOPPED)
+            except StagingCleanupError:
+                if manifest_item.status == "COPIED":
+                    await self._refresh_versioned_record(record)
+                    await self._fail(
+                        record,
+                        error_code="TRANSFER_STAGING_CLEANUP_FAILED",
+                        message="No se pudo limpiar el área temporal de la transferencia.",
+                        technical_details={
+                            "manifest_item_id": str(manifest_item.id),
+                            "provider_stage": "STAGING_CLEANUP",
+                            "file_attempt": attempt,
+                        },
+                    )
+                else:
+                    await self.store.aupdate_transfer_manifest_item(
+                        record.id,
+                        manifest_item.id,
+                        status="FAILED",
+                        error_code="TRANSFER_STAGING_CLEANUP_FAILED",
+                        failure_stage="STAGING_CLEANUP",
+                        failure_attempt=record.attempt_count,
+                    )
+                    await self._refresh_versioned_record(record)
+                    await self._fail(
+                        record,
+                        error_code="TRANSFER_STAGING_CLEANUP_FAILED",
+                        count_error=False,
+                        message="No se pudo limpiar el área temporal de la transferencia.",
+                        technical_details={
+                            "manifest_item_id": str(manifest_item.id),
+                            "provider_stage": "STAGING_CLEANUP",
+                            "file_attempt": attempt,
+                        },
+                    )
+                return FileCopyResult(CopyOutcome.STOPPED)
             except StagingSpaceError:
                 await self.store.aupdate_transfer_manifest_item(
                     record.id,
                     manifest_item.id,
                     status="FAILED",
                     error_code="TRANSFER_STAGING_SPACE_INSUFFICIENT",
+                    failure_stage="STAGING",
+                    failure_attempt=record.attempt_count,
                 )
                 await self._refresh_versioned_record(record)
                 await self._fail(
                     record,
                     error_code="TRANSFER_STAGING_SPACE_INSUFFICIENT",
                     message="No hay espacio temporal suficiente para transferir el archivo.",
-                    technical_details={"file_bytes": item.size_bytes},
+                    technical_details={
+                        "file_bytes": item.size_bytes,
+                        "manifest_item_id": str(manifest_item.id),
+                        "provider_stage": "STAGING",
+                        "file_attempt": attempt,
+                    },
                 )
                 return FileCopyResult(CopyOutcome.STOPPED)
             except Exception as exc:
@@ -2640,20 +2688,21 @@ class TransferExecutor:
                     retry_details = self._versioned_failure_details(
                         exc, provider_stage=provider_stage
                     )
+                    if isinstance(exc, MegaCmdDownloadOutputMissingError):
+                        retry_code = "MEGACMD_DOWNLOAD_OUTPUT_MISSING"
+                        retry_details = self._versioned_failure_details(
+                            exc, provider_stage=provider_stage
+                        )
                     retry_details.update(
                         provider=(
                             source_connection.provider_type
                             if provider_stage == "SOURCE_DOWNLOAD"
                             else destination_connection.provider_type
                         ),
-                        attempt=attempt,
+                        attempt=record.attempt_count,
+                        file_attempt=attempt,
                         destination_write_started=manifest_item.copy_started,
                     )
-                    if isinstance(exc, MegaCmdDownloadOutputMissingError):
-                        retry_code = "MEGACMD_DOWNLOAD_OUTPUT_MISSING"
-                        retry_details = self._versioned_failure_details(
-                            exc, provider_stage=provider_stage
-                        )
                     if not await self._wait_for_retry(
                         record,
                         min(5 * (2 ** (attempt - 1)) + random.random(), 300),
@@ -2691,6 +2740,8 @@ class TransferExecutor:
                     manifest_item.id,
                     status="FAILED",
                     error_code=code,
+                    failure_stage=provider_stage,
+                    failure_attempt=record.attempt_count,
                 )
                 await self._refresh_versioned_record(record)
                 details = self._versioned_failure_details(exc, provider_stage=provider_stage)
@@ -2701,7 +2752,9 @@ class TransferExecutor:
                         else destination_connection.provider_type
                     ),
                     operation=provider_stage,
-                    attempt=attempt,
+                    manifest_item_id=str(manifest_item.id),
+                    attempt=record.attempt_count,
+                    file_attempt=attempt,
                     destination_write_started=manifest_item.copy_started,
                 )
                 if (
@@ -3826,6 +3879,17 @@ class TransferExecutor:
                 margin_percent=self.settings.transfer_staging_margin_percent,
             ):
                 pass
+        except StagingCleanupError:
+            await self._fail(
+                record,
+                error_code="TRANSFER_STAGING_CLEANUP_FAILED",
+                message="No se pudo limpiar el área temporal de la transferencia.",
+                technical_details={
+                    "provider_stage": "STAGING_CLEANUP",
+                    "largest_file_bytes": largest_file,
+                },
+            )
+            return False
         except StagingSpaceError:
             await self._fail(
                 record,

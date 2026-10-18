@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.services.staging import (
+    StagingCleanupError,
     cleanup_orphaned_transfer_staging_areas,
     temporary_staging_area,
 )
@@ -130,7 +131,7 @@ async def test_staging_cleanup_failure_is_not_suppressed(tmp_path: Path, monkeyp
         raise OSError("staging cleanup failed")
 
     monkeypatch.setattr("app.services.staging.shutil.rmtree", fail_cleanup)
-    with pytest.raises(OSError, match="staging cleanup failed"):
+    with pytest.raises(StagingCleanupError, match="No se pudo limpiar el área temporal"):
         async with temporary_staging_area(
             tmp_path, transfer_id=uuid.uuid4(), expected_size=None
         ) as area:

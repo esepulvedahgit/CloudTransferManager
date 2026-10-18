@@ -15,5 +15,7 @@ def smb_manifest_progress_percent(
     else:
         percent = 0.0
 
-    incomplete = any(counts.get(status, 0) for status in ("pending", "failed", "skipped"))
+    incomplete = any(
+        counts.get(status, 0) for status in ("pending", "failed", "skipped", "omitted")
+    )
     return min(round(percent, 2), 99.99 if incomplete else 100.0)

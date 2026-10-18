@@ -4,6 +4,7 @@ from enum import StrEnum
 
 class CopyOutcome(StrEnum):
     COPIED = "COPIED"
+    SKIPPED = "SKIPPED"
     FAILED_SAFE = "FAILED_SAFE"
     STOPPED = "STOPPED"
 
