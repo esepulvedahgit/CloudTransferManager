@@ -405,3 +405,15 @@ async def test_login_sends_credentials_only_over_stdin_and_redacts_echoed_output
     assert username.encode() not in stdout + stderr
     assert password.encode() not in stdout + stderr
     assert stdout == b'login "[REDACTED]" "[REDACTED]"\n'
+
+
+def test_megacmd_command_error_keeps_only_safe_unclassified_diagnostic():
+    error = MegaCmdCommandError(
+        16,
+        b"API error for /private/archive/restricted.rar: resource administratively blocked",
+    )
+
+    assert error.failure_diagnostic.safe_code == "MEGACMD_FAILURE_UNCLASSIFIED"
+    assert error.failure_diagnostic.category == "UNKNOWN"
+    assert not hasattr(error, "output")
+    assert "/private/archive" not in repr(error.failure_diagnostic)

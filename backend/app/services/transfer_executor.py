@@ -2803,6 +2803,9 @@ class TransferExecutor:
             details.update(
                 return_code=exc.return_code,
                 retryable=exc.retryable,
+                safe_failure_code=exc.failure_diagnostic.safe_code,
+                failure_category=exc.failure_diagnostic.category.value,
+                failure_scope=exc.failure_diagnostic.scope.value,
             )
         elif isinstance(exc, RcloneCommandError):
             details.update(

@@ -2486,3 +2486,14 @@ async def test_corrupt_selected_mega_root_has_manifest_rebuild_diagnostic(tmp_pa
     _failure_diagnostic(
         await store.alist_transfer_events(transfer.id), "MEGA_MANIFEST_REBUILD_REQUIRED"
     )
+
+
+def test_megacmd_failure_details_contain_only_safe_unclassified_fields():
+    error = MegaCmdCommandError(16, b"/private/archive.rar resource administratively blocked")
+
+    details = TransferExecutor._versioned_failure_details(error, provider_stage="SOURCE_DOWNLOAD")
+
+    assert details["safe_failure_code"] == "MEGACMD_FAILURE_UNCLASSIFIED"
+    assert details["failure_category"] == "UNKNOWN"
+    assert details["failure_scope"] == "UNKNOWN"
+    assert "/private/archive.rar" not in repr(details)

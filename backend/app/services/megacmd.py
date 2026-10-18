@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from app.services.megacmd_failures import classify_megacmd_failure
+
 MegaCmdAction = Literal["logout", "ls", "get", "put", "mkdir", "df", "quit", "version"]
 LineCallback = Callable[[str], Awaitable[None]]
 CancelCheck = Callable[[], Awaitable[bool]]
@@ -53,6 +55,7 @@ class MegaCmdCommandError(MegaCmdError):
 
     def __init__(self, return_code: int, output: bytes = b"") -> None:
         self.return_code = return_code
+        self.failure_diagnostic = classify_megacmd_failure(return_code, output)
         message = output.decode("utf-8", errors="ignore").casefold()
         self._retryable = not any(marker in message for marker in self._fatal_markers) and any(
             marker in message for marker in self._retryable_markers
