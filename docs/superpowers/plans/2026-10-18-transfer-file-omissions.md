@@ -105,11 +105,11 @@
 
 **Interfaces:** ampliar `dependency_wait_reason(parent_status: str | None, *, parent_omitted_count: int = 0, parent_attempt_count: int = 1, accepted_parent_omissions_attempt: int | None = None) -> str | None`. Nuevo `AcceptParentOmissionsRequest(expected_parent_attempt: int, request_id: UUID)` y store `aaccept_parent_omissions(child_id: UUID, *, actor_id: UUID, expected_parent_attempt: int, request_id: UUID) -> TransferRecord`.
 
-- [ ] Escribir pruebas fallidas: padre con omisiones explícitas y advertencias bloquea hijo con `BLOCKED_PARENT_OMISSIONS`; padre con solo renombrados mantiene comportamiento anterior; padre `FAILED`/`CANCELLED` nunca se libera aceptando omisiones.
-- [ ] Ejecutar `cd backend && pytest tests/test_transfer_scheduling.py tests/test_transfer_evaluation_flow.py tests/test_transfer_recovery_api.py -q`.
-- [ ] Implementar el guard en evaluación, reserva del dispatcher y preflight final; contar omisiones de los padres en lote. El endpoint registra `TRANSFER_PARENT_OMISSIONS_ACCEPTED` y aceptación del intento vigente, comprobando que el hijo sigue pendiente sin reserva y que el padre es visible/terminal. Cambiar dependencia borra aceptación.
-- [ ] Probar aceptación idempotente y concurrencia con reanudación del padre/despacho del hijo en PostgreSQL: un intento nuevo exige nueva aceptación; revalidación bajo bloqueo antes de iniciar. La evaluación aprobada previamente no evita el guard final.
-- [ ] Pasar pruebas enfocadas y crear commit `feat: guard dependent transfers after source omissions`.
+- [x] Escribir pruebas fallidas: padre con omisiones explícitas y advertencias bloquea hijo con `BLOCKED_PARENT_OMISSIONS`; padre con solo renombrados mantiene comportamiento anterior; padre `FAILED`/`CANCELLED` nunca se libera aceptando omisiones.
+- [x] Ejecutar `cd backend && pytest tests/test_transfer_scheduling.py tests/test_transfer_evaluation_flow.py tests/test_transfer_recovery_api.py -q`.
+- [x] Implementar el guard en evaluación, reserva del dispatcher y preflight final; contar omisiones de los padres en lote. El endpoint registra `TRANSFER_PARENT_OMISSIONS_ACCEPTED` y aceptación del intento vigente, comprobando que el hijo sigue pendiente sin reserva y que el padre es visible/terminal. Cambiar dependencia borra aceptación.
+- [x] Probar aceptación idempotente y concurrencia con reanudación del padre/despacho del hijo en PostgreSQL: un intento nuevo exige nueva aceptación; revalidación bajo bloqueo antes de iniciar. La evaluación aprobada previamente no evita el guard final.
+- [x] Pasar pruebas enfocadas y crear commit `feat: guard dependent transfers after source omissions`.
 
 ## Task 5: Reintento selectivo, reporte y avisos durables
 

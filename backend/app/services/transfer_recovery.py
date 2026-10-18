@@ -16,6 +16,11 @@ class SkipAndResumeRequest(BaseModel):
     source_file_error_policy: SourceFileErrorPolicy | None = None
 
 
+class AcceptParentOmissionsRequest(BaseModel):
+    expected_parent_attempt: int = Field(ge=1)
+    request_id: uuid.UUID
+
+
 async def skip_and_resume_transfer(
     store: Any,
     transfer_id: uuid.UUID,
@@ -36,4 +41,20 @@ async def skip_and_resume_transfer(
             if request.source_file_error_policy is not None
             else None
         ),
+    )
+
+
+async def accept_parent_omissions(
+    store: Any,
+    child_id: uuid.UUID,
+    *,
+    actor_id: uuid.UUID,
+    request: AcceptParentOmissionsRequest,
+) -> TransferRecord:
+    """Accept omissions from one specific successful parent attempt atomically."""
+    return await store.aaccept_parent_omissions(
+        child_id,
+        actor_id=actor_id,
+        expected_parent_attempt=request.expected_parent_attempt,
+        request_id=request.request_id,
     )

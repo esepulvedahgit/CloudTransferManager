@@ -85,6 +85,46 @@ async def failed_mega_transfer(store: MemoryStore, user_id: uuid.UUID):
     return source, destination, transfer, failed_item
 
 
+async def parent_with_omissions_and_child(
+    store: MemoryStore,
+    user_id: uuid.UUID,
+    *,
+    parent_status: str = "COMPLETED_WITH_WARNINGS",
+):
+    source = store.create_connection("Parent source", "GOOGLE_DRIVE", user_id)
+    destination = store.create_connection("Parent destination", "SEAFILE", user_id)
+    parent = await store.acreate_transfer(
+        user_id, source.id, destination.id, ["/parent"], "/destination"
+    )
+    parent.status = parent_status
+    parent.attempt_count = 2
+    parent.completed_at = datetime.now(UTC)
+    await store.asave_transfer(parent)
+    await store.aadd_transfer_manifest_items(
+        parent.id,
+        [
+            {
+                "source_path": "/parent/restricted.rar",
+                "destination_path": "/destination/restricted.rar",
+                "size_bytes": 8,
+            }
+        ],
+    )
+    omitted = (await store.alist_transfer_manifest_items(parent.id, statuses={"PENDING"}))[0]
+    omitted.status = "SKIPPED"
+    omitted.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+    omitted.omitted_at = datetime.now(UTC)
+    child = await store.acreate_transfer(
+        user_id,
+        source.id,
+        destination.id,
+        ["/child"],
+        "/destination",
+        depends_on_transfer_id=parent.id,
+    )
+    return parent, child
+
+
 @pytest.mark.asyncio
 async def test_skip_and_resume_is_atomic_audited_and_idempotent(monkeypatch):
     store = MemoryStore()
@@ -160,6 +200,92 @@ async def test_skip_and_resume_is_atomic_audited_and_idempotent(monkeypatch):
         "TRANSFER_RESUMED",
         "TRANSFER_FILE_OMITTED",
     ]
+
+
+@pytest.mark.asyncio
+async def test_accept_parent_omissions_is_attempt_scoped_audited_and_idempotent(monkeypatch):
+    store = MemoryStore()
+    user = store.add_user(
+        "parent-accept-owner",
+        "parent-accept@example.test",
+        PasswordService().hash("A-Strong-Password123!"),
+    )
+    parent, child = await parent_with_omissions_and_child(store, user.id)
+    app = create_app(
+        Settings(
+            app_env="production",
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+        ),
+        store=store,
+    )
+    app.state.event_bus = None
+    dispatches = []
+    monkeypatch.setattr(
+        "app.worker.dispatch_pending_transfers.delay", lambda: dispatches.append("transfer")
+    )
+    monkeypatch.setattr(
+        "app.worker.dispatch_pending_evaluations.delay", lambda: dispatches.append("evaluation")
+    )
+    client = await logged_in_client(app, user.username)
+    request_id = uuid.uuid4()
+    body = {"expected_parent_attempt": 2, "request_id": str(request_id)}
+    url = f"/api/v1/transfers/{child.id}/accept-parent-omissions"
+    headers = {"X-CSRF-Token": client.cookies["ctm_csrf"]}
+    response = await client.post(url, json=body, headers=headers)
+    replay = await client.post(url, json=body, headers=headers)
+    reused = await client.post(
+        url,
+        json={"expected_parent_attempt": 3, "request_id": str(request_id)},
+        headers=headers,
+    )
+    await client.aclose()
+
+    audits = await store.alist_audit_events(limit=100)
+    updated_child = await store.aget_transfer(child.id)
+    assert response.status_code == 202
+    assert response.json()["accepted_parent_omissions_attempt"] == 2
+    assert replay.status_code == 202
+    assert reused.status_code == 409
+    assert updated_child is not None
+    assert updated_child.accepted_parent_omissions_attempt == 2
+    assert dispatches == ["transfer"]
+    assert any(event["action"] == "TRANSFER_PARENT_OMISSIONS_ACCEPTED" for event in audits)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_status", ["FAILED", "CANCELLED"])
+async def test_failed_or_cancelled_parent_omissions_cannot_be_accepted(
+    monkeypatch, parent_status
+):
+    store = MemoryStore()
+    user = store.add_user(
+        f"parent-failure-{parent_status.lower()}",
+        f"parent-{parent_status.lower()}@example.test",
+        PasswordService().hash("A-Strong-Password123!"),
+    )
+    parent, child = await parent_with_omissions_and_child(
+        store, user.id, parent_status=parent_status
+    )
+    app = create_app(
+        Settings(
+            app_env="production",
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+        ),
+        store=store,
+    )
+    app.state.event_bus = None
+    monkeypatch.setattr("app.worker.dispatch_pending_transfers.delay", lambda: None)
+    client = await logged_in_client(app, user.username)
+    response = await client.post(
+        f"/api/v1/transfers/{child.id}/accept-parent-omissions",
+        json={"expected_parent_attempt": parent.attempt_count, "request_id": str(uuid.uuid4())},
+        headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+    )
+    await client.aclose()
+
+    assert response.status_code == 409
 
 
 @pytest.mark.asyncio

@@ -5,10 +5,19 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import delete, event, func, select
 from sqlalchemy.orm import Session
 
-from app.models import AuditEvent, TransferEvent, TransferJob, TransferManifestItem
+from app.models import (
+    AuditEvent,
+    StorageConnection,
+    TransferEvaluation,
+    TransferEvent,
+    TransferJob,
+    TransferManifestItem,
+    TransferNotificationOutbox,
+    User,
+)
 from app.services.database_store import DatabaseStore
 from app.services.memory_store import MemoryStore
 from app.services.transfer_omissions import (
@@ -403,6 +412,89 @@ async def test_database_store_rejects_active_reservation_and_credential_changes(
 
 
 @pytest.mark.asyncio
+async def test_database_accept_parent_omissions_is_attempt_scoped_and_idempotent(tmp_path):
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'parent-acceptance.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("parent-accept-owner", "parent-accept@example.test", "hash")
+    source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
+    destination = await store.acreate_connection("Destination", "MOCK", user.id, uuid.uuid4(), b"")
+    parent = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/parent"], "/destination"
+    )
+    child = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/child"],
+        "/destination",
+        depends_on_transfer_id=parent.id,
+    )
+    await store.aadd_transfer_manifest_items(
+        parent.id,
+        [
+            {
+                "source_path": "/parent/restricted.rar",
+                "destination_path": "/destination/restricted.rar",
+                "size_bytes": 100,
+            }
+        ],
+    )
+    async with store.sessions() as session:
+        async with session.begin():
+            parent_row = await session.get(TransferJob, parent.id)
+            omitted_row = await session.scalar(
+                select(TransferManifestItem).where(
+                    TransferManifestItem.transfer_job_id == parent.id
+                )
+            )
+            assert parent_row is not None and omitted_row is not None
+            parent_row.status = "COMPLETED_WITH_WARNINGS"
+            omitted_row.status = "SKIPPED"
+            omitted_row.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+            omitted_row.omitted_at = datetime.now(UTC)
+
+    request_id = uuid.uuid4()
+    accepted = await store.aaccept_parent_omissions(
+        child.id,
+        actor_id=user.id,
+        expected_parent_attempt=parent.attempt_count,
+        request_id=request_id,
+    )
+    replay = await store.aaccept_parent_omissions(
+        child.id,
+        actor_id=user.id,
+        expected_parent_attempt=parent.attempt_count,
+        request_id=request_id,
+    )
+    with pytest.raises(TransferRecoveryConflictError):
+        await store.aaccept_parent_omissions(
+            child.id,
+            actor_id=user.id,
+            expected_parent_attempt=parent.attempt_count + 1,
+            request_id=uuid.uuid4(),
+        )
+
+    async with store.sessions() as session:
+        accepted_count = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.resource_id == str(child.id),
+                    AuditEvent.action == "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                )
+            )
+            or 0
+        )
+    await store.aclose()
+
+    assert accepted.accepted_parent_omissions_attempt == parent.attempt_count
+    assert replay.accepted_parent_omissions_attempt == parent.attempt_count
+    assert sum(record.idempotent_replay for record in (accepted, replay)) == 1
+    assert accepted_count == 1
+
+
+@pytest.mark.asyncio
 async def test_memory_store_fences_concurrent_replays_and_revoked_connection_access():
     store = MemoryStore()
     user = store.add_user("private-owner", "private@example.test", "hash")
@@ -562,3 +654,153 @@ async def test_postgres_skip_and_resume_serializes_concurrent_same_request():
     assert attempt_count == 3
     assert audit_count == 1
     assert all(result.status == "QUEUED" and result.attempt_count == 3 for result in results)
+
+
+@pytest.mark.asyncio
+async def test_postgres_parent_retry_racing_child_dispatch_requires_new_acceptance():
+    database_url = os.environ.get("CTM_TEST_POSTGRES_URL")
+    if not database_url:
+        pytest.skip("CTM_TEST_POSTGRES_URL is not configured")
+    store = DatabaseStore(Settings(database_url=database_url))
+    await store.create_schema()
+    suffix = uuid.uuid4().hex
+    user = await store.acreate_user(
+        f"pg-parent-{suffix}", f"pg-parent-{suffix}@example.test", "hash"
+    )
+    source = await store.acreate_connection("Source", "MOCK", user.id, uuid.uuid4(), b"")
+    destination = await store.acreate_connection(
+        "Destination", "MOCK", user.id, uuid.uuid4(), b""
+    )
+    parent = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/parent"], "/destination"
+    )
+    child = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/child"],
+        "/destination",
+        depends_on_transfer_id=parent.id,
+    )
+    await store.aadd_transfer_manifest_items(
+        parent.id,
+        [
+            {
+                "source_path": "/parent/restricted.rar",
+                "destination_path": "/destination/restricted.rar",
+                "size_bytes": 100,
+            }
+        ],
+    )
+    async with store.sessions() as session:
+        async with session.begin():
+            parent_row = await session.get(TransferJob, parent.id)
+            omitted_row = await session.scalar(
+                select(TransferManifestItem).where(
+                    TransferManifestItem.transfer_job_id == parent.id
+                )
+            )
+            assert parent_row is not None and omitted_row is not None
+            parent_row.status = "COMPLETED_WITH_WARNINGS"
+            omitted_row.status = "SKIPPED"
+            omitted_row.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+            omitted_row.omitted_at = datetime.now(UTC)
+
+    request_id = uuid.uuid4()
+    results = await asyncio.gather(
+        *[
+            store.aaccept_parent_omissions(
+                child.id,
+                actor_id=user.id,
+                expected_parent_attempt=parent.attempt_count,
+                request_id=request_id,
+            )
+            for _ in range(2)
+        ]
+    )
+    assert sum(result.idempotent_replay for result in results) == 1
+    reservations = await store.adispatch_due_transfers(datetime.now(UTC), max_concurrent=1)
+    assert [record.id for record in reservations.admitted] == [child.id]
+    dispatch_token = reservations.admitted[0].dispatch_token
+    assert dispatch_token is not None
+
+    parent_retry_locked = asyncio.Event()
+    allow_parent_retry_commit = asyncio.Event()
+
+    async def update_parent_attempt() -> None:
+        async with store.sessions() as session:
+            async with session.begin():
+                parent_row = await session.scalar(
+                    select(TransferJob)
+                    .where(TransferJob.id == parent.id)
+                    .with_for_update()
+                )
+                assert parent_row is not None
+                parent_retry_locked.set()
+                await allow_parent_retry_commit.wait()
+                parent_row.attempt_count += 1
+                parent_row.status = "COMPLETED_WITH_WARNINGS"
+
+    async def start_child() -> bool:
+        return await store.astart_transfer_dispatch(
+            child.id, dispatch_token, datetime.now(UTC)
+        )
+
+    retry_task = asyncio.create_task(update_parent_attempt())
+    start_task: asyncio.Task[bool] | None = None
+    try:
+        await parent_retry_locked.wait()
+        start_task = asyncio.create_task(start_child())
+        await asyncio.sleep(0.05)
+        assert not start_task.done()
+        allow_parent_retry_commit.set()
+        await retry_task
+        started = await start_task
+        updated_child = await store.aget_transfer(child.id)
+    finally:
+        allow_parent_retry_commit.set()
+        if not retry_task.done():
+            await retry_task
+        if start_task is not None and not start_task.done():
+            await start_task
+        async with store.sessions() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(AuditEvent).where(
+                        AuditEvent.resource_id == str(child.id)
+                    )
+                )
+                await session.execute(
+                    delete(TransferNotificationOutbox).where(
+                        TransferNotificationOutbox.transfer_job_id.in_([parent.id, child.id])
+                    )
+                )
+                await session.execute(
+                    delete(TransferEvent).where(
+                        TransferEvent.transfer_job_id.in_([parent.id, child.id])
+                    )
+                )
+                await session.execute(
+                    delete(TransferEvaluation).where(
+                        TransferEvaluation.transfer_job_id.in_([parent.id, child.id])
+                    )
+                )
+                await session.execute(
+                    delete(TransferManifestItem).where(
+                        TransferManifestItem.transfer_job_id.in_([parent.id, child.id])
+                    )
+                )
+                await session.execute(delete(TransferJob).where(TransferJob.id == child.id))
+                await session.execute(delete(TransferJob).where(TransferJob.id == parent.id))
+                await session.execute(
+                    delete(StorageConnection).where(
+                        StorageConnection.id.in_([source.id, destination.id])
+                    )
+                )
+                await session.execute(delete(User).where(User.id == user.id))
+        await store.aclose()
+
+    assert started is False
+    assert updated_child is not None
+    assert updated_child.status == "QUEUED"
+    assert updated_child.wait_reason == "BLOCKED_PARENT_OMISSIONS"

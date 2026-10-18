@@ -140,6 +140,45 @@ def test_transfer_dependencies_only_open_after_success_including_warnings():
     assert dependency_wait_reason("CANCELLED") == "BLOCKED_PARENT_FAILED"
 
 
+def test_transfer_dependencies_require_current_attempt_acceptance_for_omissions():
+    assert (
+        dependency_wait_reason(
+            "COMPLETED_WITH_WARNINGS",
+            parent_omitted_count=1,
+            parent_attempt_count=3,
+        )
+        == "BLOCKED_PARENT_OMISSIONS"
+    )
+    assert (
+        dependency_wait_reason(
+            "COMPLETED_WITH_WARNINGS",
+            parent_omitted_count=1,
+            parent_attempt_count=3,
+            accepted_parent_omissions_attempt=3,
+        )
+        is None
+    )
+    assert (
+        dependency_wait_reason(
+            "COMPLETED_WITH_WARNINGS",
+            parent_omitted_count=1,
+            parent_attempt_count=4,
+            accepted_parent_omissions_attempt=3,
+        )
+        == "BLOCKED_PARENT_OMISSIONS"
+    )
+    for status in ("FAILED", "CANCELLED"):
+        assert (
+            dependency_wait_reason(
+                status,
+                parent_omitted_count=1,
+                parent_attempt_count=3,
+                accepted_parent_omissions_attempt=3,
+            )
+            == "BLOCKED_PARENT_FAILED"
+        )
+
+
 def test_evaluation_wait_reason_distinguishes_pending_blocked_and_approved():
     transfer_id = uuid.uuid4()
     evaluation = EvaluationRecord(id=uuid.uuid4(), transfer_id=transfer_id, status="PENDING")
@@ -611,6 +650,73 @@ async def test_dispatcher_releases_child_after_parent_completes_with_warnings(tm
     assert waiting_child is not None
     assert waiting_child.wait_reason == "WAITING_PARENT"
     assert [job.id for job in released_batch.admitted] == [child.id]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_blocks_parent_omissions_until_current_attempt_is_accepted(tmp_path):
+    from sqlalchemy import select
+
+    from app.models import TransferJob, TransferManifestItem
+
+    store = DatabaseStore(
+        Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'parent-omissions.sqlite'}")
+    )
+    await store.create_schema()
+    user = await store.acreate_user("parent-owner", "parent@example.test", "hash")
+    source = await store.acreate_connection("Drive A", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x")
+    destination = await store.acreate_connection(
+        "Drive B", "GOOGLE_DRIVE", user.id, uuid.uuid4(), b"x"
+    )
+    parent = await store.acreate_transfer(
+        user.id, source.id, destination.id, ["/first"], "/destination"
+    )
+    child = await store.acreate_transfer(
+        user.id,
+        source.id,
+        destination.id,
+        ["/second"],
+        "/destination",
+        depends_on_transfer_id=parent.id,
+    )
+    await store.aadd_transfer_manifest_items(
+        parent.id,
+        [
+            {
+                "source_path": "/first/restricted.rar",
+                "destination_path": "/destination/restricted.rar",
+                "size_bytes": 8,
+            }
+        ],
+    )
+    async with store.sessions() as session:
+        async with session.begin():
+            parent_row = await session.get(TransferJob, parent.id)
+            omitted_row = await session.scalar(
+                select(TransferManifestItem).where(
+                    TransferManifestItem.transfer_job_id == parent.id
+                )
+            )
+            assert parent_row is not None and omitted_row is not None
+            parent_row.status = "COMPLETED_WITH_WARNINGS"
+            omitted_row.status = "SKIPPED"
+            omitted_row.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+            omitted_row.omitted_at = datetime.now(UTC)
+
+    blocked = await store.adispatch_due_transfers(datetime.now(UTC), max_concurrent=1)
+    blocked_child = await store.aget_transfer(child.id)
+    assert child.id not in {job.id for job in blocked.admitted}
+    assert blocked_child is not None
+    assert blocked_child.wait_reason == "BLOCKED_PARENT_OMISSIONS"
+
+    async with store.sessions() as session:
+        async with session.begin():
+            child_row = await session.get(TransferJob, child.id)
+            assert child_row is not None
+            child_row.accepted_parent_omissions_attempt = parent.attempt_count
+    released = await store.adispatch_due_transfers(datetime.now(UTC), max_concurrent=1)
+    await store.aclose()
+
+    assert [job.id for job in released.admitted] == [child.id]
 
 
 @pytest.mark.asyncio

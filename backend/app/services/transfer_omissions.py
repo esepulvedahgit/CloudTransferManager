@@ -169,6 +169,17 @@ def recovery_request_hash(
     ).hexdigest()
 
 
+def parent_omissions_request_hash(*, child_id: uuid.UUID, expected_parent_attempt: int) -> str:
+    payload = {
+        "action": "accept-parent-omissions",
+        "child_id": str(child_id),
+        "expected_parent_attempt": expected_parent_attempt,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     if isinstance(value, str):
         try:

@@ -673,7 +673,11 @@ class MemoryStore:
     async def arequest_transfer_evaluation(
         self, transfer_id: uuid.UUID, now: datetime
     ) -> EvaluationRecord:
-        from app.services.transfer_scheduling import dependency_wait_reason
+        from app.services.transfer_scheduling import (
+            dependency_error_code,
+            dependency_wait_message,
+            dependency_wait_reason,
+        )
 
         now = now.astimezone(UTC)
         async with self._evaluation_claim_lock:
@@ -700,19 +704,27 @@ class MemoryStore:
             parent_wait = None
             if transfer.depends_on_transfer_id is not None:
                 parent = self.transfers.get(transfer.depends_on_transfer_id)
-                parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
+                parent_omitted_count = sum(
+                    1
+                    for (candidate_transfer_id, _), item in self.transfer_manifest_items.items()
+                    if parent is not None
+                    and candidate_transfer_id == parent.id
+                    and not item.is_dir
+                    and item.omission_kind is not None
+                )
+                parent_wait = dependency_wait_reason(
+                    parent.status if parent else "FAILED",
+                    parent_omitted_count=parent_omitted_count,
+                    parent_attempt_count=parent.attempt_count if parent else 1,
+                    accepted_parent_omissions_attempt=(
+                        transfer.accepted_parent_omissions_attempt
+                    ),
+                )
             if parent_wait is not None:
                 evaluation.status = "WAITING_PARENT"
                 evaluation.sequence = 1
-                evaluation.safe_error_code = (
-                    "BLOCKED_PARENT_FAILED"
-                    if parent_wait == "BLOCKED_PARENT_FAILED"
-                    else None
-                )
-                evaluation.safe_message = (
-                    "La transferencia padre debe completarse correctamente "
-                    "antes de evaluar esta selección."
-                )
+                evaluation.safe_error_code = dependency_error_code(parent_wait)
+                evaluation.safe_message = dependency_wait_message(parent_wait)
                 transfer.wait_reason = parent_wait
             else:
                 transfer.wait_reason = "WAITING_EVALUATION"
@@ -761,7 +773,11 @@ class MemoryStore:
     async def aclaim_due_evaluations(
         self, now: datetime, *, limit: int = 1
     ) -> list[EvaluationClaim]:
-        from app.services.transfer_scheduling import dependency_wait_reason
+        from app.services.transfer_scheduling import (
+            dependency_error_code,
+            dependency_wait_message,
+            dependency_wait_reason,
+        )
 
         if limit < 1:
             raise ValueError("limit must be positive")
@@ -830,17 +846,25 @@ class MemoryStore:
 
                 if transfer.depends_on_transfer_id is not None:
                     parent = self.transfers.get(transfer.depends_on_transfer_id)
-                    parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
+                    parent_omitted_count = sum(
+                        1
+                        for (candidate_transfer_id, _), item in self.transfer_manifest_items.items()
+                        if parent is not None
+                        and candidate_transfer_id == parent.id
+                        and not item.is_dir
+                        and item.omission_kind is not None
+                    )
+                    parent_wait = dependency_wait_reason(
+                        parent.status if parent else "FAILED",
+                        parent_omitted_count=parent_omitted_count,
+                        parent_attempt_count=parent.attempt_count if parent else 1,
+                        accepted_parent_omissions_attempt=(
+                            transfer.accepted_parent_omissions_attempt
+                        ),
+                    )
                     if parent_wait is not None:
-                        safe_error_code = (
-                            "BLOCKED_PARENT_FAILED"
-                            if parent_wait == "BLOCKED_PARENT_FAILED"
-                            else None
-                        )
-                        safe_message = (
-                            "La transferencia padre debe completarse correctamente "
-                            "antes de evaluar esta selección."
-                        )
+                        safe_error_code = dependency_error_code(parent_wait)
+                        safe_message = dependency_wait_message(parent_wait)
                         if evaluation.status != "WAITING_PARENT":
                             restart_evaluation(evaluation, now=now)
                             evaluation.status = "WAITING_PARENT"
@@ -995,6 +1019,7 @@ class MemoryStore:
         message: str | None,
         now: datetime,
         retry_at: datetime | None = None,
+        wait_reason: str | None = None,
     ) -> bool:
         if status not in {"PENDING", "APPROVED", "BLOCKED", "ERROR", "WAITING_PARENT"}:
             raise ValueError("Invalid evaluation completion status")
@@ -1027,7 +1052,7 @@ class MemoryStore:
             elif status in {"BLOCKED", "ERROR"}:
                 transfer.wait_reason = "BLOCKED_EVALUATION"
             elif status == "WAITING_PARENT":
-                transfer.wait_reason = "WAITING_PARENT"
+                transfer.wait_reason = wait_reason or "WAITING_PARENT"
             else:
                 transfer.wait_reason = "WAITING_EVALUATION"
             return True
@@ -1343,7 +1368,11 @@ class MemoryStore:
         execution_mode: str,
         depends_on_transfer_id: uuid.UUID | None,
     ) -> TransferRecord | None:
-        from app.services.transfer_scheduling import dependency_wait_reason
+        from app.services.transfer_scheduling import (
+            dependency_error_code,
+            dependency_wait_message,
+            dependency_wait_reason,
+        )
 
         transfer = self.transfers.get(transfer_id)
         if (
@@ -1368,6 +1397,8 @@ class MemoryStore:
         transfer.schedule_timezone = schedule_timezone
         transfer.execution_mode = execution_mode
         transfer.depends_on_transfer_id = depends_on_transfer_id
+        if dependency_changed:
+            transfer.accepted_parent_omissions_attempt = None
         due_later = scheduled_at is not None and scheduled_at > datetime.now(UTC)
         transfer.status = "SCHEDULED" if due_later else "QUEUED"
         transfer.wait_reason = "WAITING_UNTIL" if due_later else None
@@ -1396,19 +1427,27 @@ class MemoryStore:
             parent_wait = None
             if depends_on_transfer_id is not None:
                 parent = self.transfers.get(depends_on_transfer_id)
-                parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
+                parent_omitted_count = sum(
+                    1
+                    for (candidate_transfer_id, _), item in self.transfer_manifest_items.items()
+                    if parent is not None
+                    and candidate_transfer_id == parent.id
+                    and not item.is_dir
+                    and item.omission_kind is not None
+                )
+                parent_wait = dependency_wait_reason(
+                    parent.status if parent else "FAILED",
+                    parent_omitted_count=parent_omitted_count,
+                    parent_attempt_count=parent.attempt_count if parent else 1,
+                    accepted_parent_omissions_attempt=(
+                        transfer.accepted_parent_omissions_attempt
+                    ),
+                )
             if parent_wait is not None:
                 evaluation.status = "WAITING_PARENT"
                 evaluation.sequence = 1
-                evaluation.safe_error_code = (
-                    "BLOCKED_PARENT_FAILED"
-                    if parent_wait == "BLOCKED_PARENT_FAILED"
-                    else None
-                )
-                evaluation.safe_message = (
-                    "La transferencia padre debe completarse correctamente "
-                    "antes de evaluar esta selección."
-                )
+                evaluation.safe_error_code = dependency_error_code(parent_wait)
+                evaluation.safe_message = dependency_wait_message(parent_wait)
                 transfer.wait_reason = parent_wait
             else:
                 transfer.wait_reason = (
@@ -1457,6 +1496,133 @@ class MemoryStore:
         transfer.execution_heartbeat_at = None
         transfer.cancel_requested_at = None
         return transfer
+
+    async def aaccept_parent_omissions(
+        self,
+        child_id: uuid.UUID,
+        *,
+        actor_id: uuid.UUID,
+        expected_parent_attempt: int,
+        request_id: uuid.UUID,
+    ) -> TransferRecord:
+        from app.services.transfer_evaluation import restart_evaluation
+        from app.services.transfer_omissions import (
+            TransferRecoveryConflictError,
+            TransferRecoveryNotFoundError,
+            parent_omissions_request_hash,
+        )
+
+        lock = self._transfer_recovery_locks.setdefault(child_id, asyncio.Lock())
+        async with lock:
+            child = self.transfers.get(child_id)
+            if child is None:
+                raise TransferRecoveryNotFoundError("Transfer not found")
+            request_hash = parent_omissions_request_hash(
+                child_id=child_id,
+                expected_parent_attempt=expected_parent_attempt,
+            )
+            actor = self.users.get(actor_id)
+            if actor is None or not actor.is_active:
+                raise TransferRecoveryNotFoundError("Transfer not found")
+            if actor.role != "ADMIN" and child.requested_by != actor_id:
+                raise TransferRecoveryNotFoundError("Transfer not found")
+            parent = (
+                self.transfers.get(child.depends_on_transfer_id)
+                if child.depends_on_transfer_id
+                else None
+            )
+            if parent is None or (actor.role != "ADMIN" and parent.requested_by != actor_id):
+                raise TransferRecoveryNotFoundError("Parent transfer not found")
+            for event in self.audit_events:
+                if (
+                    event.get("resource_type") == "transfer"
+                    and event.get("resource_id") == str(child_id)
+                    and event.get("action") == "TRANSFER_PARENT_OMISSIONS_ACCEPTED"
+                    and event.get("metadata", {}).get("request_id") == str(request_id)
+                ):
+                    if event.get("metadata", {}).get("request_hash") != request_hash:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used for a different acceptance"
+                        )
+                    child.idempotent_replay = True
+                    return child
+
+            if child.status not in {"SCHEDULED", "QUEUED"}:
+                raise TransferRecoveryConflictError("Child transfer is not pending")
+            if (
+                child.dispatch_token is not None
+                or child.dispatch_claimed_at is not None
+                or child.execution_started_at is not None
+                or child.execution_heartbeat_at is not None
+                or child.cancel_requested_at is not None
+                or (
+                    execution_lock := self._transfer_execution_locks.get(child_id)
+                )
+                is not None
+                and execution_lock.locked()
+            ):
+                raise TransferRecoveryConflictError("Child transfer execution is still active")
+            if expected_parent_attempt != parent.attempt_count:
+                raise TransferRecoveryConflictError("Parent transfer attempt changed")
+            if parent.status not in {"COMPLETED", "COMPLETED_WITH_WARNINGS"}:
+                raise TransferRecoveryConflictError(
+                    "Only a successful terminal parent can be accepted"
+                )
+            summary = (await self.alist_transfer_manifest_summaries([parent.id]))[parent.id]
+            if summary.get("omitted", 0) < 1:
+                raise TransferRecoveryConflictError("Parent has no explicit omissions")
+
+            previous_child = replace(child)
+            event_count = len(self.transfer_events.get(child_id, []))
+            audit_count = len(self.audit_events)
+            now = datetime.now(UTC)
+            try:
+                child.accepted_parent_omissions_attempt = expected_parent_attempt
+                if child.evaluation is not None:
+                    if child.evaluation.status == "WAITING_PARENT":
+                        restart_evaluation(child.evaluation, now=now)
+                    child.wait_reason = "WAITING_EVALUATION"
+                else:
+                    child.wait_reason = (
+                        "WAITING_UNTIL"
+                        if child.scheduled_at is not None and child.scheduled_at > now
+                        else None
+                    )
+                metadata = {
+                    "child_public_id": child.public_id,
+                    "parent_public_id": parent.public_id,
+                    "request_id": str(request_id),
+                    "request_hash": request_hash,
+                    "accepted_parent_omissions_attempt": expected_parent_attempt,
+                    "omitted_count": summary["omitted"],
+                }
+                await self.aadd_audit_event(
+                    actor_user_id=actor_id,
+                    action="TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                    resource_type="transfer",
+                    resource_id=str(child_id),
+                    result="SUCCESS",
+                    metadata=metadata,
+                )
+                await self.aadd_transfer_event(
+                    child_id,
+                    level="WARNING",
+                    event_type="TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                    message=(
+                        "Se aceptaron las omisiones del intento vigente de la transferencia padre."
+                    ),
+                    technical_details={
+                        "parent_transfer_id": str(parent.id),
+                        "parent_attempt": expected_parent_attempt,
+                        "omitted_count": summary["omitted"],
+                    },
+                )
+            except Exception:
+                self.transfers[child_id] = previous_child
+                del self.transfer_events[child_id][event_count:]
+                del self.audit_events[audit_count:]
+                raise
+            return child
 
     async def askip_transfer_item_and_resume(
         self,
@@ -1698,6 +1864,8 @@ class MemoryStore:
             DispatchBatch,
             TransferReservation,
             admission_wait_reason,
+            dependency_error_code,
+            dependency_wait_message,
             dependency_wait_reason,
             evaluation_wait_reason,
             transfer_requires_staging,
@@ -1782,9 +1950,25 @@ class MemoryStore:
 
             if transfer.depends_on_transfer_id is not None:
                 parent = self.transfers.get(transfer.depends_on_transfer_id)
-                parent_wait = dependency_wait_reason(parent.status if parent else "FAILED")
+                parent_omitted_count = sum(
+                    1
+                    for (candidate_transfer_id, _), item in self.transfer_manifest_items.items()
+                    if parent is not None
+                    and candidate_transfer_id == parent.id
+                    and not item.is_dir
+                    and item.omission_kind is not None
+                )
+                parent_wait = dependency_wait_reason(
+                    parent.status if parent else "FAILED",
+                    parent_omitted_count=parent_omitted_count,
+                    parent_attempt_count=parent.attempt_count if parent else 1,
+                    accepted_parent_omissions_attempt=(
+                        transfer.accepted_parent_omissions_attempt
+                    ),
+                )
                 if parent_wait is not None:
-                    if transfer.wait_reason != parent_wait:
+                    wait_reason_changed = transfer.wait_reason != parent_wait
+                    if wait_reason_changed:
                         transfer.wait_reason = parent_wait
                         changed_ids.add(transfer.id)
                     if (
@@ -1798,10 +1982,18 @@ class MemoryStore:
                             evaluation.sequence += 1
                             evaluation.updated_at = now
                         evaluation.status = "WAITING_PARENT"
-                        evaluation.safe_error_code = None
-                        evaluation.safe_message = (
-                            "La selección se evaluará cuando termine la transferencia padre."
-                        )
+                        evaluation.safe_error_code = dependency_error_code(parent_wait)
+                        evaluation.safe_message = dependency_wait_message(parent_wait)
+                    elif transfer.evaluation is not None and (
+                        transfer.evaluation.safe_error_code != dependency_error_code(parent_wait)
+                        or transfer.evaluation.safe_message
+                        != dependency_wait_message(parent_wait)
+                        or wait_reason_changed
+                    ):
+                        transfer.evaluation.safe_error_code = dependency_error_code(parent_wait)
+                        transfer.evaluation.safe_message = dependency_wait_message(parent_wait)
+                        transfer.evaluation.updated_at = now
+                        transfer.evaluation.sequence += 1
                     continue
                 if (
                     transfer.evaluation is not None

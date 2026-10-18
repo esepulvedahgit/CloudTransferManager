@@ -11,6 +11,7 @@ from app.providers.base import PaginatedItems, StorageItem
 from app.services.database_store import DatabaseStore
 from app.services.memory_store import MemoryStore
 from app.services.provider_factory import StorageProviderFactory
+from app.services.transfer_evaluation import EvaluationClaim
 from app.services.transfer_evaluator import TransferEvaluator
 from app.services.transfer_executor import TransferExecutor
 from app.settings import Settings
@@ -65,6 +66,67 @@ class StoreHandle:
 
     def __getattr__(self, name: str):
         return getattr(self.current, name)
+
+
+@pytest.mark.asyncio
+async def test_evaluator_preserves_parent_omission_block_reason():
+    settings = Settings()
+    store = MemoryStore(settings)
+    user = store.add_user("parent-eval", "parent-eval@example.test", "hash")
+    source_connection = store.create_connection(
+        "Source", "MOCK", user.id, encrypted_credentials=b""
+    )
+    destination_connection = store.create_connection(
+        "Destination", "MOCK", user.id, encrypted_credentials=b""
+    )
+    parent = store.create_transfer(
+        user.id, source_connection.id, destination_connection.id, ["/parent"], "/destination"
+    )
+    parent.status = "COMPLETED_WITH_WARNINGS"
+    store.transfers[parent.id] = parent
+    await store.aadd_transfer_manifest_items(
+        parent.id,
+        [
+            {
+                "source_path": "/parent/restricted.rar",
+                "destination_path": "/destination/restricted.rar",
+                "size_bytes": 100,
+            }
+        ],
+    )
+    parent_item = (await store.alist_transfer_manifest_items(parent.id))[0]
+    parent_item.status = "SKIPPED"
+    parent_item.omission_kind = "USER_ACCEPTED_SOURCE_FAILURE"
+    parent_item.omitted_at = datetime.now(UTC)
+
+    child = store.create_transfer(
+        user.id,
+        source_connection.id,
+        destination_connection.id,
+        ["/child"],
+        "/destination",
+        scheduled_at=datetime.now(UTC) + timedelta(hours=1),
+        depends_on_transfer_id=parent.id,
+    )
+    store.transfers[child.id] = child
+    assert child.evaluation is not None
+    claim_token = uuid.uuid4()
+    child.evaluation.status = "EVALUATING"
+    child.evaluation.claim_token = claim_token
+    child.evaluation.generation = 2
+    claim = EvaluationClaim(child.id, 2, claim_token)
+
+    async def publish(_record) -> None:
+        return None
+
+    evaluator = TransferEvaluator(settings, store, publish)
+    await evaluator.execute(claim)
+    updated = await store.aget_transfer(child.id)
+
+    assert updated is not None and updated.evaluation is not None
+    assert updated.evaluation.status == "WAITING_PARENT"
+    assert updated.evaluation.safe_error_code == "BLOCKED_PARENT_OMISSIONS"
+    assert updated.wait_reason == "BLOCKED_PARENT_OMISSIONS"
 
 
 @pytest.mark.asyncio

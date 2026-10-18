@@ -18,6 +18,11 @@ from app.services.source_inventory import (
     SourceInventoryScanner,
 )
 from app.services.transfer_evaluation import EvaluationClaim
+from app.services.transfer_scheduling import (
+    dependency_error_code,
+    dependency_wait_message,
+    dependency_wait_reason,
+)
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -25,7 +30,6 @@ logger = logging.getLogger(__name__)
 _EVALUATION_HEARTBEAT_SECONDS = 5
 _EVALUATION_TIMEOUT_SECONDS = 600
 _EVALUATION_RETRY_DELAYS = (60, 120)
-_SUCCESSFUL_PARENT_STATUSES = {"COMPLETED", "COMPLETED_WITH_WARNINGS"}
 _SUPPORTED_DESTINATIONS = {"GOOGLE_DRIVE", "MEGA", "SEAFILE", "NEXTCLOUD"}
 
 
@@ -92,6 +96,7 @@ class TransferEvaluator:
         error_code: str | None = None,
         message: str | None = None,
         retry_at: datetime | None = None,
+        wait_reason: str | None = None,
     ) -> bool:
         saved = await self.store.afinish_evaluation(
             claim,
@@ -100,6 +105,7 @@ class TransferEvaluator:
             error_code=error_code,
             message=message,
             retry_at=retry_at,
+            wait_reason=wait_reason,
             now=self.now_fn(),
         )
         if saved:
@@ -189,7 +195,20 @@ class TransferEvaluator:
 
             if transfer.depends_on_transfer_id is not None:
                 parent = await self.store.aget_transfer(transfer.depends_on_transfer_id)
-                if parent is None or parent.status not in _SUCCESSFUL_PARENT_STATUSES:
+                if parent is None:
+                    parent_wait = dependency_wait_reason("FAILED")
+                else:
+                    summaries = await self.store.alist_transfer_manifest_summaries([parent.id])
+                    parent_summary = summaries.get(parent.id, {})
+                    parent_wait = dependency_wait_reason(
+                        parent.status,
+                        parent_omitted_count=parent_summary.get("omitted", 0),
+                        parent_attempt_count=parent.attempt_count,
+                        accepted_parent_omissions_attempt=(
+                            transfer.accepted_parent_omissions_attempt
+                        ),
+                    )
+                if parent_wait is not None:
                     await self._finish(
                         claim,
                         status="WAITING_PARENT",
@@ -197,8 +216,9 @@ class TransferEvaluator:
                             files_found=transfer.evaluation.files_found or 0,
                             count_complete=False,
                         ),
-                        error_code=None,
-                        message="La selección se evaluará cuando termine la transferencia padre.",
+                        error_code=dependency_error_code(parent_wait),
+                        message=dependency_wait_message(parent_wait),
+                        wait_reason=parent_wait,
                     )
                     return
 

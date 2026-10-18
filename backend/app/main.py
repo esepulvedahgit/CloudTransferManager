@@ -72,7 +72,12 @@ from app.services.transfer_omissions import (
     resolve_failure_evidence,
     skip_unavailable_reason,
 )
-from app.services.transfer_recovery import SkipAndResumeRequest, skip_and_resume_transfer
+from app.services.transfer_recovery import (
+    AcceptParentOmissionsRequest,
+    SkipAndResumeRequest,
+    accept_parent_omissions,
+    skip_and_resume_transfer,
+)
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -2292,6 +2297,55 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
             app.state.tasks.add(task)
             task.add_done_callback(app.state.tasks.discard)
         return resumed.public_dict()
+
+    @app.post(
+        "/api/v1/transfers/{transfer_id}/accept-parent-omissions",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def accept_transfer_parent_omissions(
+        transfer_id: uuid.UUID,
+        payload: AcceptParentOmissionsRequest,
+        user: UserAccount = Depends(current_user),
+        user_csrf: None = Depends(csrf_guard),
+    ) -> dict[str, Any]:
+        del user_csrf
+        await visible_transfer(transfer_id, user)
+        try:
+            accepted = await accept_parent_omissions(
+                app.state.store,
+                transfer_id,
+                actor_id=user.id,
+                request=payload,
+            )
+        except TransferRecoveryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Transferencia no encontrada") from exc
+        except (TransferRecoveryConflictError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        accepted.manifest_summary = (
+            await app.state.store.alist_transfer_manifest_summaries([accepted.id])
+        )[accepted.id]
+        if accepted.idempotent_replay:
+            return accepted.public_dict()
+
+        await publish_transfer(accepted)
+        if config.app_env.lower() == "production":
+            try:
+                if (
+                    accepted.evaluation is not None
+                    and accepted.evaluation.status == "PENDING"
+                ):
+                    from app.worker import dispatch_pending_evaluations
+
+                    dispatch_pending_evaluations.delay()
+                else:
+                    from app.worker import dispatch_pending_transfers
+
+                    dispatch_pending_transfers.delay()
+            except Exception:
+                # The next scheduler tick will pick up the accepted child.
+                pass
+        return accepted.public_dict()
 
     @app.get("/api/v1/transfers/{transfer_id}/stream")
     async def stream_transfer(
