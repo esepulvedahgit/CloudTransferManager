@@ -1313,8 +1313,17 @@ describe('Cloud Transfer Manager', () => {
     expect(within(summary).getByText('Drive de respaldo')).toBeVisible();
     expect(within(summary).getByText('Carpeta raíz')).toBeVisible();
     expect(within(summary).getByText('Conservar ambos · numerar la copia')).toBeVisible();
-    expect(within(summary).getByText(/La omisión automática de archivos MEGA está deshabilitada/)).toBeVisible();
+    const megaWarning = within(summary).getByRole('button', { name: 'Aviso sobre archivos MEGA' });
+    expect(megaWarning).toBeVisible();
+    expect(within(summary).queryByText(/La omisión automática de archivos MEGA está deshabilitada/)).not.toBeInTheDocument();
     expect(within(summary).getByText('Avisarme por correo al terminar')).toBeVisible();
+
+    fireEvent.click(megaWarning);
+    const dialog = await screen.findByRole('dialog', { name: 'Limitación de omisión automática en MEGA' });
+    expect(within(dialog).getByText(/La omisión automática de archivos MEGA está deshabilitada/)).toBeVisible();
+    expect(within(dialog).getByText(/El informe permite revisar los fallos y omitir manualmente los elegibles\./)).toBeVisible();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Entendido' }));
+    await waitForElementToBeRemoved(() => screen.queryByRole('dialog', { name: 'Limitación de omisión automática en MEGA' }));
   });
 
   it('loads the next explorer page when a directory has more than 50 items', async () => {

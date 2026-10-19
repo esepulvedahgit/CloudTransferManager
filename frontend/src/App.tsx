@@ -1902,6 +1902,7 @@ function TransferWorkspace({
   const [mobileStep, setMobileStep] = useState(0);
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
+  const [megaOmissionDialogOpen, setMegaOmissionDialogOpen] = useState(false);
   const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
   const [scheduleDateTime, setScheduleDateTime] = useState(() => localDateTimeValue(new Date(Date.now() + 60 * 60_000)));
   const [scheduleMode, setScheduleMode] = useState<'AUTO' | 'EXCLUSIVE'>('AUTO');
@@ -3161,9 +3162,17 @@ function TransferWorkspace({
               <Typography variant="body2" fontWeight={650}>Conservar ambos · numerar la copia</Typography>
             </Box>
             {sourceConnection?.provider_type === 'MEGA' && (
-              <Alert severity="info" sx={{ py: 0.25 }}>
-                La omisión automática de archivos MEGA está deshabilitada hasta validar una firma de restricción por archivo para la versión instalada de MEGAcmd. El informe permite revisar los fallos y omitir manualmente los elegibles.
-              </Alert>
+              <Button
+                className="mega-omission-notice"
+                size="small"
+                variant="outlined"
+                color="warning"
+                startIcon={<SvgIcon fontSize="small" viewBox="0 0 24 24"><path d="M12 3 1.8 21h20.4L12 3Zm0 4.1 6.7 11.9H5.3L12 7.1Zm-1 3.4v4.7h2v-4.7h-2Zm0 5.8v1.8h2v-1.8h-2Z" /></SvgIcon>}
+                aria-haspopup="dialog"
+                onClick={() => setMegaOmissionDialogOpen(true)}
+              >
+                Aviso sobre archivos MEGA
+              </Button>
             )}
             <FormControlLabel
               control={<Checkbox checked={sendEmailNotification} onChange={(_event, checked) => setSendEmailNotification(checked)} size="small" />}
@@ -3468,6 +3477,26 @@ function TransferWorkspace({
           <Button variant="contained" onClick={() => void saveScheduledTransfer()} disabled={busy}>
             {busy ? <CircularProgress size={20} color="inherit" /> : 'Confirmar programación'}
           </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        className="mega-omission-dialog"
+        open={megaOmissionDialogOpen}
+        onClose={() => setMegaOmissionDialogOpen(false)}
+        fullWidth
+        maxWidth="sm"
+        scroll="paper"
+        aria-labelledby="mega-omission-dialog-title"
+        aria-describedby="mega-omission-dialog-description"
+      >
+        <DialogTitle id="mega-omission-dialog-title">Limitación de omisión automática en MEGA</DialogTitle>
+        <DialogContent>
+          <Alert id="mega-omission-dialog-description" severity="warning" variant="outlined" role="note">
+            La omisión automática de archivos MEGA está deshabilitada hasta validar una firma de restricción por archivo para la versión instalada de MEGAcmd. El informe permite revisar los fallos y omitir manualmente los elegibles.
+          </Alert>
+        </DialogContent>
+        <DialogActions>
+          <Button variant="contained" onClick={() => setMegaOmissionDialogOpen(false)}>Entendido</Button>
         </DialogActions>
       </Dialog>
       <ConnectionDialog
