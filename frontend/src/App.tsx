@@ -46,9 +46,9 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Controller, useForm } from 'react-hook-form';
-import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { z } from 'zod';
 import { apiRequest, ApiError } from './api';
 import DocumentationSection from './DocumentationSection';
@@ -57,6 +57,8 @@ import TransferIncidentPanel from './TransferIncidentPanel';
 import TransferFileReport from './TransferFileReport';
 import type { TransferManifestPage, TransferRecord } from './transferTypes';
 import './styles.css';
+
+const MetricsDashboard = lazy(() => import('./MetricsDashboard'));
 
 type User = { id: string; username: string; email: string; role: 'ADMIN' | 'USER'; must_change_password?: boolean };
 type Connection = {
@@ -1785,6 +1787,8 @@ function TransferWorkspace({
   onUserUpdated: (patch: Partial<User>) => void;
 }) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const location = useLocation();
   const pendingTransferKeys = useRef(new Map<string, string>());
   const createTransfer = async (payload: Record<string, unknown>) => {
     const fingerprint = JSON.stringify(payload);
@@ -1798,7 +1802,11 @@ function TransferWorkspace({
     pendingTransferKeys.current.delete(fingerprint);
     return transfer;
   };
-  const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections' | 'private' | 'scheduled' | 'documentation'>('explorer');
+  const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections' | 'private' | 'scheduled' | 'documentation' | 'metrics'>(location.pathname === '/metrics' ? 'metrics' : 'explorer');
+  useEffect(() => {
+    if (location.pathname === '/metrics') setWorkspaceSection('metrics');
+    else if (location.pathname === '/' && workspaceSection === 'metrics') setWorkspaceSection('explorer');
+  }, [location.pathname, workspaceSection]);
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
     queryFn: () => apiRequest<{ items: Connection[] }>('/api/v1/connections'),
@@ -2632,12 +2640,16 @@ function TransferWorkspace({
           <Tabs
             className="header-navigation"
             value={workspaceSection === 'documentation' ? false : workspaceSection}
-            onChange={(_event, value: 'explorer' | 'connections' | 'private' | 'scheduled') => setWorkspaceSection(value)}
+            onChange={(_event, value: 'explorer' | 'connections' | 'private' | 'scheduled' | 'metrics') => {
+              setWorkspaceSection(value);
+              navigate(value === 'metrics' ? '/metrics' : '/');
+            }}
             aria-label="Secciones principales"
           >
             <Tab value="explorer" label="Explorador" />
             <Tab value="private" label="Servicios privados" />
             <Tab value="scheduled" label="Programaciones" />
+            <Tab value="metrics" label="Métricas" />
             {user.role === 'ADMIN' && <Tab value="connections" label="Conexiones" />}
           </Tabs>
           <Stack className="topbar-actions" direction="row" alignItems="center" spacing={1.5}>
@@ -2839,7 +2851,7 @@ function TransferWorkspace({
                   ? 'ORÍGENES DE RED PRIVADA'
                   : workspaceSection === 'scheduled'
                     ? 'COLA DE TRANSFERENCIAS'
-                    : workspaceSection === 'documentation' ? 'GUÍA DE USO' : 'CENTRO DE TRANSFERENCIAS'}
+                    : workspaceSection === 'documentation' ? 'GUÍA DE USO' : workspaceSection === 'metrics' ? 'OBSERVABILIDAD' : 'CENTRO DE TRANSFERENCIAS'}
             </Typography>
             <Typography variant="h4" component="h1">
               {workspaceSection === 'connections'
@@ -2848,7 +2860,7 @@ function TransferWorkspace({
                   ? 'Servicios privados'
                   : workspaceSection === 'scheduled'
                     ? 'Programaciones'
-                    : workspaceSection === 'documentation' ? 'Documentación' : 'Explorador de archivos'}
+                    : workspaceSection === 'documentation' ? 'Documentación' : workspaceSection === 'metrics' ? 'Métricas' : 'Explorador de archivos'}
             </Typography>
             <Typography color="text.secondary" sx={{ mt: 0.6 }}>
               {workspaceSection === 'connections'
@@ -2859,6 +2871,8 @@ function TransferWorkspace({
                     ? 'Revisa horarios, dependencias y acciones de las transferencias programadas.'
                     : workspaceSection === 'documentation'
                       ? 'Conoce cómo transferir archivos y cómo se administran la cola, la capacidad y el progreso.'
+                      : workspaceSection === 'metrics'
+                        ? 'Consulta volumen, actividad, rendimiento y fiabilidad de las transferencias.'
                       : 'Copia archivos entre tus servicios cloud y los NAS conectados.'}
             </Typography>
           </Box>
@@ -2866,7 +2880,11 @@ function TransferWorkspace({
 
         {notice && <Alert severity={noticeSeverity} sx={{ mb: 2 }}>{notice}</Alert>}
         {transferFailure && <Alert severity="error" sx={{ mb: 2 }}>{transferFailure.message}</Alert>}
-        {workspaceSection === 'connections' && user.role === 'ADMIN' ? (
+        {workspaceSection === 'metrics' ? (
+          <Suspense fallback={<Box sx={{ py: 8, display: 'flex', justifyContent: 'center' }}><CircularProgress /></Box>}>
+            <MetricsDashboard user={user} connections={connections} />
+          </Suspense>
+        ) : workspaceSection === 'connections' && user.role === 'ADMIN' ? (
           <ConnectionManagementSection
             connections={connections.filter((connection) => connection.provider_type !== 'SMB')}
             loading={connectionsQuery.isLoading}
@@ -3510,8 +3528,7 @@ function AppRoutes() {
   return (
     <Routes>
       <Route path="/login" element={user ? <Navigate to="/" replace /> : <LoginPage onLogin={setUser} />} />
-      <Route path="/" element={user ? <TransferWorkspace user={user} onUserUpdated={(patch) => setUser({ ...user, ...patch })} onLogout={() => void logout()} /> : <Navigate to="/login" replace />} />
-      <Route path="*" element={<Navigate to={user ? '/' : '/login'} replace />} />
+      <Route path="*" element={user ? <TransferWorkspace user={user} onUserUpdated={(patch) => setUser({ ...user, ...patch })} onLogout={() => void logout()} /> : <Navigate to="/login" replace />} />
     </Routes>
   );
 }

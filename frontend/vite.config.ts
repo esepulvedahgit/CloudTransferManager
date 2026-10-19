@@ -9,6 +9,7 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (!id.includes('node_modules')) return undefined;
+          if (id.includes('@mui/x-charts')) return undefined;
           if (id.includes('@mui/') || id.includes('@emotion/')) return 'ui-vendor';
           if (id.includes('react-hook-form') || id.includes('@hookform/') || id.includes('/zod/')) {
             return 'forms-vendor';

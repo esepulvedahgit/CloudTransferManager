@@ -431,3 +431,14 @@ El host debe coincidir exactamente con una entrada de `SMB_ALLOWED_TARGETS`. SMB
 ### Resumen de manifiesto (extensión compatible, 2026-10-16)
 
 Los listados, detalle y eventos de progreso de transferencias incluyen `manifest_summary`: `{copied, failed, skipped, pending, renamed, omitted, omitted_bytes}` (enteros no negativos). El primer snapshot SSE lo incluye también para trabajos terminales. `renamed` cuenta nombres asignados por conflictos/límites, incluidos directorios; no equivale a `warning_count`. `omitted` es el subconjunto explícito de `skipped`; los conflictos históricos no se pueden reintentar mediante el endpoint de omisiones. `files_completed` continúa contando elementos resueltos para compatibilidad. Los consumidores muestran copiados desde `manifest_summary.copied` y no declaran 100% con elementos sin copiar.
+
+## 9. Métricas (`/metrics/dashboard`)
+
+### `GET /api/v1/metrics/dashboard`
+- Requiere sesión. `USER` solo consulta sus transferencias; `ADMIN` consulta todas y puede acotar con `user_id`. Un usuario normal que envía `user_id` recibe `403`.
+- Filtros: `range=today|7d|30d|90d|custom` (predeterminado `30d`), `date_from` y `date_to` para `custom`, `timezone` IANA, `source_provider`, `destination_provider`, `source_connection_id`, `destination_connection_id`, `include_mock` y `user_id` (ADMIN). El máximo es 366 días. Las conexiones filtradas se autorizan antes de consultar y cachear.
+- Devuelve solamente agregados: resumen por estado y archivos, proveedores/rutas, actividad diaria, rendimiento por etapa, fiabilidad, programación, snapshot de trabajos activos y cobertura. Solo ADMIN recibe `system`.
+- La dimensión de transferencias se filtra por `created_at`; la actividad de archivo y spans se filtra por sus timestamps efectivos. Los manifiestos históricos sin `copied_at` aportan a totales, pero no al gráfico diario. No se reconstruyen fechas usando `updated_at`.
+- `copied` cuenta elementos de manifiesto únicos con estado `COPIED`, excluye directorios; los omitidos (`SKIPPED` con `omission_kind`) se separan de `SKIPPED` históricos. La tasa de éxito excluye cancelaciones del denominador.
+- El navegador almacena el resultado hasta 15 segundos por usuario/rol/filtros; el refresco de UI es cada 30 segundos. No hay rutas ni nombres de archivos en la respuesta.
+- Errores: `403` por alcance de usuario inválido, `404` para una conexión no visible y `422` para zona horaria/rango inválido.

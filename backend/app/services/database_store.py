@@ -25,6 +25,7 @@ from app.models import (
     TransferEvent,
     TransferJob,
     TransferManifestItem,
+    TransferMetricSpan,
     TransferNotificationOutbox,
     User,
     UserConnectionGrant,
@@ -111,6 +112,799 @@ class DatabaseStore:
         """Create schema for isolated tests; deployments use Alembic migrations."""
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+
+    @staticmethod
+    def _metrics_int(value: Any) -> int:
+        return int(value or 0)
+
+    @staticmethod
+    def _metrics_file_columns() -> dict[str, Any]:
+        item = TransferManifestItem
+        return {
+            "total": func.count(item.id).label("total"),
+            "copied": func.sum(case((item.status == "COPIED", 1), else_=0)).label("copied"),
+            "copied_bytes": func.coalesce(
+                func.sum(
+                    case((item.status == "COPIED", func.coalesce(item.size_bytes, 0)), else_=0)
+                ),
+                0,
+            ).label("copied_bytes"),
+            "copied_size_unknown": func.sum(
+                case((and_(item.status == "COPIED", item.size_bytes.is_(None)), 1), else_=0)
+            ).label("copied_size_unknown"),
+            "failed": func.sum(case((item.status == "FAILED", 1), else_=0)).label("failed"),
+            "skipped_historical": func.sum(
+                case((and_(item.status == "SKIPPED", item.omission_kind.is_(None)), 1), else_=0)
+            ).label("skipped_historical"),
+            "omitted": func.sum(
+                case((and_(item.status == "SKIPPED", item.omission_kind.is_not(None)), 1), else_=0)
+            ).label("omitted"),
+            "omitted_bytes": func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(item.status == "SKIPPED", item.omission_kind.is_not(None)),
+                            func.coalesce(item.size_bytes, 0),
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("omitted_bytes"),
+            "pending": func.sum(case((item.status == "PENDING", 1), else_=0)).label("pending"),
+            "renamed": func.sum(case((item.rename_reason.is_not(None), 1), else_=0)).label(
+                "renamed"
+            ),
+        }
+
+    @staticmethod
+    def _metrics_file_values(row: Any) -> dict[str, int]:
+        return {
+            key: DatabaseStore._metrics_int(row._mapping.get(key, 0))
+            for key in DatabaseStore._metrics_file_columns()
+        }
+
+    async def ametric_dashboard(
+        self,
+        *,
+        requested_by: uuid.UUID | None,
+        date_from: datetime,
+        date_to: datetime,
+        timezone: str,
+        source_provider: str | None = None,
+        destination_provider: str | None = None,
+        source_connection_id: uuid.UUID | None = None,
+        destination_connection_id: uuid.UUID | None = None,
+        include_mock: bool = False,
+    ) -> dict[str, Any]:
+        """Return aggregates only; manifest paths and connection credentials never leave SQL."""
+        source = aliased(StorageConnection)
+        destination = aliased(StorageConnection)
+
+        def job_filters(*, in_range: bool) -> list[Any]:
+            criteria: list[Any] = []
+            if requested_by is not None:
+                criteria.append(TransferJob.requested_by == requested_by)
+            if in_range:
+                criteria.extend(
+                    (TransferJob.created_at >= date_from, TransferJob.created_at < date_to)
+                )
+            if not include_mock:
+                criteria.extend(
+                    (source.provider_type != "MOCK", destination.provider_type != "MOCK")
+                )
+            if source_provider is not None:
+                criteria.append(source.provider_type == source_provider)
+            if destination_provider is not None:
+                criteria.append(destination.provider_type == destination_provider)
+            if source_connection_id is not None:
+                criteria.append(TransferJob.source_connection_id == source_connection_id)
+            if destination_connection_id is not None:
+                criteria.append(TransferJob.destination_connection_id == destination_connection_id)
+            return criteria
+
+        def from_jobs(*, in_range: bool) -> Any:
+            return (
+                select(
+                    TransferJob,
+                    source.provider_type.label("source_type"),
+                    destination.provider_type.label("destination_type"),
+                )
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(*job_filters(in_range=in_range))
+            )
+
+        async with self.sessions() as session:
+            job_rows = (await session.execute(from_jobs(in_range=True))).all()
+            transfer_ids = [row.TransferJob.id for row in job_rows]
+            statuses: dict[str, int] = {}
+            for row in job_rows:
+                job = row.TransferJob
+                statuses[job.status] = statuses.get(job.status, 0) + 1
+
+            file_summary = {key: 0 for key in self._metrics_file_columns()}
+            if transfer_ids:
+                aggregate = await session.execute(
+                    select(*self._metrics_file_columns().values())
+                    .select_from(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id.in_(transfer_ids),
+                        TransferManifestItem.is_dir.is_(False),
+                    )
+                )
+                file_summary = self._metrics_file_values(aggregate.one())
+
+            provider_stats: dict[str, dict[str, dict[str, int]]] = {
+                "source": {},
+                "destination": {},
+                "pairs": {},
+            }
+            transfer_counts: dict[str, dict[str, int]] = {
+                "source": {},
+                "destination": {},
+                "pairs": {},
+            }
+            for row in job_rows:
+                job = row.TransferJob
+                source_type = row.source_type
+                destination_type = row.destination_type
+                for kind, key in (
+                    ("source", source_type),
+                    ("destination", destination_type),
+                    ("pairs", f"{source_type} → {destination_type}"),
+                ):
+                    transfer_counts[kind][key] = transfer_counts[kind].get(key, 0) + 1
+            if transfer_ids:
+                for kind, group_columns in (
+                    ("source", [source.provider_type]),
+                    ("destination", [destination.provider_type]),
+                    ("pairs", [source.provider_type, destination.provider_type]),
+                ):
+                    grouped = await session.execute(
+                        select(*group_columns, *self._metrics_file_columns().values())
+                        .select_from(TransferManifestItem)
+                        .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                        .join(source, source.id == TransferJob.source_connection_id)
+                        .join(destination, destination.id == TransferJob.destination_connection_id)
+                        .where(
+                            *job_filters(in_range=True),
+                            TransferManifestItem.is_dir.is_(False),
+                        )
+                        .group_by(*group_columns)
+                    )
+                    for values in grouped.all():
+                        if kind == "source":
+                            key = values[0]
+                        elif kind == "destination":
+                            key = values[0]
+                        else:
+                            key = f"{values[0]} → {values[1]}"
+                        provider_stats[kind][key] = self._metrics_file_values(values)
+
+            # Activity uses the viewer timezone; undated legacy rows stay undated.
+            dialect = self.engine.dialect.name
+            if dialect == "postgresql":
+                created_day = func.date(func.timezone(timezone, TransferJob.created_at))
+                copied_day = func.date(func.timezone(timezone, TransferManifestItem.copied_at))
+            else:
+                created_day = func.date(TransferJob.created_at)
+                copied_day = func.date(TransferManifestItem.copied_at)
+            daily: dict[str, dict[str, int]] = {}
+            created_rows = await session.execute(
+                select(created_day.label("day"), func.count(TransferJob.id))
+                .select_from(TransferJob)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(*job_filters(in_range=True))
+                .group_by(created_day)
+            )
+            for day, count in created_rows.all():
+                if day is not None:
+                    daily[str(day)] = {
+                        "transfers_created": self._metrics_int(count),
+                        "copied": 0,
+                        "copied_bytes": 0,
+                    }
+            copied_rows = await session.execute(
+                select(
+                    copied_day.label("day"),
+                    func.count(TransferManifestItem.id),
+                    func.coalesce(func.sum(func.coalesce(TransferManifestItem.size_bytes, 0)), 0),
+                )
+                .select_from(TransferManifestItem)
+                .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=False),
+                    TransferManifestItem.is_dir.is_(False),
+                    TransferManifestItem.status == "COPIED",
+                    TransferManifestItem.copied_at >= date_from,
+                    TransferManifestItem.copied_at < date_to,
+                )
+                .group_by(copied_day)
+            )
+            for day, count, byte_count in copied_rows.all():
+                if day is not None:
+                    entry = daily.setdefault(
+                        str(day), {"transfers_created": 0, "copied": 0, "copied_bytes": 0}
+                    )
+                    entry["copied"] = self._metrics_int(count)
+                    entry["copied_bytes"] = self._metrics_int(byte_count)
+
+            stage_filters = [
+                TransferMetricSpan.span_type == "STAGE",
+                TransferMetricSpan.started_at >= date_from,
+                TransferMetricSpan.started_at < date_to,
+            ]
+            if requested_by is not None:
+                stage_filters.append(TransferJob.requested_by == requested_by)
+            if source_provider is not None:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.connection_role != "SOURCE",
+                        TransferMetricSpan.provider_type == source_provider,
+                    )
+                )
+            if destination_provider is not None:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.connection_role != "DESTINATION",
+                        TransferMetricSpan.provider_type == destination_provider,
+                    )
+                )
+            if source_connection_id is not None:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.connection_role != "SOURCE",
+                        TransferMetricSpan.connection_id == source_connection_id,
+                    )
+                )
+            if destination_connection_id is not None:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.connection_role != "DESTINATION",
+                        TransferMetricSpan.connection_id == destination_connection_id,
+                    )
+                )
+            if not include_mock:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.provider_type.is_(None),
+                        TransferMetricSpan.provider_type != "MOCK",
+                    )
+                )
+            stage_from = TransferMetricSpan.__table__.join(
+                TransferJob.__table__, TransferJob.id == TransferMetricSpan.transfer_job_id
+            )
+            stage_select = select(
+                TransferMetricSpan.code,
+                TransferMetricSpan.provider_type,
+                TransferMetricSpan.connection_role,
+                func.count(TransferMetricSpan.id),
+                func.sum(case((TransferMetricSpan.outcome == "SUCCESS", 1), else_=0)),
+                func.sum(case((TransferMetricSpan.outcome == "FAILED", 1), else_=0)),
+                func.sum(case((TransferMetricSpan.outcome == "OPEN", 1), else_=0)),
+                func.percentile_disc(0.5).within_group(TransferMetricSpan.duration_ms),
+                func.percentile_disc(0.95).within_group(TransferMetricSpan.duration_ms),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                TransferMetricSpan.outcome == "SUCCESS",
+                                TransferMetricSpan.bytes_count,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                TransferMetricSpan.outcome == "SUCCESS",
+                                TransferMetricSpan.duration_ms,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+            ).select_from(stage_from)
+            if dialect == "postgresql":
+                stage_rows = await session.execute(
+                    stage_select.where(*stage_filters).group_by(
+                        TransferMetricSpan.code,
+                        TransferMetricSpan.provider_type,
+                        TransferMetricSpan.connection_role,
+                    )
+                )
+                performance = [
+                    {
+                        "stage": code,
+                        "provider_type": provider_type,
+                        "connection_role": role,
+                        "samples": self._metrics_int(samples),
+                        "successful_samples": self._metrics_int(successes),
+                        "failed_samples": self._metrics_int(failures),
+                        "incomplete_samples": self._metrics_int(incomplete),
+                        "median_ms": self._metrics_int(median) if median is not None else None,
+                        "p95_ms": self._metrics_int(p95) if p95 is not None else None,
+                        "bytes_count": self._metrics_int(total_bytes),
+                        "effective_bytes_per_second": (
+                            round(
+                                self._metrics_int(total_bytes) * 1000 / self._metrics_int(total_ms)
+                            )
+                            if self._metrics_int(total_ms)
+                            else None
+                        ),
+                    }
+                    for (
+                        code,
+                        provider_type,
+                        role,
+                        samples,
+                        successes,
+                        failures,
+                        incomplete,
+                        median,
+                        p95,
+                        total_bytes,
+                        total_ms,
+                    ) in stage_rows.all()
+                ]
+            else:
+                from app.services.transfer_metrics import percentile
+
+                raw_stage_rows = await session.execute(
+                    select(
+                        TransferMetricSpan.code,
+                        TransferMetricSpan.provider_type,
+                        TransferMetricSpan.connection_role,
+                        TransferMetricSpan.outcome,
+                        TransferMetricSpan.duration_ms,
+                        TransferMetricSpan.bytes_count,
+                    )
+                    .select_from(stage_from)
+                    .where(*stage_filters)
+                )
+                grouped_stages: dict[tuple[str, str | None, str | None], list[Any]] = {}
+                for value in raw_stage_rows.all():
+                    grouped_stages.setdefault((value[0], value[1], value[2]), []).append(value)
+                performance = []
+                for (code, provider_type, role), samples in sorted(grouped_stages.items()):
+                    successful = [
+                        value for value in samples if value[3] == "SUCCESS" and value[4] is not None
+                    ]
+                    durations = [self._metrics_int(value[4]) for value in successful]
+                    total_bytes = sum(self._metrics_int(value[5]) for value in successful)
+                    total_ms = sum(durations)
+                    performance.append(
+                        {
+                            "stage": code,
+                            "provider_type": provider_type,
+                            "connection_role": role,
+                            "samples": len(samples),
+                            "successful_samples": len(successful),
+                            "failed_samples": sum(value[3] == "FAILED" for value in samples),
+                            "incomplete_samples": sum(value[3] == "OPEN" for value in samples),
+                            "median_ms": percentile(durations, 0.5),
+                            "p95_ms": percentile(durations, 0.95),
+                            "bytes_count": total_bytes,
+                            "effective_bytes_per_second": round(total_bytes * 1000 / total_ms)
+                            if total_ms
+                            else None,
+                        }
+                    )
+
+            state_query = (
+                select(
+                    TransferMetricSpan.code,
+                    func.count(TransferMetricSpan.id),
+                    func.percentile_disc(0.5).within_group(TransferMetricSpan.duration_ms),
+                    func.percentile_disc(0.95).within_group(TransferMetricSpan.duration_ms),
+                )
+                .join(TransferJob, TransferJob.id == TransferMetricSpan.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    TransferMetricSpan.span_type == "STATE",
+                    TransferMetricSpan.outcome == "SUCCESS",
+                    TransferMetricSpan.duration_ms.is_not(None),
+                    TransferMetricSpan.started_at < date_to,
+                    TransferMetricSpan.completed_at >= date_from,
+                    *job_filters(in_range=False),
+                )
+                .group_by(TransferMetricSpan.code)
+            )
+            if dialect == "postgresql":
+                state_rows = await session.execute(state_query)
+                states = [
+                    {
+                        "state": code,
+                        "samples": self._metrics_int(count),
+                        "median_ms": self._metrics_int(median),
+                        "p95_ms": self._metrics_int(p95),
+                    }
+                    for code, count, median, p95 in state_rows.all()
+                    if median is not None and p95 is not None
+                ]
+            else:
+                from app.services.transfer_metrics import percentile
+
+                state_samples_rows = await session.execute(
+                    select(TransferMetricSpan.code, TransferMetricSpan.duration_ms)
+                    .select_from(stage_from)
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(
+                        TransferMetricSpan.span_type == "STATE",
+                        TransferMetricSpan.outcome == "SUCCESS",
+                        TransferMetricSpan.duration_ms.is_not(None),
+                        TransferMetricSpan.started_at < date_to,
+                        TransferMetricSpan.completed_at >= date_from,
+                        *job_filters(in_range=False),
+                    )
+                )
+                values_by_state: dict[str, list[int]] = {}
+                for code, duration_ms in state_samples_rows.all():
+                    values_by_state.setdefault(code, []).append(self._metrics_int(duration_ms))
+                states = [
+                    {
+                        "state": code,
+                        "samples": len(values),
+                        "median_ms": percentile(values, 0.5),
+                        "p95_ms": percentile(values, 0.95),
+                    }
+                    for code, values in sorted(values_by_state.items())
+                ]
+
+            errors = await session.execute(
+                select(TransferManifestItem.error_code, func.count(TransferManifestItem.id))
+                .select_from(TransferManifestItem)
+                .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=True),
+                    TransferManifestItem.is_dir.is_(False),
+                    TransferManifestItem.status == "FAILED",
+                )
+                .group_by(TransferManifestItem.error_code)
+                .order_by(func.count(TransferManifestItem.id).desc())
+                .limit(10)
+            )
+            error_rows = [
+                {"error_code": code or "UNKNOWN", "files": self._metrics_int(count)}
+                for code, count in errors.all()
+            ]
+            size_rows = await session.execute(
+                select(
+                    func.sum(case((TransferManifestItem.size_bytes == 0, 1), else_=0)),
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    TransferManifestItem.size_bytes > 0,
+                                    TransferManifestItem.size_bytes < 1024**2,
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    TransferManifestItem.size_bytes >= 1024**2,
+                                    TransferManifestItem.size_bytes < 100 * 1024**2,
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    TransferManifestItem.size_bytes >= 100 * 1024**2,
+                                    TransferManifestItem.size_bytes < 1024**3,
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(case((TransferManifestItem.size_bytes >= 1024**3, 1), else_=0)),
+                    func.sum(case((TransferManifestItem.size_bytes.is_(None), 1), else_=0)),
+                )
+                .select_from(TransferManifestItem)
+                .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=True),
+                    TransferManifestItem.is_dir.is_(False),
+                    TransferManifestItem.status == "COPIED",
+                )
+            )
+            size_values = size_rows.one()
+            size_distribution = [
+                {"bucket": bucket, "files": self._metrics_int(count)}
+                for bucket, count in zip(
+                    (
+                        "zero",
+                        "under_1_mib",
+                        "1_to_100_mib",
+                        "100_mib_to_1_gib",
+                        "over_1_gib",
+                        "unknown",
+                    ),
+                    size_values,
+                    strict=True,
+                )
+            ]
+            extensions: dict[str, int] = {}
+            extension_filter = (
+                *job_filters(in_range=True),
+                TransferManifestItem.is_dir.is_(False),
+                TransferManifestItem.status == "COPIED",
+            )
+            if dialect == "postgresql":
+                basename = func.regexp_replace(TransferManifestItem.source_path, r"^.*/", "")
+                has_extension = basename.op("~")(r"[^./]+\.[^./]+$")
+                extension = case(
+                    (
+                        has_extension,
+                        func.lower(func.regexp_replace(basename, r"^.*\.([^./]+)$", r"\1")),
+                    ),
+                    else_="Sin extensión",
+                )
+                extension_rows = await session.execute(
+                    select(extension, func.count(TransferManifestItem.id))
+                    .select_from(TransferManifestItem)
+                    .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(*extension_filter)
+                    .group_by(extension)
+                )
+                for extension_name, count in extension_rows.all():
+                    extensions[str(extension_name)] = self._metrics_int(count)
+            else:
+                # SQLite is used only in development tests; PostgreSQL aggregates in the database.
+                from pathlib import PurePosixPath
+
+                extension_rows = await session.execute(
+                    select(TransferManifestItem.source_path)
+                    .select_from(TransferManifestItem)
+                    .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(*extension_filter)
+                )
+                for (path,) in extension_rows:
+                    extension_name = (
+                        PurePosixPath(str(path)).suffix.casefold().lstrip(".") or "Sin extensión"
+                    )
+                    extensions[extension_name] = extensions.get(extension_name, 0) + 1
+
+            waiting_rows = await session.execute(
+                select(TransferJob.status, TransferJob.wait_reason, func.count(TransferJob.id))
+                .select_from(TransferJob)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=True),
+                    TransferJob.status.in_(["SCHEDULED", "QUEUED", "PAUSING", "PAUSED"]),
+                )
+                .group_by(TransferJob.status, TransferJob.wait_reason)
+            )
+            waiting = paused = 0
+            wait_reasons: dict[str, int] = {}
+            for status_value, reason, count in waiting_rows.all():
+                if status_value in {"SCHEDULED", "QUEUED"}:
+                    waiting += self._metrics_int(count)
+                    wait_reasons[reason or "OTHER"] = wait_reasons.get(
+                        reason or "OTHER", 0
+                    ) + self._metrics_int(count)
+                else:
+                    paused += self._metrics_int(count)
+
+            active_query = (
+                select(
+                    TransferJob.status,
+                    func.count(),
+                    func.coalesce(func.sum(TransferJob.current_speed_bps), 0),
+                )
+                .select_from(TransferJob)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=False),
+                    TransferJob.status.in_(
+                        ["VALIDATING", "RUNNING", "RETRYING", "PAUSING", "PAUSED", "CANCELLING"]
+                    ),
+                )
+                .group_by(TransferJob.status)
+            )
+            active_rows = await session.execute(active_query)
+            active_values = active_rows.all()
+            active_by_status = {
+                status_value: int(count) for status_value, count, _speed in active_values
+            }
+            active_speed = sum(int(speed or 0) for _status, _count, speed in active_values)
+            all_transfer_status_counts = {key: value for key, value in statuses.items()}
+            completed = all_transfer_status_counts.get("COMPLETED", 0)
+            warnings = all_transfer_status_counts.get("COMPLETED_WITH_WARNINGS", 0)
+            failed = all_transfer_status_counts.get("FAILED", 0)
+            eligible = completed + warnings + failed
+
+            manifest_counts_query = await session.execute(
+                select(
+                    func.count(func.distinct(TransferManifestItem.transfer_job_id)),
+                    func.count(func.distinct(TransferJob.id)),
+                )
+                .select_from(TransferJob)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .outerjoin(
+                    TransferManifestItem, TransferManifestItem.transfer_job_id == TransferJob.id
+                )
+                .where(*job_filters(in_range=True))
+            )
+            with_manifest, all_count = manifest_counts_query.one()
+            copied_coverage = await session.execute(
+                select(
+                    func.sum(case((TransferManifestItem.copied_at.is_not(None), 1), else_=0)),
+                    func.sum(case((TransferManifestItem.copied_at.is_(None), 1), else_=0)),
+                )
+                .select_from(TransferManifestItem)
+                .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=True),
+                    TransferManifestItem.is_dir.is_(False),
+                    TransferManifestItem.status == "COPIED",
+                )
+            )
+            copied_with_date, copied_without_date = copied_coverage.one()
+            span_coverage = await session.execute(
+                select(
+                    func.count(TransferMetricSpan.id),
+                    func.sum(case((TransferMetricSpan.outcome == "OPEN", 1), else_=0)),
+                )
+                .select_from(TransferMetricSpan)
+                .join(TransferJob, TransferJob.id == TransferMetricSpan.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=False),
+                    TransferMetricSpan.span_type == "STAGE",
+                    TransferMetricSpan.started_at >= date_from,
+                    TransferMetricSpan.started_at < date_to,
+                )
+            )
+            stage_count, incomplete_count = span_coverage.one()
+
+        def provider_payload(kind: str, key_name: str) -> list[dict[str, Any]]:
+            result = []
+            for key, count in sorted(transfer_counts[kind].items()):
+                result.append(
+                    {
+                        key_name: key,
+                        "transfers": count,
+                        "files": provider_stats[kind].get(
+                            key, {name: 0 for name in self._metrics_file_columns()}
+                        ),
+                    }
+                )
+            return result
+
+        return {
+            "summary": {
+                "transfers": {
+                    "total": len(job_rows),
+                    "by_status": statuses,
+                    "completed_cleanly": completed,
+                    "completed_with_warnings": warnings,
+                    "failed": failed,
+                    "cancelled": statuses.get("CANCELLED", 0),
+                    "success_rate": round((completed + warnings) * 100 / eligible, 1)
+                    if eligible
+                    else 0,
+                    "additional_attempts": sum(
+                        max(0, row.TransferJob.attempt_count - 1) for row in job_rows
+                    ),
+                },
+                "files": file_summary,
+            },
+            "providers": {
+                "source": provider_payload("source", "provider_type"),
+                "destination": provider_payload("destination", "provider_type"),
+                "pairs": provider_payload("pairs", "label"),
+            },
+            "activity": [{"date": day, **values} for day, values in sorted(daily.items())],
+            "performance": {"stages": performance, "states": states},
+            "reliability": {
+                "errors": error_rows,
+                "size_distribution": size_distribution,
+                "extensions": [
+                    {"extension": key, "files": count}
+                    for key, count in sorted(
+                        extensions.items(), key=lambda entry: (-entry[1], entry[0])
+                    )[:6]
+                ],
+            },
+            "scheduling": {
+                "waiting": waiting,
+                "paused": paused,
+                "by_wait_reason": [
+                    {"reason": key, "transfers": count}
+                    for key, count in sorted(wait_reasons.items())
+                ],
+            },
+            "live": {
+                "active": sum(active_by_status.values()),
+                "by_status": active_by_status,
+                "reported_speed_bps": active_speed,
+            },
+            "coverage": {
+                "transfers": int(all_count or 0),
+                "with_manifest": int(with_manifest or 0),
+                "manifestless_transfers": max(0, int(all_count or 0) - int(with_manifest or 0)),
+                "copied_files_with_date": int(copied_with_date or 0),
+                "copied_files_without_date": int(copied_without_date or 0),
+                "stage_samples": int(stage_count or 0),
+                "stage_samples_incomplete": int(incomplete_count or 0),
+            },
+            "system": None,
+        }
+
+    async def ametric_system_summary(self) -> dict[str, Any]:
+        async with self.sessions() as session:
+            outbox_rows = await session.execute(
+                select(TransferNotificationOutbox.status, func.count()).group_by(
+                    TransferNotificationOutbox.status
+                )
+            )
+            evaluation_rows = await session.execute(
+                select(TransferEvaluation.status, func.count()).group_by(TransferEvaluation.status)
+            )
+            connection_rows = await session.execute(
+                select(
+                    StorageConnection.provider_type,
+                    StorageConnection.status,
+                    StorageConnection.last_test_status,
+                    func.count(StorageConnection.id),
+                ).group_by(
+                    StorageConnection.provider_type,
+                    StorageConnection.status,
+                    StorageConnection.last_test_status,
+                )
+            )
+        return {
+            "notifications": {
+                "by_status": {status: int(count) for status, count in outbox_rows.all()}
+            },
+            "evaluations": {
+                "by_status": {status: int(count) for status, count in evaluation_rows.all()}
+            },
+            "connections": [
+                {
+                    "provider_type": provider,
+                    "status": status,
+                    "last_test_status": last_test,
+                    "count": int(count),
+                }
+                for provider, status, last_test, count in connection_rows.all()
+            ],
+        }
 
     async def _ensure_notification_outbox(
         self, session: AsyncSession, transfer: TransferJob
@@ -579,6 +1373,7 @@ class DatabaseStore:
             omitted_by=row.omitted_by,
             last_failure_stage=row.last_failure_stage,
             last_failure_attempt=row.last_failure_attempt,
+            copied_at=row.copied_at,
             updated_at=row.updated_at,
         )
 
@@ -1019,6 +1814,13 @@ class DatabaseStore:
                         created_at=datetime.now(UTC),
                     )
                     session.add(row)
+                    await self._record_transfer_state_span(
+                        session,
+                        row,
+                        status=row.status,
+                        wait_reason=row.wait_reason,
+                        now=row.created_at,
+                    )
                     evaluation_row: TransferEvaluation | None = None
                     if scheduled_at is not None and scheduled_at > datetime.now(UTC):
                         is_smb_source = by_id[source_connection_id].provider_type == "SMB"
@@ -1984,6 +2786,14 @@ class DatabaseStore:
                     else []
                 )
                 rows_by_id = {row.id: row for row in rows}
+                for row in rows:
+                    await self._record_transfer_state_span(
+                        session,
+                        row,
+                        status=row.status,
+                        wait_reason=row.wait_reason,
+                        now=now,
+                    )
                 admitted = [self._transfer(rows_by_id[item_id]) for item_id in admitted_ids]
                 changed = [
                     self._transfer(rows_by_id[item_id])
@@ -2163,6 +2973,13 @@ class DatabaseStore:
                     else:
                         row.wait_reason = "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
                 record = self._transfer(row, evaluation_override=evaluation)
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=row.status,
+                    wait_reason=row.wait_reason,
+                    now=datetime.now(UTC),
+                )
                 await session.flush()
                 return record
 
@@ -2200,6 +3017,9 @@ class DatabaseStore:
                 else:
                     row.status = "CANCELLING"
                     needs_worker_signal = True
+                await self._record_transfer_state_span(
+                    session, row, status=row.status, wait_reason=row.wait_reason, now=now
+                )
                 row.state_version += 1
                 await session.flush()
                 return self._transfer(row), needs_worker_signal
@@ -2253,6 +3073,9 @@ class DatabaseStore:
                     needs_worker = True
                 else:
                     return None, False
+                await self._record_transfer_state_span(
+                    session, row, status=row.status, wait_reason=row.wait_reason, now=now
+                )
                 row.state_version += 1
                 await session.flush()
                 return self._transfer(row), needs_worker
@@ -2318,6 +3141,9 @@ class DatabaseStore:
                 row.execution_heartbeat_at = None
                 row.wait_reason = None
                 row.state_version += 1
+                await self._record_transfer_state_span(
+                    session, row, status=row.status, wait_reason=row.wait_reason, now=now
+                )
                 await session.flush()
                 return self._transfer(row)
 
@@ -2355,6 +3181,13 @@ class DatabaseStore:
                     row.execution_heartbeat_at = None
                     row.cancel_requested_at = None
                     row.state_version += 1
+                    await self._record_transfer_state_span(
+                        session,
+                        row,
+                        status=row.status,
+                        wait_reason=row.wait_reason,
+                        now=now,
+                    )
                     await session.flush()
                     return self._transfer(row)
                 row.status = "QUEUED"
@@ -2370,6 +3203,13 @@ class DatabaseStore:
                 row.execution_heartbeat_at = None
                 row.cancel_requested_at = None
                 row.state_version += 1
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=row.status,
+                    wait_reason=row.wait_reason,
+                    now=datetime.now(UTC),
+                )
                 await session.flush()
                 return self._transfer(row)
 
@@ -2483,6 +3323,13 @@ class DatabaseStore:
                         if child.scheduled_at is not None and child.scheduled_at > now
                         else None
                     )
+                await self._record_transfer_state_span(
+                    session,
+                    child,
+                    status=child.status,
+                    wait_reason=child.wait_reason,
+                    now=now,
+                )
                 metadata = {
                     "child_public_id": child.public_id,
                     "parent_public_id": parent.public_id,
@@ -2691,6 +3538,13 @@ class DatabaseStore:
                 row.execution_heartbeat_at = None
                 row.cancel_requested_at = None
                 row.source_file_error_policy = "STOP"
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=row.status,
+                    wait_reason=row.wait_reason,
+                    now=datetime.now(UTC),
+                )
 
                 count_rows = (
                     await session.execute(
@@ -2962,6 +3816,9 @@ class DatabaseStore:
                     row.source_file_error_policy = normalize_source_file_error_policy(
                         source_file_error_policy
                     )
+                await self._record_transfer_state_span(
+                    session, row, status=row.status, wait_reason=row.wait_reason, now=now
+                )
 
                 metadata = {
                     "public_id": row.public_id,
@@ -3094,6 +3951,13 @@ class DatabaseStore:
                                 evaluation.heartbeat_at = None
                                 evaluation.sequence += 1
                                 evaluation.updated_at = now.astimezone(UTC)
+                            await self._record_transfer_state_span(
+                                session,
+                                row,
+                                status=row.status,
+                                wait_reason=row.wait_reason,
+                                now=now.astimezone(UTC),
+                            )
                             return False
 
                     owner = await session.get(User, row.requested_by)
@@ -3134,6 +3998,13 @@ class DatabaseStore:
                         row.wait_reason = wait_reason
                         row.dispatch_token = None
                         row.dispatch_claimed_at = None
+                        await self._record_transfer_state_span(
+                            session,
+                            row,
+                            status=row.status,
+                            wait_reason=row.wait_reason,
+                            now=now.astimezone(UTC),
+                        )
                         return False
                 row.execution_started_at = now.astimezone(UTC)
                 row.execution_heartbeat_at = now.astimezone(UTC)
@@ -3215,6 +4086,13 @@ class DatabaseStore:
                 row.dispatch_claimed_at = None
                 row.execution_started_at = None
                 row.execution_heartbeat_at = None
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=row.status,
+                    wait_reason=row.wait_reason,
+                    now=datetime.now(UTC),
+                )
                 await self._ensure_notification_outbox(session, row)
                 session.add(
                     TransferEvent(
@@ -3575,8 +4453,18 @@ class DatabaseStore:
                     transfer.status, -1
                 ) < _TRANSFER_STATUS_RANK.get(row.status, -1):
                     return False
+                next_status = row.status if preserve_status else transfer.status
+                next_wait_reason = row.wait_reason if preserve_status else transfer.wait_reason
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=next_status,
+                    wait_reason=next_wait_reason,
+                    now=datetime.now(UTC),
+                )
                 if not preserve_status:
                     row.status = transfer.status
+                row.wait_reason = next_wait_reason
                 row.progress_percent = transfer.progress_percent
                 row.files_total = transfer.files_total
                 row.files_completed = transfer.files_completed
@@ -3603,6 +4491,145 @@ class DatabaseStore:
                 transfer.paused_at = row.paused_at
                 transfer.state_version = row.state_version
                 await self._ensure_notification_outbox(session, row)
+                return True
+
+    async def _record_transfer_state_span(
+        self,
+        session: AsyncSession,
+        transfer: TransferJob,
+        *,
+        status: str,
+        wait_reason: str | None,
+        now: datetime,
+    ) -> None:
+        current = await session.scalar(
+            select(TransferMetricSpan)
+            .where(
+                TransferMetricSpan.transfer_job_id == transfer.id,
+                TransferMetricSpan.span_type == "STATE",
+                TransferMetricSpan.outcome == "OPEN",
+            )
+            .order_by(TransferMetricSpan.started_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        if current is not None and current.code == status and current.wait_reason == wait_reason:
+            return
+        if current is not None:
+            current.completed_at = now
+            started_at = current.started_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
+            completed_at = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+            current.duration_ms = max(0, int((completed_at - started_at).total_seconds() * 1000))
+            current.outcome = "SUCCESS"
+        terminal = status in _TERMINAL_TRANSFER_STATUSES
+        session.add(
+            TransferMetricSpan(
+                id=uuid.uuid4(),
+                transfer_job_id=transfer.id,
+                attempt_count=transfer.attempt_count,
+                dispatch_token=transfer.dispatch_token,
+                span_type="STATE",
+                code=status,
+                wait_reason=wait_reason,
+                started_at=now,
+                completed_at=now if terminal else None,
+                duration_ms=None,
+                outcome="SUCCESS" if terminal else "OPEN",
+            )
+        )
+
+    async def astart_transfer_metric_span(
+        self,
+        transfer_id: uuid.UUID,
+        *,
+        dispatch_token: uuid.UUID | None,
+        attempt_count: int,
+        span_type: str,
+        code: str,
+        manifest_item_id: uuid.UUID | None = None,
+        connection_id: uuid.UUID | None = None,
+        provider_type: str | None = None,
+        connection_role: str | None = None,
+        started_at: datetime | None = None,
+    ) -> uuid.UUID | None:
+        async with self.sessions() as session:
+            async with session.begin():
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if (
+                    transfer is None
+                    or transfer.status in _TERMINAL_TRANSFER_STATUSES
+                    or transfer.attempt_count != attempt_count
+                    or transfer.dispatch_token != dispatch_token
+                ):
+                    return None
+                span_id = uuid.uuid4()
+                session.add(
+                    TransferMetricSpan(
+                        id=span_id,
+                        transfer_job_id=transfer_id,
+                        manifest_item_id=manifest_item_id,
+                        dispatch_token=dispatch_token,
+                        attempt_count=attempt_count,
+                        span_type=span_type,
+                        code=code,
+                        provider_type=provider_type,
+                        connection_role=connection_role,
+                        connection_id=connection_id,
+                        started_at=started_at or datetime.now(UTC),
+                        outcome="OPEN",
+                    )
+                )
+                return span_id
+
+    async def afinish_transfer_metric_span(
+        self,
+        span_id: uuid.UUID,
+        *,
+        dispatch_token: uuid.UUID | None,
+        completed_at: datetime,
+        duration_ms: int,
+        outcome: str,
+        bytes_count: int | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        if outcome not in {"SUCCESS", "FAILED", "INTERRUPTED"}:
+            raise ValueError("Invalid metric outcome")
+        async with self.sessions() as session:
+            async with session.begin():
+                span = await session.scalar(
+                    select(TransferMetricSpan)
+                    .where(TransferMetricSpan.id == span_id)
+                    .with_for_update()
+                )
+                transfer = (
+                    await session.get(TransferJob, span.transfer_job_id)
+                    if span is not None
+                    else None
+                )
+                if (
+                    span is None
+                    or transfer is None
+                    or span.outcome != "OPEN"
+                    or span.dispatch_token != dispatch_token
+                    or transfer.dispatch_token != dispatch_token
+                    or transfer.attempt_count != span.attempt_count
+                ):
+                    return False
+                span.completed_at = completed_at
+                span.duration_ms = max(0, duration_ms)
+                span.outcome = outcome
+                span.bytes_count = max(0, bytes_count) if bytes_count is not None else None
+                span.error_code = (
+                    error_code
+                    if error_code
+                    and len(error_code) <= 64
+                    and error_code.replace("_", "").isalnum()
+                    else None
+                )
                 return True
 
     async def aadd_transfer_manifest_items(
@@ -3907,6 +4934,8 @@ class DatabaseStore:
                 item.status = status
                 item.verified_by = verified_by
                 item.error_code = error_code
+                if status == "COPIED":
+                    item.copied_at = item.copied_at or datetime.now(UTC)
                 if status == "FAILED":
                     item.last_failure_stage = failure_stage
                     item.last_failure_attempt = failure_attempt

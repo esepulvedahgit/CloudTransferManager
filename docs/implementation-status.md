@@ -13,6 +13,7 @@
 | Transferencias | Desplegado en Compose; validación con proveedores reales pendiente | Las transferencias nuevas usan `KEEP_BOTH` global, inventario por identidad, asignación de nombres `_01`, `_02`, manifiesto común y staging por archivo. La recuperación manual puede omitir explícitamente un fallo elegible, conserva las copias verificadas y continúa con los restantes; el CSV, el reintento selectivo, la aceptación por intento de omisiones del padre y el panel paginado de fallos/omisiones están disponibles. `SKIPPED` histórico se distingue de `omitted`. La pausa durable en límites entre archivos está desplegada para trabajos compatibles; las ejecuciones heredadas activas sin límite seguro informan que no admiten pausa. La política automática MEGA sigue deshabilitada: no se verificó una firma por archivo ligada a la versión instalada, así que las fallas quedan `UNKNOWN`. Rclone no reemplaza objetos existentes; Seafile API solicita `replace=false`; los resultados de escritura ambiguos solo se aceptan tras reconciliar SHA-256. Migraciones `20261018_0016` y `20261018_0017` aplicadas en la instalación. |
 | Programaciones | Desplegado en Compose; prueba de flujo real pendiente | Ejecuciones futuras de una sola vez, zonas IANA, modos `AUTO`/`EXCLUSIVE`, dependencias, despacho durable vía PostgreSQL/Celery Beat/`control-worker` y estados `PAUSING`/`PAUSED`. Las tareas programadas muestran conteo parcial/completo y motivo de espera en Programaciones; se conservan horario e intento al pausar y reanudar. Evaluaciones bloqueadas no reservan copias y el dispatcher mantiene el preflight final. Compose incluye `evaluation-worker` aislado y `/health/evaluations` separado de readiness. Detalle en `docs/integrations/transfer-scheduling.md`. |
 | Progreso e historial | Desplegado en Compose | SSE sobre Redis, reconciliación por `attempt_count`/`state_version` entre SSE, polling e historial, paginación SQL de incidentes y resultados por archivo para manifiestos SMB. Los trabajos `PAUSED` cierran su stream hasta reanudarse. Véanse `docs/specs/05-realtime-telemetry-spec.md` y el contrato API. |
+| Tablero de métricas | Desplegado en entorno de pruebas | Vista `/metrics` en nueva pestaña de la aplicación, filtros por periodo/nube/conexión y usuario ADMIN, agregados de manifiestos, rendimiento, cola, fiabilidad y salud administrativa. La migración `20261018_0018` está aplicada en `transfer.cloudlab.cl`; guarda `copied_at` y spans de estado/etapa, sin inferir fechas históricas. Véase `docs/specs/08-metrics-dashboard-spec.md`. |
 | Auditoría y SMTP | Implementado con límite por confirmar | Registro de eventos, sanitización, configuración/prueba SMTP desde Administración, secretos SMTP cifrados y outbox transaccional por intento terminal. La creación de transferencias y su evento de auditoría comparten transacción; el envío usa worker/cola aislados, tokens de despacho y de intento, reintentos durables y vista ADMIN de estados sin correo del destinatario. `/health/notifications` vigila el worker sin degradar readiness de copias. SMTP no garantiza exactamente una entrega si el proceso cae tras la aceptación remota. La aplicación escribe auditoría append-only, pero su inmutabilidad no está impuesta por trigger/permisos de PostgreSQL. |
 | Despliegue y CI | Compose actualizado el 2026-10-18; CI independiente | Backend, frontend y workers se reconstruyeron desde `develop`; PostgreSQL aplicó `20261018_0016` y `20261018_0017`. `/health/ready`, `/health/evaluations`, `/health/notifications` y el proxy HTTPS respondieron correctamente. Compose mantiene PostgreSQL, Redis y workers en redes internas; solo el proxy publica puertos. La conectividad de proveedores y los recorridos de copia/pausa con una transferencia dedicada siguen pendientes. |
 
@@ -27,6 +28,7 @@
 - CI de backend/frontend y análisis Trivy de repositorio, configuración e imágenes.
 - Conservación y numeración de nombres ocupados en las transferencias nuevas de todos los proveedores reales admitidos; el contenido igual también recibe un nombre numerado. Mock sigue simulando progreso sin modelar escrituras.
 - Omisiones manuales auditadas de fallos MEGA elegibles, continuidad por manifiesto, informe CSV, reintento selectivo, avisos de progreso/correo y aceptación explícita de omisiones del intento padre. La omisión automática está protegida y rechazada hasta demostrar una firma individual de MEGAcmd para la versión instalada.
+- Tablero de métricas con MUI X Charts: conteos históricos de archivos/proveedores, actividad con timestamps efectivos, spans de descarga/hash/carga/verificación y snapshot de salud solo para ADMIN. Los registros anteriores a `copied_at` quedan contabilizados sin fecha exacta.
 
 ## Remediación de resiliencia (2026-10-14)
 
@@ -92,6 +94,13 @@ La evidencia local de esta revisión no equivale a un resultado de CI sobre un c
 - `docker compose config --quiet` pasó usando `.env.example` solo para resolver la configuración local.
 - Al cierre de esa validación aún no se habían aplicado migraciones ni reconstruido servicios. No se accedió al manifiesto real ni se actuó sobre `TRF-2026-000013`. No se verificó una versión concreta de MEGAcmd instalada en el servicio, así que la omisión automática permanece deshabilitada.
 
+## Evidencia de publicación del tablero de métricas (2026-10-18)
+
+- Se reconstruyeron las imágenes de backend, frontend y workers desde `develop`; el build de producción del frontend incluyó el chunk `MetricsDashboard`.
+- La migración `20261018_0018` quedó aplicada en la instalación de prueba; `alembic current` reportó esa revisión y PostgreSQL confirmó la tabla `transfer_metric_spans`.
+- El backend, frontend, PostgreSQL y Redis quedaron saludables; los workers y Beat quedaron en ejecución. La raíz y `/metrics` respondieron HTTP 200, el chunk del dashboard respondió HTTP 200 y el API respondió 401 sin sesión, como requiere autenticación. La prueba de proxy existente pasó.
+- La revisión visual autenticada queda pendiente. El certificado TLS servido por el dominio es autofirmado y puede mostrar una advertencia en el navegador. La cobertura histórica de `copied_at` no se backfilleó desde `updated_at`.
+
 ## Evidencia de incidentes y pausa entre archivos (2026-10-18)
 
 - Backend completo: `pytest -q --tb=short`: **586 pasaron, 12 omitidas**. `ruff check app tests migrations` pasó y `mypy app` no encontró problemas en 48 archivos.
@@ -113,3 +122,11 @@ La evidencia local de esta revisión no equivale a un resultado de CI sobre un c
 | 6. Transferencias reales | Implementada | Incluye staging y manifiesto SMB, más programación durable. |
 | 7. SSE y notificaciones | Implementada | Incluye progreso, recuperación del estado y administración SMTP. |
 | 8. Auditoría y hardening | Parcial | La auditoría y sanitización existen; rate limiting, garantía de inmutabilidad en BD si se mantiene como requisito y evidencia final de aceptación requieren cierre. |
+
+## Revisión de experiencia del tablero de métricas (2026-10-18)
+
+- Se aplicaron cinco skills de `emilkowalski/skills` a filtros, cargas, estados dinámicos, gráficos, accesibilidad y datos extremos. La evaluación por bloque y las recomendaciones están en `docs/reviews/2026-10-18-metrics-ui-review.md`.
+- Se retiró **Incluir datos de prueba** de la UI. Los filtros se aplican juntos, se validan fechas sin retirar resultados, se conservan lecturas ante fallos y se presenta salud sin verificar cuando corresponde. La actualización automática puede pausarse sin pausar transferencias.
+- Se corrigieron advertencias solapadas, ejes X sin etiquetas, días ausentes en la serie, unidades, muestras incompletas, textos largos y presentación de consumidores. Se añadieron alternativas tabulares y filtros desplegables para pantallas estrechas.
+- Frontend final: **75 pruebas aprobadas**, lint y build de producción aprobados. Navegador local con fixtures: **20 escenarios** en cuatro anchos, más texto al 200%, errores y refresco automático con reloj controlado; sin excepciones ni overflow de página en esos escenarios. Falta confirmar experiencia táctil en hardware y recorrido autenticado con datos reales.
+- Imagen frontend reconstruida y publicada; `/metrics` y el bundle nuevo respondieron HTTP 200. Frontend saludable; backend y workers conservan el despliegue previo, sin migración nueva.

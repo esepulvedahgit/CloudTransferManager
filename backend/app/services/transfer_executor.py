@@ -1,11 +1,13 @@
 import asyncio
 import hashlib
+import logging
 import random
+import time
 import traceback
 import unicodedata
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -57,6 +59,8 @@ from app.services.transfer_naming import allocate_available_name, collision_key
 from app.services.transfer_outcomes import CopyOutcome, FileCopyResult, SourceFileError
 from app.services.transfer_progress import smb_manifest_progress_percent
 from app.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 def reserved_directory_names(parent_path: str, entries: list[dict[str, Any]]) -> set[str]:
@@ -110,6 +114,132 @@ class TransferExecutor:
             self.error_code = error_code
             self.message = message
             self.technical_details = technical_details or {}
+
+    async def _measure_stage(
+        self,
+        record: TransferRecord,
+        *,
+        code: str,
+        connection: ConnectionRecord,
+        role: str,
+        manifest_item: TransferManifestItemRecord,
+        operation: Callable[[], Awaitable[Any]],
+        bytes_count: int | None = None,
+    ) -> Any:
+        started_at = datetime.now(UTC)
+        started_tick = time.monotonic()
+        span_id: uuid.UUID | None = None
+        try:
+            span_id = await self.store.astart_transfer_metric_span(
+                record.id,
+                dispatch_token=self.dispatch_token,
+                attempt_count=record.attempt_count,
+                span_type="STAGE",
+                code=code,
+                manifest_item_id=manifest_item.id,
+                connection_id=connection.id,
+                provider_type=connection.provider_type,
+                connection_role=role,
+                started_at=started_at,
+            )
+        except Exception:
+            logger.warning("Could not start a transfer metric span")
+        try:
+            result = await operation()
+        except BaseException as exc:
+            if span_id is not None:
+                outcome = "INTERRUPTED" if isinstance(exc, asyncio.CancelledError) else "FAILED"
+                await self._finish_stage_metric(
+                    span_id,
+                    started_tick,
+                    outcome=outcome,
+                    bytes_count=None,
+                )
+            raise
+        if span_id is not None:
+            measured_bytes = bytes_count
+            if measured_bytes is None and isinstance(result, Path):
+                try:
+                    measured_bytes = result.stat().st_size
+                except OSError:
+                    measured_bytes = None
+            await self._finish_stage_metric(
+                span_id,
+                started_tick,
+                outcome="SUCCESS",
+                bytes_count=measured_bytes,
+            )
+        return result
+
+    async def _finish_stage_metric(
+        self,
+        span_id: uuid.UUID,
+        started_tick: float,
+        *,
+        outcome: str,
+        bytes_count: int | None,
+    ) -> None:
+        try:
+            await self.store.afinish_transfer_metric_span(
+                span_id,
+                dispatch_token=self.dispatch_token,
+                completed_at=datetime.now(UTC),
+                duration_ms=max(0, int((time.monotonic() - started_tick) * 1000)),
+                outcome=outcome,
+                bytes_count=bytes_count,
+                error_code="TRANSFER_STAGE_FAILED" if outcome == "FAILED" else None,
+            )
+        except Exception:
+            logger.warning("Could not finish a transfer metric span")
+
+    @asynccontextmanager
+    async def _measured_staging_area(
+        self,
+        record: TransferRecord,
+        manifest_item: TransferManifestItemRecord,
+        *,
+        expected_size: int | None,
+    ) -> AsyncIterator[Path]:
+        span_id: uuid.UUID | None = None
+        cleanup_tick: float | None = None
+        outcome = "SUCCESS"
+        try:
+            async with temporary_staging_area(
+                Path(self.settings.transfer_staging_path),
+                transfer_id=record.id,
+                expected_size=expected_size,
+                reserve_bytes=self.settings.transfer_staging_reserve_bytes,
+                margin_percent=self.settings.transfer_staging_margin_percent,
+            ) as area:
+                try:
+                    yield area
+                finally:
+                    started_at = datetime.now(UTC)
+                    try:
+                        span_id = await self.store.astart_transfer_metric_span(
+                            record.id,
+                            dispatch_token=self.dispatch_token,
+                            attempt_count=record.attempt_count,
+                            span_type="STAGE",
+                            code="STAGING_CLEANUP",
+                            manifest_item_id=manifest_item.id,
+                            started_at=started_at,
+                        )
+                    except Exception:
+                        logger.warning("Could not start a transfer metric span")
+                    if span_id is not None:
+                        cleanup_tick = time.monotonic()
+        except StagingCleanupError:
+            outcome = "FAILED"
+            raise
+        finally:
+            if span_id is not None and cleanup_tick is not None:
+                await self._finish_stage_metric(
+                    span_id,
+                    cleanup_tick,
+                    outcome=outcome,
+                    bytes_count=None,
+                )
 
     async def execute(self, transfer_id: uuid.UUID) -> bool:
         record = await self.store.aget_transfer(transfer_id)
@@ -2503,21 +2633,26 @@ class TransferExecutor:
             reserve_size = google_export_limit if unknown_google_export else item.size_bytes
             provider_stage = "SOURCE_DOWNLOAD"
             try:
-                async with temporary_staging_area(
-                    Path(self.settings.transfer_staging_path),
-                    transfer_id=record.id,
+                async with self._measured_staging_area(
+                    record,
+                    manifest_item,
                     expected_size=reserve_size,
-                    reserve_bytes=self.settings.transfer_staging_reserve_bytes,
-                    margin_percent=self.settings.transfer_staging_margin_percent,
                 ) as area:
                     try:
-                        local_file = await self._download_versioned_source(
+                        local_file = await self._measure_stage(
                             record,
-                            source_connection,
-                            source,
-                            item,
-                            area,
-                            max_bytes=max_bytes,
+                            code="SOURCE_DOWNLOAD",
+                            connection=source_connection,
+                            role="SOURCE",
+                            manifest_item=manifest_item,
+                            operation=lambda: self._download_versioned_source(
+                                record,
+                                source_connection,
+                                source,
+                                item,
+                                area,
+                                max_bytes=max_bytes,
+                            ),
                         )
                     except FileNotFoundError:
                         raise SourceFileError("SOURCE_ITEM_NOT_FOUND") from None
@@ -2537,7 +2672,19 @@ class TransferExecutor:
                         )
                         manifest_item.size_bytes = actual_size
                         record.bytes_total += actual_size
-                    digest = await _sha256_file(local_file, self.should_cancel)
+
+                    async def hash_source(file_path: Path = local_file) -> str:
+                        return await _sha256_file(file_path, self.should_cancel)
+
+                    digest = await self._measure_stage(
+                        record,
+                        code="SOURCE_HASH",
+                        connection=source_connection,
+                        role="SOURCE",
+                        manifest_item=manifest_item,
+                        operation=hash_source,
+                        bytes_count=actual_size,
+                    )
                     destination_name = PurePosixPath(manifest_item.destination_path).name
                     if (
                         not self._uses_seafile_api(destination_connection)
@@ -2561,12 +2708,29 @@ class TransferExecutor:
                         # provider. Reconcile the destination before accepting success;
                         # never repeat a write merely because it was not immediately listed.
                         safe_to_retry_copy = False
-                        actual_destination = await self._upload_versioned_destination(
+
+                        async def upload_destination(
+                            file_path: Path = local_file,
+                            connection: ConnectionRecord = destination_connection,
+                            provider: Any = destination,
+                            destination_path: str = manifest_item.destination_path,
+                        ) -> str | None:
+                            return await self._upload_versioned_destination(
+                                record,
+                                connection,
+                                provider,
+                                file_path,
+                                destination_path,
+                            )
+
+                        actual_destination = await self._measure_stage(
                             record,
-                            destination_connection,
-                            destination,
-                            local_file,
-                            manifest_item.destination_path,
+                            code="DESTINATION_UPLOAD",
+                            connection=destination_connection,
+                            role="DESTINATION",
+                            manifest_item=manifest_item,
+                            operation=upload_destination,
+                            bytes_count=actual_size,
                         )
                     except Exception as upload_error:
                         existing = await self._find_versioned_destination_item(
@@ -2611,33 +2775,54 @@ class TransferExecutor:
                         raise upload_error
 
                     provider_stage = "DESTINATION_VERIFY"
-                    if actual_destination != manifest_item.destination_path:
-                        raise RuntimeError("Provider did not create the assigned destination name")
-                    destination_item = await self._find_versioned_destination_item(
-                        destination, manifest_item.destination_path
+
+                    async def verify_destination(
+                        actual_destination_path: str | None = actual_destination,
+                        destination_path: str = manifest_item.destination_path,
+                        file_size: int = actual_size,
+                        expected_digest: str = digest,
+                    ) -> str:
+                        if actual_destination_path != destination_path:
+                            raise RuntimeError(
+                                "Provider did not create the assigned destination name"
+                            )
+                        destination_item = await self._find_versioned_destination_item(
+                            destination, destination_path
+                        )
+                        if (
+                            destination_item is None
+                            or destination_item.is_dir
+                            or (
+                                destination_item.size_bytes is not None
+                                and destination_item.size_bytes != file_size
+                            )
+                            or (
+                                destination_item.size_bytes is None
+                                and destination_connection.provider_type != "SEAFILE"
+                            )
+                        ):
+                            raise RuntimeError("Destination size verification failed")
+                        if self._uses_seafile_api(destination_connection):
+                            remote_digest = await destination.sha256(
+                                destination_path,
+                                should_cancel=self.should_cancel,
+                            )
+                            if remote_digest != expected_digest:
+                                raise RuntimeError("Destination content verification failed")
+                            return "SHA256"
+                        return "SIZE"
+
+                    verified_by = await self._measure_stage(
+                        record,
+                        code="DESTINATION_VERIFY",
+                        connection=destination_connection,
+                        role="DESTINATION",
+                        manifest_item=manifest_item,
+                        operation=verify_destination,
+                        bytes_count=(
+                            actual_size if self._uses_seafile_api(destination_connection) else None
+                        ),
                     )
-                    if (
-                        destination_item is None
-                        or destination_item.is_dir
-                        or (
-                            destination_item.size_bytes is not None
-                            and destination_item.size_bytes != actual_size
-                        )
-                        or (
-                            destination_item.size_bytes is None
-                            and destination_connection.provider_type != "SEAFILE"
-                        )
-                    ):
-                        raise RuntimeError("Destination size verification failed")
-                    verified_by = "SIZE"
-                    if self._uses_seafile_api(destination_connection):
-                        remote_digest = await destination.sha256(
-                            manifest_item.destination_path,
-                            should_cancel=self.should_cancel,
-                        )
-                        if remote_digest != digest:
-                            raise RuntimeError("Destination content verification failed")
-                        verified_by = "SHA256"
                     await self.store.aupdate_transfer_manifest_item(
                         record.id,
                         manifest_item.id,

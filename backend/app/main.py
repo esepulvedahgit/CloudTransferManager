@@ -9,7 +9,7 @@ import secrets
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
@@ -365,6 +365,8 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
     app.state.event_bus = RedisEventBus(app.state.redis_client) if app.state.redis_client else None
     app.state.tasks = set()
     app.state.cancel_requests = set()
+    app.state.metrics_cache = {}
+    app.state.metrics_cache_lock = asyncio.Lock()
     app.state.password_service = PasswordService()
     app.state.dummy_password_hash = _dummy_password_hash()
     app.state.audit_logger = AuditLogger(app.state.store)
@@ -708,6 +710,185 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
                 status_code=503, detail="Servicio de evaluación no disponible"
             ) from exc
         return {"status": "ready"}
+
+    async def dashboard_system_snapshot() -> dict[str, Any]:
+        if config.app_env.lower() != "production":
+            return {
+                "environment": "development",
+                "status": "SIMULATED",
+                "services": {
+                    "database": "simulated",
+                    "redis": "not_configured",
+                    "workers": "not_configured",
+                    "beat": "not_configured",
+                },
+                "queues": [],
+                "notifications": {},
+                "evaluations": {},
+                "connections": [],
+            }
+
+        services: dict[str, str] = {}
+        queues: list[dict[str, Any]] = []
+        try:
+            await app.state.store.acheck()
+            services["database"] = "ready"
+        except Exception:
+            services["database"] = "unavailable"
+        try:
+            if app.state.event_bus is None or not await app.state.event_bus.ping():
+                raise RuntimeError("Redis unavailable")
+            services["redis"] = "ready"
+        except Exception:
+            services["redis"] = "unavailable"
+
+        try:
+            from app.worker import celery_app
+
+            responses = await asyncio.to_thread(celery_app.control.ping, timeout=1)
+            inspector = celery_app.control.inspect(timeout=1)
+            active_queues = (
+                await asyncio.to_thread(inspector.active_queues) if inspector is not None else None
+            )
+            queue_names = {
+                str(queue.get("name"))
+                for worker_queues in (active_queues or {}).values()
+                for queue in worker_queues
+                if isinstance(queue, dict) and queue.get("name")
+            }
+            services["workers"] = (
+                "ready" if responses and {"transfers", "control"} <= queue_names else "degraded"
+            )
+            services["beat"] = (
+                "ready" if await app.state.event_bus.beat_is_alive() else "unavailable"
+            )
+            for name in ("transfers", "control", "evaluations", "notifications"):
+                queues.append(
+                    {
+                        "name": name,
+                        "consumer_ready": name in queue_names,
+                        "pending": (
+                            int(await app.state.redis_client.llen(name))
+                            if app.state.redis_client is not None
+                            else None
+                        ),
+                    }
+                )
+        except Exception:
+            services["workers"] = "unavailable"
+            services["beat"] = "unavailable"
+
+        summaries = await app.state.store.ametric_system_summary()
+        unavailable = sum(value != "ready" for value in services.values())
+        return {
+            "environment": "production",
+            "status": "READY" if unavailable == 0 else "DEGRADED",
+            "services": services,
+            "queues": queues,
+            **summaries,
+        }
+
+    @app.get("/api/v1/metrics/dashboard")
+    async def transfer_metrics_dashboard(
+        request: Request,
+        period: Literal["today", "7d", "30d", "90d", "custom"] = Query(
+            default="30d", alias="range"
+        ),
+        date_from: date | None = Query(default=None),
+        date_to: date | None = Query(default=None),
+        timezone: str = Query(default="UTC", min_length=1, max_length=64),
+        source_provider: Literal["MEGA", "GOOGLE_DRIVE", "SEAFILE", "SMB", "NEXTCLOUD", "MOCK"]
+        | None = None,
+        destination_provider: Literal["MEGA", "GOOGLE_DRIVE", "SEAFILE", "SMB", "NEXTCLOUD", "MOCK"]
+        | None = None,
+        source_connection_id: uuid.UUID | None = None,
+        destination_connection_id: uuid.UUID | None = None,
+        include_mock: bool = False,
+        user_id: uuid.UUID | None = None,
+        user: UserAccount = Depends(current_user),
+    ) -> dict[str, Any]:
+        if user.role != "ADMIN" and user_id is not None:
+            raise HTTPException(status_code=403, detail="Permisos insuficientes")
+        scoped_user_id = user_id if user.role == "ADMIN" else user.id
+        if user_id is not None and await app.state.store.aget_user(user_id) is None:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        if user.role != "ADMIN":
+            for connection_id in (source_connection_id, destination_connection_id):
+                if connection_id is not None and not await app.state.store.ahas_connection_access(
+                    user.id, connection_id
+                ):
+                    raise HTTPException(status_code=404, detail="Conexión no encontrada")
+        try:
+            zone = ZoneInfo(timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise HTTPException(status_code=422, detail="Zona horaria no válida") from exc
+
+        local_today = datetime.now(zone).date()
+        if date_from is not None or date_to is not None:
+            if date_from is None or date_to is None:
+                raise HTTPException(status_code=422, detail="Indica ambas fechas del rango")
+            start_day, end_day = date_from, date_to
+            period = "custom"
+        elif period == "custom":
+            raise HTTPException(status_code=422, detail="El rango personalizado requiere fechas")
+        elif period == "today":
+            start_day = end_day = local_today
+        else:
+            days = {"7d": 7, "30d": 30, "90d": 90}[period]
+            start_day, end_day = local_today - timedelta(days=days - 1), local_today
+        if start_day > end_day or (end_day - start_day).days >= 366:
+            raise HTTPException(status_code=422, detail="El rango máximo es de 366 días")
+        start_at = datetime.combine(start_day, datetime.min.time(), zone).astimezone(UTC)
+        end_at = datetime.combine(
+            end_day + timedelta(days=1), datetime.min.time(), zone
+        ).astimezone(UTC)
+        filter_values = {
+            "range": period,
+            "from": start_day.isoformat(),
+            "to": end_day.isoformat(),
+            "timezone": timezone,
+            "source_provider": source_provider,
+            "destination_provider": destination_provider,
+            "source_connection_id": str(source_connection_id) if source_connection_id else None,
+            "destination_connection_id": str(destination_connection_id)
+            if destination_connection_id
+            else None,
+            "include_mock": include_mock,
+            "user_id": str(scoped_user_id) if scoped_user_id else None,
+        }
+        cache_key = (str(user.id), user.role, *filter_values.values())
+        now = datetime.now(UTC)
+        async with app.state.metrics_cache_lock:
+            cached = app.state.metrics_cache.get(cache_key)
+            if cached is not None and (now - cached[0]).total_seconds() < 15:
+                return cast(dict[str, Any], cached[1])
+
+        payload = cast(
+            dict[str, Any],
+            await app.state.store.ametric_dashboard(
+                requested_by=scoped_user_id,
+                date_from=start_at,
+                date_to=end_at,
+                timezone=timezone,
+                source_provider=source_provider,
+                destination_provider=destination_provider,
+                source_connection_id=source_connection_id,
+                destination_connection_id=destination_connection_id,
+                include_mock=include_mock,
+            ),
+        )
+        payload.update(
+            {
+                "generated_at": now.isoformat(),
+                "filters": filter_values,
+                "system": await dashboard_system_snapshot() if user.role == "ADMIN" else None,
+            }
+        )
+        async with app.state.metrics_cache_lock:
+            if len(app.state.metrics_cache) >= 256:
+                app.state.metrics_cache.clear()
+            app.state.metrics_cache[cache_key] = (now, payload)
+        return payload
 
     @app.get("/api/v1/auth/csrf")
     async def csrf_token(request: Request, response: Response) -> dict[str, str]:

@@ -95,3 +95,10 @@ Accept: text/event-stream
   - `test_rclone_json_stats_parser`: Convierte correctamente las líneas de log JSON de Rclone en el modelo de métricas de telemetría.
 - **Integración:**
   - `test_sse_stream_receives_redis_pubsub_message`: Publicar un evento en Redis resulta en un frame SSE emitido al cliente HTTP.
+
+## 6. Métricas históricas
+- El tablero persistente `/metrics` usa `GET /api/v1/metrics/dashboard`; no modifica ni sustituye el canal SSE.
+- Los contadores de trabajo se agrupan por fecha de creación. La actividad de copia se agrupa por `copied_at` real y por zona horaria solicitada; si el dato histórico no existe queda fuera de la serie diaria y se informa en cobertura.
+- Los tiempos por etapa se persisten con `attempt_count` y `dispatch_token`, sin rutas, credenciales o texto crudo del proveedor. Un worker con intento/token obsoleto no puede crear ni cerrar una medición.
+- Las etapas medidas incluyen descarga/hash del origen, carga/verificación del destino y limpieza local de staging; bytes/s solo se calcula cuando se conoce el volumen procesado.
+- El tablero ADMIN añade salud de servicios, colas, conexiones, notificaciones y evaluaciones. El ambiente no productivo identifica los datos de salud como simulados.

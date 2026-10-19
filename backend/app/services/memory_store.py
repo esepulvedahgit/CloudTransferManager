@@ -267,6 +267,7 @@ class TransferManifestItemRecord:
     omitted_by: uuid.UUID | None = None
     last_failure_stage: str | None = None
     last_failure_attempt: int | None = None
+    copied_at: datetime | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def public_dict(self) -> dict[str, Any]:
@@ -325,6 +326,7 @@ class MemoryStore:
         self.transfer_events: dict[uuid.UUID, list[dict[str, Any]]] = {}
         self.notification_outbox: dict[uuid.UUID, dict[str, Any]] = {}
         self.transfer_manifest_items: dict[tuple[uuid.UUID, str], TransferManifestItemRecord] = {}
+        self.metric_spans: list[dict[str, Any]] = []
         self.transfer_idempotency: dict[tuple[uuid.UUID, uuid.UUID], tuple[str, uuid.UUID]] = {}
         self.audit_events: list[dict[str, Any]] = []
         self._evaluation_claim_lock = asyncio.Lock()
@@ -333,6 +335,11 @@ class MemoryStore:
 
     async def acheck(self) -> bool:
         return True
+
+    async def ametric_dashboard(self, **filters: Any) -> dict[str, Any]:
+        from app.services.transfer_metrics import memory_dashboard
+
+        return memory_dashboard(self, **filters)
 
     async def aget_smtp_settings(self) -> SMTPSettingsRecord | None:
         return self.smtp_settings
@@ -499,6 +506,26 @@ class MemoryStore:
                 ),
             )
         self.transfers[record.id] = record
+        self.metric_spans.append(
+            {
+                "id": uuid.uuid4(),
+                "transfer_job_id": record.id,
+                "manifest_item_id": None,
+                "dispatch_token": None,
+                "attempt_count": record.attempt_count,
+                "span_type": "STATE",
+                "code": record.status,
+                "provider_type": None,
+                "connection_role": None,
+                "connection_id": None,
+                "started_at": record.created_at,
+                "completed_at": None,
+                "duration_ms": None,
+                "bytes_count": None,
+                "outcome": "OPEN",
+                "error_code": None,
+            }
+        )
         return record
 
     def get_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
@@ -1405,11 +1432,146 @@ class MemoryStore:
             _TERMINAL_TRANSFER_STATUSES
         ):
             transfer.status = "PAUSING"
+        self._record_transfer_state(transfer)
         transfer.state_version = (
             current.state_version + 1 if current is not None else transfer.state_version + 1
         )
         self.transfers[transfer.id] = transfer
         self._ensure_notification_outbox(transfer)
+        return True
+
+    def _record_transfer_state(self, transfer: TransferRecord) -> None:
+        now = datetime.now(UTC)
+        open_span = next(
+            (
+                span
+                for span in reversed(self.metric_spans)
+                if span["transfer_job_id"] == transfer.id
+                and span["span_type"] == "STATE"
+                and span["outcome"] == "OPEN"
+            ),
+            None,
+        )
+        code = transfer.status
+        wait_reason = transfer.wait_reason
+        if (
+            open_span is not None
+            and open_span["code"] == code
+            and open_span.get("wait_reason") == wait_reason
+        ):
+            return
+        if open_span is not None:
+            open_span["completed_at"] = now
+            open_span["duration_ms"] = max(
+                0, int((now - open_span["started_at"]).total_seconds() * 1000)
+            )
+            open_span["outcome"] = "SUCCESS"
+        terminal = code in {"COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "CANCELLED"}
+        self.metric_spans.append(
+            {
+                "id": uuid.uuid4(),
+                "transfer_job_id": transfer.id,
+                "manifest_item_id": None,
+                "dispatch_token": transfer.dispatch_token,
+                "attempt_count": transfer.attempt_count,
+                "span_type": "STATE",
+                "code": code,
+                "wait_reason": wait_reason,
+                "provider_type": None,
+                "connection_role": None,
+                "connection_id": None,
+                "started_at": now,
+                "completed_at": now if terminal else None,
+                "duration_ms": None,
+                "bytes_count": None,
+                "outcome": "SUCCESS" if terminal else "OPEN",
+                "error_code": None,
+            }
+        )
+
+    async def astart_transfer_metric_span(
+        self,
+        transfer_id: uuid.UUID,
+        *,
+        dispatch_token: uuid.UUID | None,
+        attempt_count: int,
+        span_type: str,
+        code: str,
+        manifest_item_id: uuid.UUID | None = None,
+        connection_id: uuid.UUID | None = None,
+        provider_type: str | None = None,
+        connection_role: str | None = None,
+        started_at: datetime | None = None,
+    ) -> uuid.UUID | None:
+        transfer = self.transfers.get(transfer_id)
+        if (
+            transfer is None
+            or transfer.status in {"COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "CANCELLED"}
+            or transfer.dispatch_token != dispatch_token
+            or transfer.attempt_count != attempt_count
+        ):
+            return None
+        span_id = uuid.uuid4()
+        self.metric_spans.append(
+            {
+                "id": span_id,
+                "transfer_job_id": transfer_id,
+                "manifest_item_id": manifest_item_id,
+                "dispatch_token": dispatch_token,
+                "attempt_count": attempt_count,
+                "span_type": span_type,
+                "code": code,
+                "provider_type": provider_type,
+                "connection_role": connection_role,
+                "connection_id": connection_id,
+                "started_at": started_at or datetime.now(UTC),
+                "completed_at": None,
+                "duration_ms": None,
+                "bytes_count": None,
+                "outcome": "OPEN",
+                "error_code": None,
+            }
+        )
+        return span_id
+
+    async def afinish_transfer_metric_span(
+        self,
+        span_id: uuid.UUID,
+        *,
+        dispatch_token: uuid.UUID | None,
+        completed_at: datetime,
+        duration_ms: int,
+        outcome: str,
+        bytes_count: int | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        span = next((span for span in self.metric_spans if span["id"] == span_id), None)
+        transfer = self.transfers.get(span["transfer_job_id"]) if span is not None else None
+        if (
+            span is None
+            or transfer is None
+            or span["outcome"] != "OPEN"
+            or span["dispatch_token"] != dispatch_token
+            or transfer.dispatch_token != dispatch_token
+            or transfer.attempt_count != span["attempt_count"]
+            or outcome not in {"SUCCESS", "FAILED", "INTERRUPTED"}
+        ):
+            return False
+        span.update(
+            {
+                "completed_at": completed_at,
+                "duration_ms": max(0, duration_ms),
+                "outcome": outcome,
+                "bytes_count": max(0, bytes_count) if bytes_count is not None else None,
+                "error_code": (
+                    error_code
+                    if error_code
+                    and len(error_code) <= 64
+                    and error_code.replace("_", "").isalnum()
+                    else None
+                ),
+            }
+        )
         return True
 
     def _ensure_notification_outbox(self, transfer: TransferRecord) -> None:
@@ -2869,6 +3031,8 @@ class MemoryStore:
         item.verified_by = verified_by
         item.error_code = error_code
         item.updated_at = datetime.now(UTC)
+        if status == "COPIED":
+            item.copied_at = item.copied_at or item.updated_at
         if status == "FAILED":
             item.last_failure_stage = failure_stage
             item.last_failure_attempt = failure_attempt

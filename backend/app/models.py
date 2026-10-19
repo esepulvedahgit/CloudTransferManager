@@ -340,6 +340,7 @@ class TransferManifestItem(Base):
     )
     last_failure_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_failure_attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    copied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -373,6 +374,49 @@ class TransferEvent(Base):
     item_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     correlation_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), default=uuid.uuid4)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TransferMetricSpan(Base):
+    __tablename__ = "transfer_metric_spans"
+    __table_args__ = (
+        CheckConstraint("span_type IN ('STATE', 'STAGE')", name="ck_transfer_metric_span_type"),
+        CheckConstraint(
+            "outcome IN ('OPEN', 'SUCCESS', 'FAILED', 'INTERRUPTED')",
+            name="ck_transfer_metric_outcome",
+        ),
+        CheckConstraint(
+            "duration_ms IS NULL OR duration_ms >= 0", name="ck_transfer_metric_duration"
+        ),
+        CheckConstraint("bytes_count IS NULL OR bytes_count >= 0", name="ck_transfer_metric_bytes"),
+        Index("ix_transfer_metric_time", "span_type", "code", "started_at"),
+        Index("ix_transfer_metric_transfer", "transfer_job_id", "started_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    transfer_job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("transfer_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    manifest_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("transfer_manifest_items.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    dispatch_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    span_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    code: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    connection_role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    wait_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    connection_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("storage_connections.id", ondelete="SET NULL"), nullable=True
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    bytes_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False, default="OPEN")
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class TransferNotificationOutbox(Base):
