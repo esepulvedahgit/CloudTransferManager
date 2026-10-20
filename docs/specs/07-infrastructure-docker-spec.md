@@ -64,6 +64,7 @@ El servicio `evaluation-worker` consume la cola Celery `evaluations` con concurr
 ## 3. Configuración de Secretos (Docker Secrets)
 
 Para evitar almacenar credenciales sensibles en variables de entorno, Compose monta los secretos como archivos en `/run/secrets/`. Los entrypoints del backend, los workers y el respaldo empiezan brevemente como root para copiarlos a un `tmpfs` privado en `/run/ctm-secrets/`, con permisos `0600`, y preparar sus directorios runtime; luego bajan privilegios mediante `gosu`. La API y Celery corren como `ctm` (UID `10001`); el respaldo corre como `postgres`. La excepción de Trivy `DS-0002` está limitada a las instrucciones `USER root` de esas dos imágenes y documenta el bootstrap requerido. Esto evita depender de remapeos de UID/GID que Compose no ofrece para secretos respaldados por archivos locales.
+- La imagen de respaldo recompila el módulo oficial `gosu` 1.19 con Go 1.26.9 y reemplaza el binario heredado de `postgres:16-bookworm`, que fue compilado con Go 1.24.6 y activaba hallazgos de CVE del runtime en Trivy. Mantener actualizado `GO_VERSION` en `ops/backup/Dockerfile` cuando se publiquen parches de Go.
 - `master_key`: Clave simétrica de 256 bits para cifrar las credenciales de proveedores.
 - `postgres_password`: Contraseña de la base de datos PostgreSQL.
 - `smtp_password`: Contraseña para autenticar con el servidor de correo.
