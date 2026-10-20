@@ -55,6 +55,22 @@ Las programaciones no son recurrentes. Una programación tampoco crea conectivid
 
 Configuración y evidencia de la instalación local: [CloudLab](docs/deployment-cloudlab.md).
 
+Para una instalación nueva, ejecuta desde la raíz del repositorio:
+
+```bash
+bash scripts/deploy.sh
+```
+
+El [script de despliegue en `main`](https://github.com/esepulvedahgit/CloudTransferManager/blob/main/scripts/deploy.sh) solicita el dominio DNS, genera un certificado autofirmado con ese nombre en el SAN, crea `.env` con HTTPS en el puerto 443 y genera los secretos locales con permisos restringidos. Después construye los contenedores, espera a que estén saludables y comprueba `/health/ready`. En una terminal interactiva también solicita el correo del administrador y la CLI pide su contraseña inicial. Si lo repites con el mismo dominio, conserva las claves y el certificado; si detecta un dominio distinto o secretos incompletos, se detiene. No ejecutes el script sobre una instalación cuyo certificado corresponda a otro dominio sin planificar su cambio.
+
+El nombre solicitado debe resolverse a la IP del host Docker desde cada equipo cliente: configura el DNS interno o el archivo `hosts` de esos equipos. El script no registra dominios ni modifica el DNS. Como el certificado es autofirmado, instala `certs/fullchain.pem` como certificado de confianza en los clientes, o sustitúyelo por un certificado confiable para ese mismo dominio. El respaldo MEGA S4 queda desactivado; el script crea su clave local y archivos de credenciales vacíos, pero las claves de acceso al servicio S4 deben obtenerse de MEGA antes de activarlo. Guarda copias externas protegidas de `secrets/master_key` y `secrets/backup_encryption_key`.
+
+Si ejecutaste el script sin terminal interactiva, crea el administrador inicial con la CLI. Esta solicita la contraseña sin mostrarla:
+
+```bash
+docker compose exec backend python -m app.cli create-admin --username admin --email admin@tu-dominio.example
+```
+
 ### Requisitos
 
 - Docker Engine y Docker Compose v2.
@@ -62,7 +78,7 @@ Configuración y evidencia de la instalación local: [CloudLab](docs/deployment-
 - Espacio suficiente en el almacenamiento de Docker para las bases de datos, logs y el staging temporal de transferencias.
 - Conectividad desde el host Docker hacia los proveedores configurados. Para SMB, prepara también la ruta, DNS y reglas de firewall hacia el NAS.
 
-### Primera instalación
+### Instalación manual
 
 Ejecuta los comandos desde la raíz del repositorio. Primero crea `.env` y define `APP_BASE_URL` con la URL HTTPS exacta que usarán los usuarios. Para probar en el mismo host con los puertos predeterminados, usa `https://localhost:8443`:
 
