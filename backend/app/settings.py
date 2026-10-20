@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -19,11 +20,25 @@ class Settings(BaseSettings):
     postgres_password_file: str | None = None
     redis_url: str = "redis://redis:6379/0"
     rclone_binary: str = "/usr/bin/rclone"
+    smb_allowed_targets: str = ""
+    smb_interactive_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    nextcloud_max_concurrent: int = Field(default=1, ge=1, le=8)
+    nextcloud_bandwidth_limit: str = Field(default="8M", pattern=r"^[1-9][0-9]{0,3}(?:K|M|G)?$")
+    nextcloud_chunk_size: str = Field(
+        default="10Mi",
+        pattern=r"^(?:(?:10|32|64|128|256|512)Mi|1Gi)$",
+    )
+    nextcloud_job_timeout_seconds: int = Field(default=43200, ge=60, le=86400)
     megacmd_binary_dir: str = "/usr/bin"
     transfer_temp_path: str = "/var/lib/cloud-transfer/tmp"
     transfer_staging_path: str = "/var/lib/cloud-transfer/staging"
-    transfer_max_retries: int = 5
-    transfer_max_concurrent: int = 2
+    transfer_max_retries: int = Field(default=5, ge=0)
+    transfer_max_concurrent: int = Field(default=1, ge=1)
+    transfer_max_files: int = Field(default=5000, ge=1)
+    smb_transfer_max_files: int = Field(default=100000, ge=1)
+    transfer_max_file_bytes: int = Field(default=0, ge=0)
+    transfer_staging_reserve_bytes: int = Field(default=1073741824, ge=0)
+    transfer_staging_margin_percent: int = Field(default=20, ge=0, le=100)
     app_base_url: str = ""
     smtp_host: str = ""
     smtp_port: int = 587

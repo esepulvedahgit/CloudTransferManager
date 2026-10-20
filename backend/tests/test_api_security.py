@@ -1,7 +1,10 @@
+import uuid
+
 import httpx
 import pytest
 
 from app.main import create_app
+from app.providers.mock import MockStorageProvider
 from app.security.passwords import PasswordService
 from app.services.memory_store import MemoryStore
 from app.settings import Settings
@@ -102,3 +105,72 @@ async def test_explorer_rejects_path_traversal():
         )
 
     assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_transfer_request_is_queued_without_checking_remote_source(monkeypatch):
+    store = MemoryStore()
+    user = store.add_user(
+        username="operator",
+        email="operator@example.test",
+        password_hash=PasswordService().hash("A-Strong-Password123!"),
+        role="ADMIN",
+    )
+    source = store.create_connection("Source", "MOCK", user.id)
+    destination = store.create_connection("Destination", "MOCK", user.id)
+    app = create_app(
+        Settings(
+            app_env="production",
+            app_secret_key="test-secret-key",
+            session_cookie_secure=False,
+        ),
+        store=store,
+    )
+    app.state.event_bus = None
+    monkeypatch.setattr("app.worker.run_transfer.delay", lambda _transfer_id: None)
+
+    async def remote_check_must_not_run(self, path):
+        del self, path
+        raise AssertionError("the HTTP request must not inspect remote storage")
+
+    monkeypatch.setattr(MockStorageProvider, "get_item", remote_check_must_not_run)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        csrf = (await client.get("/api/v1/auth/csrf")).json()["csrf_token"]
+        await client.post(
+            "/api/v1/auth/login",
+            json={"username_or_email": "operator", "password": "A-Strong-Password123!"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        response = await client.post(
+            "/api/v1/transfers",
+            json={
+                "source_connection_id": str(source.id),
+                "destination_connection_id": str(destination.id),
+                "source_paths": ["/some/remote/file.bin"],
+                "destination_path": "/backup",
+            },
+            headers={
+                "X-CSRF-Token": client.cookies["ctm_csrf"],
+                "Idempotency-Key": str(uuid.uuid4()),
+            },
+        )
+        too_many_paths = await client.post(
+            "/api/v1/transfers",
+            json={
+                "source_connection_id": str(source.id),
+                "destination_connection_id": str(destination.id),
+                "source_paths": [f"/item-{index}" for index in range(101)],
+                "destination_path": "/backup",
+            },
+            headers={
+                "X-CSRF-Token": client.cookies["ctm_csrf"],
+                "Idempotency-Key": str(uuid.uuid4()),
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "QUEUED"
+    assert too_many_paths.status_code == 422
+    assert "100 rutas" in too_many_paths.json()["detail"][0]["msg"]

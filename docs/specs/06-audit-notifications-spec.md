@@ -28,12 +28,16 @@ CREATE INDEX idx_audit_events_action ON audit_events(action);
 CREATE INDEX idx_audit_events_created_at ON audit_events(created_at);
 ```
 
+### Estado de implementación
+La aplicación agrega eventos y expone solo una consulta administrativa; no tiene rutas para editarlos o borrarlos. El esquema actual no define un trigger ni permisos SQL que impidan modificar/borrar filas directamente. Por lo tanto, el registro es append-only en el flujo de aplicación, pero la inmutabilidad frente a una cuenta con acceso de escritura a PostgreSQL sigue pendiente si se exige como garantía de seguridad.
+
 ### Eventos Auditados Obligatoriamente:
 - Inicio de sesión (exitoso y fallido) y cierre de sesión.
 - Cambio y restablecimiento de contraseña.
 - Creación, modificación y desactivación de usuarios.
 - Creación, prueba, edición y desactivación de conexiones.
 - Creación, cancelación y reintento de transferencias.
+- Omisión manual de archivo (`TRANSFER_FILE_OMITTED`), reanudación resultante, aceptación de omisiones de un intento padre (`TRANSFER_PARENT_OMISSIONS_ACCEPTED`) y reintento selectivo (`TRANSFER_OMITTED_FILES_RETRIED`). Estas transiciones comparten la transacción con su auditoría y conservan la referencia UUID al manifiesto; los reintentos mantienen la omisión anterior en el historial de eventos.
 - Modificación de ajustes de sistema o configuración SMTP.
 - Accesos no autorizados (intentos 403 / 401).
 
@@ -70,6 +74,15 @@ CREATE TABLE transfer_events (
 
 ## 5. Notificaciones por Correo Electrónico (SMTP)
 
+### Configuración de Administración
+- Los administradores gestionan la configuración global desde una subpestaña SMTP del diálogo Administración.
+- `GET /api/v1/settings/smtp` devuelve host, puerto, STARTTLS, remitente e indicador `credentials_configured`; nunca devuelve usuario ni contraseña. `PUT` actualiza esos valores y `POST /api/v1/settings/smtp/test` prueba el borrador sin guardarlo ni enviar un mensaje.
+- Solo el rol `ADMIN` puede leer, probar o modificar la configuración. Las mutaciones requieren protección CSRF.
+- Si no existe un registro guardado, la configuración y la contraseña montada como Docker Secret siguen tomando sus valores del entorno actual. Después de guardar, los workers usan el registro de PostgreSQL para los siguientes correos.
+- Usuario y contraseña se cifran juntos mediante AES-256-GCM envelope con la clave maestra del sistema. Los campos de host, puerto, TLS y remitente no son secretos.
+- Credenciales omitidas o vacías conservan las credenciales vigentes. La prueba autentica solo cuando existen credenciales y devuelve un resultado genérico ante fallos SMTP, TLS, autenticación o timeout.
+- Cada actualización registra `SMTP_SETTINGS_UPDATED`. Sus metadatos contienen nombres de campos cambiados, nunca valores SMTP ni credenciales.
+
 ### Triggers de Envío:
 - Transferencia Completada (`COMPLETED`).
 - Transferencia Completada con Advertencias (`COMPLETED_WITH_WARNINGS`).
@@ -81,6 +94,8 @@ CREATE TABLE transfer_events (
 - El envío de correos se procesa en segundo plano como una tarea Celery separada.
 - Un fallo en el servidor SMTP **NUNCA** debe marcar una transferencia exitosa como fallida.
 - Los correos no contienen rutas temporales locales ni stack traces técnicos.
+- El snapshot terminal del outbox fija `omitted` y `omitted_bytes` junto con estado y bytes transferidos. Una notificación pendiente describe el intento que la creó aunque luego se vuelvan a intentar omisiones. El correo presenta cantidades agregadas y no incluye las rutas de los archivos omitidos.
+- Diagnósticos MEGAcmd guardan solo código de salida, categoría/cobertura segura y reintentabilidad; no se persiste texto crudo de stdout/stderr ni rutas locales/remotas obtenidas de la salida.
 
 ---
 

@@ -5,6 +5,7 @@ import re
 import stat
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
@@ -33,6 +34,7 @@ class RcloneCommandError(RuntimeError):
         "502",
         "503",
         "504",
+        "423",
         "rate limit",
         "network is unreachable",
     )
@@ -49,6 +51,54 @@ class RcloneCommandError(RuntimeError):
             return False
         return any(marker in message for marker in self._retryable_markers)
 
+    @property
+    def source_item_missing(self) -> bool:
+        message = self._stderr.decode("utf-8", errors="ignore").casefold()
+        return any(
+            marker in message
+            for marker in (
+                "no such file or directory",
+                "object not found",
+                "source file not found",
+                "not found",
+            )
+        )
+
+    @property
+    def diagnostic_details(self) -> dict[str, list[int] | list[str]]:
+        """Fixed diagnostic values only: never provider messages, URLs or credentials."""
+        message = self._stderr.decode("utf-8", errors="ignore").casefold()
+        status_patterns = (
+            r"\b(?:http(?:/[12](?:\.\d)?)?\s+|status(?: code)?[\s:=]+)([45]\d\d)\b",
+            r"\b([45]\d\d)\s+(?:bad request|forbidden|unauthorized|not found|locked|"
+            r"too many requests|service unavailable|bad gateway|gateway timeout|"
+            r"insufficient storage|request entity too large)\b",
+        )
+        statuses = {
+            int(match.group(1)) for pattern in status_patterns
+            for match in re.finditer(pattern, message)
+        }
+        operations = {
+            "UPLOAD_CHUNK": ("uploading chunk",),
+            "FINALIZE_UPLOAD": ("assembling chunks", "merging chunks", "move failed"),
+            "SET_MODIFICATION_TIME": ("modification time", "modtime", "proppatch"),
+            "CHECKSUM_VERIFICATION": ("corrupted on transfer", "hash differ", "checksum mismatch"),
+            "DOWNLOAD": ("failed to open source", "download failed"),
+        }
+        return {
+            "rclone_http_statuses": sorted(statuses),
+            "rclone_error_categories": ["FILENAME_TOO_LONG"] if any(
+                marker in message for marker in (
+                    "file name too long", "filename too long", "name is too long",
+                    "nombre del archivo es demasiado largo",
+                )
+            ) else [],
+            "rclone_operations": [
+                operation for operation, markers in operations.items()
+                if any(marker in message for marker in markers)
+            ],
+        }
+
 
 class RcloneCancelledError(RuntimeError):
     pass
@@ -58,27 +108,70 @@ class RcloneOutputLimitError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class RcloneExecutionProfile:
+    bandwidth_limit: str = "8M"
+    transfers: int = 1
+    checkers: int = 2
+    connect_timeout_seconds: int = 10
+    idle_timeout_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[1-9][0-9]{0,3}(?:K|M|G)?", self.bandwidth_limit):
+            raise ValueError("Invalid Rclone bandwidth limit")
+        if self.transfers != 1 or self.checkers != 2:
+            raise ValueError("Unsupported Rclone transfer profile")
+        if self.connect_timeout_seconds != 10 or self.idle_timeout_seconds != 60:
+            raise ValueError("Unsupported Rclone timeout profile")
+
+    def argv(self) -> list[str]:
+        return [
+            "--transfers",
+            str(self.transfers),
+            "--checkers",
+            str(self.checkers),
+            "--bwlimit",
+            self.bandwidth_limit,
+            "--contimeout",
+            f"{self.connect_timeout_seconds}s",
+            "--timeout",
+            f"{self.idle_timeout_seconds}s",
+        ]
+
+
 class RcloneRunner:
     _allowed_commands = {"lsjson", "copy", "about", "size"}
     _copy_output_limit = 64 * 1024
     _json_output_limit = 32 * 1024 * 1024
     _max_log_line_bytes = 64 * 1024
-    _remote_path = re.compile(r"^(ctm_[0-9a-f]{32}):(/[^\x00\r\n]*)$")
+    _remote_path = re.compile(r"^(ctm_[0-9a-f]{32}):(/[^\x00\r\n]*|[^\x00\r\n]+)$")
 
-    def __init__(self, binary: str, temp_path: str, staging_path: str | None = None) -> None:
+    def __init__(
+        self,
+        binary: str,
+        temp_path: str,
+        staging_path: str | None = None,
+        *,
+        transfer_profile: RcloneExecutionProfile | None = None,
+    ) -> None:
         self.binary = binary
         self.temp_path = temp_path
         self.staging_path = Path(staging_path) if staging_path is not None else None
+        self.transfer_profile = transfer_profile
 
     @classmethod
     def _validate_remote_path(cls, value: str) -> str:
         match = cls._remote_path.fullmatch(value)
         if match is None:
-            raise ValueError("Rclone paths must use an internal remote and an absolute path")
+            raise ValueError("Rclone paths must use an internal remote and a normalized path")
         path = match.group(2)
         if "\\" in path or any(part == ".." for part in path.split("/")):
             raise ValueError("Path traversal is not allowed")
-        if str(PurePosixPath(path)) != path.rstrip("/") and path != "/":
+        if path.startswith("/") and str(PurePosixPath(path)) != path.rstrip("/") and path != "/":
+            raise ValueError("Rclone path is not normalized")
+        if not path.startswith("/") and (
+            any(part in {"", "."} for part in path.split("/")) or str(PurePosixPath(path)) != path
+        ):
             raise ValueError("Rclone path is not normalized")
         return value
 
@@ -88,24 +181,37 @@ class RcloneRunner:
         remote_paths: list[str],
         config_path: str,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        *,
+        create_empty_src_dirs: bool = False,
+        stat: bool = False,
     ) -> list[str]:
         if command not in self._allowed_commands:
             raise ValueError(f"Rclone command is not allowed: {command}")
+        if create_empty_src_dirs and command != "copy":
+            raise ValueError("Empty source directories can only be preserved by copy")
+        if stat and command != "lsjson":
+            raise ValueError("Stat output is only available for lsjson")
         expected_paths = 2 if command == "copy" else 1
         if len(remote_paths) != expected_paths:
             raise ValueError(f"{command} expects {expected_paths} remote path(s)")
         paths = [self._validate_remote_path(path) for path in remote_paths]
         argv = [self.binary, command, *paths, "--config", config_path]
         if command == "copy":
-            if conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT"}:
+            if conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT", "KEEP_BOTH"}:
                 raise ValueError("Unsupported copy conflict policy")
             argv.extend(["--use-json-log", "--stats", "1s", "--stats-log-level", "NOTICE"])
-            if conflict_policy == "SKIP":
+            if conflict_policy in {"SKIP", "KEEP_BOTH"}:
                 argv.append("--ignore-existing")
+            if create_empty_src_dirs:
+                argv.append("--create-empty-src-dirs")
         elif command == "about":
             argv.extend(["--json", "--full"])
         elif command == "size":
             argv.append("--json")
+        elif stat:
+            argv.append("--stat")
+        if self.transfer_profile is not None:
+            argv.extend(self.transfer_profile.argv())
         return argv
 
     async def run(
@@ -117,6 +223,9 @@ class RcloneRunner:
         line_callback: Callable[[str], Awaitable[None]] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        create_empty_src_dirs: bool = False,
+        stat: bool = False,
+        timeout_seconds: float | None = None,
     ) -> tuple[bytes, bytes]:
         if command not in self._allowed_commands:
             raise ValueError(f"Rclone command is not allowed: {command}")
@@ -129,10 +238,16 @@ class RcloneRunner:
             config_content,
             job_id,
             lambda config_path: self.build_command(
-                command, remote_paths, config_path, conflict_policy
+                command,
+                remote_paths,
+                config_path,
+                conflict_policy,
+                create_empty_src_dirs=create_empty_src_dirs,
+                stat=stat,
             ),
             line_callback=line_callback,
             should_cancel=should_cancel,
+            timeout_seconds=timeout_seconds,
         )
 
     async def copy_remote_to_local(
@@ -145,6 +260,7 @@ class RcloneRunner:
         line_callback: Callable[[str], Awaitable[None]] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        max_transfer_bytes: int | None = None,
     ) -> None:
         safe_remote_source = self._validate_remote_path(remote_source)
         safe_local_directory = self._validate_local_staging_path(local_directory, is_directory=True)
@@ -153,7 +269,8 @@ class RcloneRunner:
             config_content,
             job_id,
             lambda config_path: self._copy_command(
-                safe_remote_source, safe_local_directory, config_path, conflict_policy
+                safe_remote_source, safe_local_directory, config_path, conflict_policy,
+                max_transfer_bytes=max_transfer_bytes,
             ),
             line_callback=line_callback,
             should_cancel=should_cancel,
@@ -169,6 +286,7 @@ class RcloneRunner:
         line_callback: Callable[[str], Awaitable[None]] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        force_transfer: bool = False,
     ) -> None:
         safe_local_file = self._validate_local_staging_path(local_file, is_directory=False)
         safe_remote_destination = self._validate_remote_path(remote_destination)
@@ -177,7 +295,8 @@ class RcloneRunner:
             config_content,
             job_id,
             lambda config_path: self._copy_command(
-                safe_local_file, safe_remote_destination, config_path, conflict_policy
+                safe_local_file, safe_remote_destination, config_path, conflict_policy,
+                force_transfer=force_transfer,
             ),
             line_callback=line_callback,
             should_cancel=should_cancel,
@@ -194,9 +313,7 @@ class RcloneRunner:
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
     ) -> None:
-        safe_local_directory = self._validate_local_staging_path(
-            local_directory, is_directory=True
-        )
+        safe_local_directory = self._validate_local_staging_path(local_directory, is_directory=True)
         safe_remote_destination = self._validate_remote_path(remote_destination)
         await self._run_with_argv(
             "copy",
@@ -261,8 +378,10 @@ class RcloneRunner:
         conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
         *,
         create_empty_src_dirs: bool = False,
+        max_transfer_bytes: int | None = None,
+        force_transfer: bool = False,
     ) -> list[str]:
-        if conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT"}:
+        if conflict_policy not in {"SKIP", "OVERWRITE_IF_DIFFERENT", "KEEP_BOTH"}:
             raise ValueError("Unsupported copy conflict policy")
         command = [
             self.binary,
@@ -277,10 +396,18 @@ class RcloneRunner:
             "--stats-log-level",
             "NOTICE",
         ]
-        if conflict_policy == "SKIP":
+        if conflict_policy in {"SKIP", "KEEP_BOTH"}:
             command.append("--ignore-existing")
         if create_empty_src_dirs:
             command.append("--create-empty-src-dirs")
+        if max_transfer_bytes is not None:
+            if not isinstance(max_transfer_bytes, int) or max_transfer_bytes <= 0:
+                raise ValueError("Invalid transfer byte limit")
+            command.extend(["--max-transfer", str(max_transfer_bytes), "--cutoff-mode", "HARD"])
+        if force_transfer and conflict_policy != "SKIP":
+            command.append("--ignore-times")
+        if self.transfer_profile is not None:
+            command.extend(self.transfer_profile.argv())
         return command
 
     async def _run_with_argv(
@@ -292,9 +419,12 @@ class RcloneRunner:
         *,
         line_callback: Callable[[str], Awaitable[None]] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[bytes, bytes]:
         if "\x00" in config_content:
             raise ValueError("Rclone configuration contains an invalid character")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("Rclone timeout must be positive")
         os.makedirs(self.temp_path, mode=0o700, exist_ok=True)
         os.chmod(self.temp_path, 0o700)
         config_path = os.path.join(self.temp_path, f"{job_id}.rclone.conf")
@@ -335,6 +465,7 @@ class RcloneRunner:
                 callback: Callable[[str], Awaitable[None]] | None = None,
             ) -> tuple[bytes, bool]:
                 chunks: list[bytes] = []
+                tail = bytearray()
                 captured = 0
                 truncated = False
                 pending = bytearray()
@@ -343,13 +474,19 @@ class RcloneRunner:
                     self._copy_output_limit if command == "copy" else self._json_output_limit
                 )
                 while chunk := await stream.read(64 * 1024):
-                    remaining = output_limit - captured
-                    if remaining > 0:
-                        retained = chunk[:remaining]
-                        chunks.append(retained)
-                        captured += len(retained)
-                    if len(chunk) > remaining:
-                        truncated = True
+                    if command == "copy":
+                        tail.extend(chunk)
+                        if len(tail) > output_limit:
+                            del tail[:-output_limit]
+                            truncated = True
+                    else:
+                        remaining = output_limit - captured
+                        if remaining > 0:
+                            retained = chunk[:remaining]
+                            chunks.append(retained)
+                            captured += len(retained)
+                        if len(chunk) > remaining:
+                            truncated = True
                     if callback is None:
                         continue
                     pending.extend(chunk)
@@ -373,14 +510,24 @@ class RcloneRunner:
                             await callback(line.decode("utf-8", errors="replace").rstrip("\r\n"))
                 if pending and callback is not None and not discarding_long_line:
                     await callback(pending.decode("utf-8", errors="replace").rstrip("\r\n"))
-                return b"".join(chunks), truncated
+                return (bytes(tail) if command == "copy" else b"".join(chunks)), truncated
 
             reader_tasks = [
                 asyncio.create_task(read_stream(process.stdout)),
                 asyncio.create_task(read_stream(process.stderr, line_callback)),
             ]
             wait_task = asyncio.create_task(process.wait())
+            deadline = (
+                asyncio.get_running_loop().time() + timeout_seconds
+                if timeout_seconds is not None
+                else None
+            )
             while not wait_task.done():
+                for task in reader_tasks:
+                    if task.done() and not task.cancelled():
+                        reader_error = task.exception()
+                        if reader_error is not None:
+                            raise reader_error
                 if should_cancel is not None and await should_cancel():
                     process.terminate()
                     try:
@@ -390,7 +537,25 @@ class RcloneRunner:
                         await wait_task
                     await asyncio.gather(*reader_tasks, return_exceptions=True)
                     raise RcloneCancelledError("La transferencia fue cancelada")
-                await asyncio.wait({wait_task}, timeout=0.25)
+                if deadline is not None:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise TimeoutError("Rclone operation timed out")
+                    wait_timeout = min(0.25, remaining)
+                else:
+                    wait_timeout = 0.25
+                pending_tasks = {task for task in [wait_task, *reader_tasks] if not task.done()}
+                if pending_tasks:
+                    await asyncio.wait(
+                        pending_tasks,
+                        timeout=wait_timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+            for task in reader_tasks:
+                if task.done() and not task.cancelled():
+                    reader_error = task.exception()
+                    if reader_error is not None:
+                        raise reader_error
             (stdout, stdout_truncated), (stderr, stderr_truncated) = await asyncio.gather(
                 *reader_tasks
             )

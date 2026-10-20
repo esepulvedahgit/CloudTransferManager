@@ -23,6 +23,8 @@ class StorageItem(BaseModel):
     modified_at: Optional[datetime] = None
     mime_type: Optional[str] = None
     provider_type: str
+    object_id: Optional[str] = None
+    parent_object_id: Optional[str] = None
 
 class PaginatedItems(BaseModel):
     items: List[StorageItem]
@@ -80,18 +82,20 @@ class StorageProvider(ABC):
 - **Motor:** El binario oficial MEGAcmd gestiona la sesión, exploración, cuota, descargas y subidas de MEGA; Rclone no se usa como backend MEGA.
 - **Seguridad y ciclo de vida:** El login se envía a `mega-cmd` por stdin (nunca como argumento del proceso). Cada sesión usa un `HOME` privado y efímero, ejecuta logout/quit y elimina su caché al cerrarse.
 - **Límites de espera:** Login: 30 s; listado/cuota: 10 s; logout/quit: 3 s por cliente, con cierre acotado a 5 s por paso. Las tuberías heredadas por el daemon no pueden dejar el cliente esperando indefinidamente. Un logout agotado no impide intentar quit; si quit falla, se conserva el HOME y se informa el fallo. Las descargas/subidas no tienen este límite de metadatos.
-- **Comandos permitidos:** `mega-ls`, `mega-df`, `mega-get`, `mega-put -c`, `mega-logout` y `mega-quit`; no se invocan comandos remotos destructivos.
+- **Comandos permitidos:** `mega-ls`, `mega-df`, `mega-get`, `mega-put -c`, `mega-mkdir -p` (solo carpetas de destino), `mega-logout` y `mega-quit`; no se invocan comandos remotos destructivos.
 - MEGA no garantiza hashes ni fechas de modificación en todas las respuestas; los metadatos opcionales permanecen como `None` cuando no están disponibles.
-- El parser de `mega-ls -l` excluye los encabezados de columnas (`FLAGS ... NAME`) y los títulos de directorio con ruta absoluta antes de crear elementos, paginar o contar archivos. Un archivo real llamado `NAME` se conserva.
+- El parser de `mega-ls -l --show-handles` conserva los handles `H:...` como `object_id`, excluye encabezados y títulos de directorio antes de paginar y permite leer archivos homónimos por identidad.
 - Las transferencias con MEGA se realizan por archivo individual mediante staging local temporal, que se elimina antes de procesar el siguiente archivo.
 
 ### B. Adaptador Google Drive (`RcloneGoogleDriveProvider`)
 - **Motor:** Rclone CLI aislado, exclusivamente para Google Drive.
+- Los tamaños negativos de Rclone (`-1` en documentos nativos exportados) se presentan como `None`. La ruta Drive → Nextcloud exporta esos archivos a staging privado y verifica la exportación materializada mediante SHA-256 del destino, sin comparar tamaños desconocidos ni generar una segunda exportación para verificar.
 - **Flujo de Autorización:** OAuth 2.0 (Client ID, Client Secret, Refresh Token y Access Token).
 - **Soporte de Unidades:**
   - Mi Unidad (`root`).
   - Unidades Compartidas (*Shared Drives*): Parámetro de configuración `team_drive`.
   - Renovación automática de tokens mediante el Refresh Token cuando expire el Access Token.
+- Los listados conservan el ID y padre de cada objeto. Las transferencias usan la API de Drive por ID para leer objetos homónimos por separado; el token OAuth no se devuelve ni se escribe en logs.
 
 ### C. Adaptadores Seafile (`SeafileRcloneProvider` y `SeafileApiProvider`)
 - `provider_type` es `SEAFILE`. `adapter_type` se guarda por conexión y acepta `RCLONE` (predeterminado) o `SEAFILE_API`; no se cambia automáticamente al fallar una operación.
@@ -108,6 +112,22 @@ class StorageProvider(ABC):
 ### D. Proveedor Mock (`MockStorageProvider`)
 - Implementación en memoria que simula un árbol de directorios con archivos ficticios y latencias programables.
 - **Uso obligatorio en la Fase 2** para construir y validar el *Vertical Slice* de la aplicación antes de depender de credenciales reales.
+
+### E. Recursos SMB/NAS (`RcloneSmbProvider`)
+- SMB se registra como `provider_type=SMB` y permite explorar un recurso compartido y una carpeta base configurada. El host debe estar en `SMB_ALLOWED_TARGETS`; una lista vacía deniega el acceso.
+- En el flujo de migración de la UI, el NAS es origen y MEGA, Google Drive o Seafile es destino. La aplicación no crea ni administra la VPN o las rutas de red necesarias.
+- Para una transferencia, la identidad estable se usa cuando el proveedor la ofrece; ruta y nombre son metadatos visibles y no bastan para colapsar dos objetos remotos distintos.
+- Rclone usa SMB únicamente desde el backend/worker, con configuración temporal por trabajo y la misma allowlist de comandos. El worker inventaría el árbol en un manifiesto persistido por páginas y registra el resultado por archivo.
+- La credencial queda cifrada como las demás conexiones. El host, recurso compartido y carpeta base forman la raíz lógica visible como `/`. La UI excluye SMB del selector de destino, pero `POST /api/v1/transfers` no valida ese límite por tipo de proveedor; agregar o mantener una restricción de servidor si SMB debe ser solo origen.
+- La guía operativa y sus límites están en [`docs/integrations/smb-nas-setup.md`](../integrations/smb-nas-setup.md).
+
+### F. Nextcloud (`NextcloudRcloneProvider`)
+- Nextcloud usa Rclone WebDAV (`type = webdav`, `vendor = nextcloud`) y una contraseña de aplicación. Un administrador introduce la URL HTTPS base, el usuario y la contraseña desde la UI; el backend genera `https://{host}/{prefijo-opcional}/remote.php/dav/files/{usuario}/`. Se aceptan servidores configurados por conexión, sin allowlist de despliegue.
+- La UI muestra Nextcloud como proveedor sin flags de habilitación. La conexión queda inactiva hasta pasar la prueba; solo los administradores pueden registrar el servidor y sus credenciales.
+- Las credenciales se almacenan cifradas con el mecanismo común y nunca se devuelven al frontend. Rclone se ejecuta como subproceso con argumentos separados y configuración temporal `0600`; la lista blanca de comandos y la semántica exclusivamente `COPY` no cambian.
+- El listado usa la abstracción común y una caché local, acotada por tiempo y memoria. Las actualizaciones de credenciales usan otra clave de caché.
+- Para trabajo Nextcloud se limita Rclone a un transfer, dos checkers, `NEXTCLOUD_BANDWIDTH_LIMIT` (predeterminado `8M`), `NEXTCLOUD_CHUNK_SIZE` (predeterminado `10Mi`), conexión de 10 s, inactividad de 60 s y `NEXTCLOUD_JOB_TIMEOUT_SECONDS` (predeterminado 12 h). La admisión permite por defecto un trabajo Nextcloud activo por clúster.
+- Soporte de lanzamiento y versión real deben registrarse tras probar contra la instancia concreta; la existencia del adaptador no equivale a certificación operativa. Véase [`docs/integrations/nextcloud-compatibility.md`](../integrations/nextcloud-compatibility.md).
 
 ---
 
@@ -146,7 +166,7 @@ class StorageProvider(ABC):
 CREATE TABLE storage_connections (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(128) NOT NULL,
-    provider_type VARCHAR(32) NOT NULL CHECK (provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE')),
+    provider_type VARCHAR(32) NOT NULL CHECK (provider_type IN ('MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB', 'NEXTCLOUD')),
     adapter_type VARCHAR(32) NOT NULL DEFAULT 'RCLONE' CHECK (adapter_type IN ('RCLONE', 'SEAFILE_API')),
     status VARCHAR(16) NOT NULL DEFAULT 'INACTIVE' CHECK (status IN ('ACTIVE', 'INACTIVE', 'ERROR')),
     deleted_at TIMESTAMP WITH TIME ZONE NULL,
@@ -194,3 +214,7 @@ La operación devuelve `204 No Content` al completarse, `404 Not Found` para UUI
   - `test_test_connection_endpoint`: Endpoint `/api/v1/connections/{id}/test` ejecuta y actualiza `last_tested_at`.
   - `test_archive_connection_preserves_transfer_history`: Archivar una conexión inactiva borra ciphertext y permisos, sin eliminar transferencias o eventos.
   - `test_archive_connection_rejects_active_transfers`: Una transferencia en cualquiera de los estados activos bloquea el archivado con `409`.
+
+### Formato MEGAcmd comprobado (2026-10-16)
+
+El listado largo real con `--show-handles` coloca `H:XXXXXXXX` entre fecha y nombre. El parser consume únicamente la columna y un separador, preservando espacios legítimos y Unicode. Los encabezados no son nodos; filas de nodos incompletas, tamaños/fechas inválidos o identidades mal formadas fallan con `MegaCmdListingError`. No se buscan identificadores dentro del nombre. La descarga por handle se verifica en staging privado: nombre exacto, archivo regular, sin symlinks ni salidas adicionales; el ejecutor compara el tamaño con el inventario. Una salida con nombre distinto produce error determinista, no se acepta por coincidencia de tamaño.

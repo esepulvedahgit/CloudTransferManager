@@ -4,6 +4,7 @@
 !.env.example
 secrets/
 certs/
+/restore/
 *.pem
 *.key
 
@@ -53,6 +54,7 @@ tmp/
 # IDE & OS
 .vscode/
 .idea/
+.superpowers/
 *.swp
 *.swo
 .DS_Store

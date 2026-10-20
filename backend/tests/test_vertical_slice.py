@@ -61,21 +61,51 @@ async def test_login_mock_navigation_copy_progress_and_history():
             "video_demo.mp4",
         ]
 
+        transfer_key = str(uuid.uuid4())
+        transfer_payload = {
+            "source_connection_id": source["id"],
+            "destination_connection_id": destination["id"],
+            "source_paths": ["/Proyectos/informe.pdf"],
+            "source_item_ids": [None],
+            "source_parent_ids": [None],
+            "destination_path": "/Copias",
+            "operation": "COPY",
+            "send_email_notification": True,
+        }
+        transfer_headers = {**headers, "Idempotency-Key": transfer_key}
         transfer = await client.post(
             "/api/v1/transfers",
-            json={
-                "source_connection_id": source["id"],
-                "destination_connection_id": destination["id"],
-                "source_paths": ["/Proyectos/informe.pdf"],
-                "destination_path": "/Copias",
-                "operation": "COPY",
-                "send_email_notification": True,
-            },
-            headers=headers,
+            json=transfer_payload,
+            headers=transfer_headers,
         )
         assert transfer.status_code == 201
         assert transfer.json()["public_id"].startswith("TRF-")
-        assert store.get_transfer(uuid.UUID(transfer.json()["id"])).send_email_notification
+        transfer_record = store.get_transfer(uuid.UUID(transfer.json()["id"]))
+        assert transfer_record is not None
+        assert transfer_record.send_email_notification
+        assert transfer_record.conflict_policy == "KEEP_BOTH"
+        assert transfer_record.source_item_ids == [None]
+        retried_transfer = await client.post(
+            "/api/v1/transfers", json=transfer_payload, headers=transfer_headers
+        )
+        assert retried_transfer.status_code == 201
+        assert retried_transfer.json()["id"] == transfer.json()["id"]
+
+        rejected_legacy_policy = await client.post(
+            "/api/v1/transfers",
+            json={**transfer_payload, "conflict_policy": "SKIP"},
+            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert rejected_legacy_policy.status_code == 422
+        rejected_automatic_omission = await client.post(
+            "/api/v1/transfers",
+            json={
+                **transfer_payload,
+                "source_file_error_policy": "SKIP_CONFIRMED_RESTRICTED",
+            },
+            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert rejected_automatic_omission.status_code == 422
 
         deadline = asyncio.get_running_loop().time() + 3
         while asyncio.get_running_loop().time() < deadline:

@@ -1,0 +1,216 @@
+name: CI calidad y seguridad
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend · Ruff, tests y mypy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://ctm_ci:ctm_ci_password@localhost:5432/ctm_ci
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ctm_ci
+          POSTGRES_USER: ctm_ci
+          POSTGRES_PASSWORD: ctm_ci_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ctm_ci -d ctm_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+        working-directory: backend
+
+      - name: Ruff
+        run: ruff check .
+        working-directory: backend
+
+      - name: Tests backend
+        run: pytest -v --tb=short
+        working-directory: backend
+
+      - name: mypy
+        run: mypy app
+        working-directory: backend
+
+  frontend:
+    name: Frontend · tests, TypeScript y build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci
+        working-directory: frontend
+
+      - name: Tests frontend
+        run: npm test
+        working-directory: frontend
+
+      - name: Chequeo TypeScript
+        run: npm run lint
+        working-directory: frontend
+
+      - name: Build de producción
+        run: npm run build
+        working-directory: frontend
+
+  security:
+    name: Seguridad · Trivy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Instalar Trivy 0.75.0
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.75.0
+          cache: true
+
+      - name: Reportar vulnerabilidades y secretos del repositorio
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "0"
+          skip-setup-trivy: true
+
+      - name: Bloquear vulnerabilidades corregibles del repositorio
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      - name: Revisar configuración de Docker y Compose
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          scanners: misconfig
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      - name: Construir imagen backend y worker
+        run: docker build --tag ctm-backend:ci backend
+
+      - name: Construir imagen frontend
+        run: docker build --tag ctm-frontend:ci frontend
+
+      - name: Construir imagen de respaldo MEGA S4
+        run: docker build --tag ctm-backup:ci --file ops/backup/Dockerfile .
+
+      - name: Reportar vulnerabilidades de backend y worker
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ctm-backend:ci
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "0"
+          skip-setup-trivy: true
+
+      - name: Bloquear vulnerabilidades corregibles de backend y worker
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ctm-backend:ci
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      - name: Reportar vulnerabilidades del frontend
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ctm-frontend:ci
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "0"
+          skip-setup-trivy: true
+
+      - name: Bloquear vulnerabilidades corregibles del frontend
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ctm-frontend:ci
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      - name: Reportar vulnerabilidades de la imagen de respaldo
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ctm-backup:ci
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "0"
+          skip-setup-trivy: true
+
+      - name: Bloquear vulnerabilidades corregibles de la imagen de respaldo
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ctm-backup:ci
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true

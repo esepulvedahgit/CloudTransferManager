@@ -182,6 +182,11 @@ class FakeRcloneRunner:
 
     async def copy_local_to_remote(self, local_file, remote_folder, _config, _job, **_kwargs):
         self.uploads.append((remote_folder, local_file.read_bytes()))
+        provider, path = self._provider_path(remote_folder)
+        remote_path = f"{path.rstrip('/')}/{local_file.name}"
+        data = local_file.read_bytes()
+        provider.data[remote_path] = data
+        provider.items[remote_path] = _item(remote_path, data=data, provider=provider.provider_type)
 
     async def copy_local_directory_to_remote(
         self, local_directory, remote_destination, _config, _job, **_kwargs
@@ -345,7 +350,7 @@ async def test_api_retry_repeats_resumable_upload_without_fallback(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_api_source_with_unknown_listing_size_keeps_staged_size_for_progress(tmp_path):
+async def test_api_staging_route_rejects_unknown_size_before_destination_write(tmp_path):
     executor, transfer, providers, _runner, _snapshots, staging, _cancel, _store = _setup(
         tmp_path
     )
@@ -354,8 +359,13 @@ async def test_api_source_with_unknown_listing_size_keeps_staged_size_for_progre
 
     await executor.execute(transfer.id)
 
-    assert transfer.status == "COMPLETED"
-    assert transfer.bytes_total == transfer.bytes_transferred == len(b"payload")
+    assert transfer.status == "FAILED"
+    assert not providers[transfer.destination_connection_id].data
+    assert any(
+        event["event_type"] == "FAILURE_DIAGNOSTIC"
+        and event["provider_error_code"] == "TRANSFER_FILE_SIZE_UNKNOWN"
+        for event in _store.transfer_events[transfer.id]
+    )
     assert list(staging.iterdir()) == []
 
 
@@ -600,6 +610,20 @@ async def test_rclone_selected_for_both_connections_keeps_remote_to_remote_copy(
 
         async def run(self, command, paths, config, job_id, **_kwargs):
             self.remote_copy_calls.append((command, paths, config, job_id))
+            if command == "copy":
+                source_provider, source_path = self._provider_path(paths[0])
+                destination_provider, destination_root = self._provider_path(paths[1])
+                if source_path in source_provider.data:
+                    destination_path = (
+                        f"{destination_root.rstrip('/')}/{source_path.rsplit('/', 1)[-1]}"
+                    )
+                    data = source_provider.data[source_path]
+                    destination_provider.data[destination_path] = data
+                    destination_provider.items[destination_path] = _item(
+                        destination_path,
+                        data=data,
+                        provider=destination_provider.provider_type,
+                    )
             return b"", b""
 
     direct_runner = DirectRunner(providers)

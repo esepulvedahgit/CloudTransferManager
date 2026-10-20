@@ -41,6 +41,9 @@ async def test_production_readiness_requires_a_live_celery_worker(monkeypatch, t
         async def ping(self):
             return True
 
+        async def beat_is_alive(self):
+            return True
+
     app.state.event_bus = ReadyBus()
     monkeypatch.setattr("app.worker.celery_app.control.ping", lambda timeout: [])
 
@@ -71,10 +74,22 @@ async def test_production_readiness_accepts_a_live_celery_worker(monkeypatch, tm
         async def ping(self):
             return True
 
+        async def beat_is_alive(self):
+            return True
+
     app.state.event_bus = ReadyBus()
     monkeypatch.setattr(
         "app.worker.celery_app.control.ping", lambda timeout: [{"worker@localhost": {"ok": "pong"}}]
     )
+
+    class Inspector:
+        def active_queues(self):
+            return {
+                "transfer@localhost": [{"name": "transfers"}],
+                "control@localhost": [{"name": "control"}],
+            }
+
+    monkeypatch.setattr("app.worker.celery_app.control.inspect", lambda timeout: Inspector())
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -82,6 +97,183 @@ async def test_production_readiness_accepts_a_live_celery_worker(monkeypatch, tm
         response = await client.get("/health/ready")
 
     assert response.status_code == 200
+    await app.state.redis_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_notification_worker_health_is_separate_from_transfer_readiness(
+    monkeypatch, tmp_path
+):
+    settings = Settings(
+        app_env="production",
+        app_secret_key="test-secret",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'unused.sqlite'}",
+        redis_url="redis://localhost:6379/0",
+        rclone_binary="/bin/true",
+        megacmd_binary_dir=str(_fake_mega_binaries(tmp_path)),
+        session_cookie_secure=False,
+    )
+    app = create_app(settings, store=MemoryStore())
+
+    class ReadyBus:
+        async def ping(self):
+            return True
+
+        async def beat_is_alive(self):
+            return True
+
+    class Inspector:
+        def active_queues(self):
+            return {
+                "transfer@localhost": [{"name": "transfers"}],
+                "control@localhost": [{"name": "control"}],
+            }
+
+    app.state.event_bus = ReadyBus()
+    monkeypatch.setattr(
+        "app.worker.celery_app.control.ping", lambda timeout: [{"worker@localhost": {"ok": "pong"}}]
+    )
+    monkeypatch.setattr("app.worker.celery_app.control.inspect", lambda timeout: Inspector())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        transfer_readiness = await client.get("/health/ready")
+        notification_health = await client.get("/health/notifications")
+
+    assert transfer_readiness.status_code == 200
+    assert notification_health.status_code == 503
+    await app.state.redis_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_evaluation_worker_health_is_separate_from_copy_readiness(monkeypatch, tmp_path):
+    settings = Settings(
+        app_env="production",
+        app_secret_key="test-secret",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'unused.sqlite'}",
+        redis_url="redis://localhost:6379/0",
+        rclone_binary="/bin/true",
+        megacmd_binary_dir=str(_fake_mega_binaries(tmp_path)),
+        session_cookie_secure=False,
+    )
+    app = create_app(settings, store=MemoryStore())
+
+    class ReadyBus:
+        async def ping(self):
+            return True
+
+        async def beat_is_alive(self):
+            return True
+
+    class Inspector:
+        queues = {
+            "transfer@localhost": [{"name": "transfers"}],
+            "control@localhost": [{"name": "control"}],
+        }
+
+        def active_queues(self):
+            return self.queues
+
+    inspector = Inspector()
+    app.state.event_bus = ReadyBus()
+    monkeypatch.setattr(
+        "app.worker.celery_app.control.ping", lambda timeout: [{"worker@localhost": {"ok": "pong"}}]
+    )
+    monkeypatch.setattr("app.worker.celery_app.control.inspect", lambda timeout: inspector)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        copy_readiness = await client.get("/health/ready")
+        evaluation_missing = await client.get("/health/evaluations")
+        inspector.queues["evaluation@localhost"] = [{"name": "evaluations"}]
+        evaluation_ready = await client.get("/health/evaluations")
+
+    assert copy_readiness.status_code == 200
+    assert evaluation_missing.status_code == 503
+    assert evaluation_ready.status_code == 200
+    await app.state.redis_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_production_readiness_requires_both_worker_queues(monkeypatch, tmp_path):
+    settings = Settings(
+        app_env="production",
+        app_secret_key="test-secret",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'unused.sqlite'}",
+        redis_url="redis://localhost:6379/0",
+        rclone_binary="/bin/true",
+        megacmd_binary_dir=str(_fake_mega_binaries(tmp_path)),
+        session_cookie_secure=False,
+    )
+    app = create_app(settings, store=MemoryStore())
+
+    class ReadyBus:
+        async def ping(self):
+            return True
+
+        async def beat_is_alive(self):
+            return True
+
+    class Inspector:
+        def active_queues(self):
+            return {"transfer@localhost": [{"name": "transfers"}]}
+
+    app.state.event_bus = ReadyBus()
+    monkeypatch.setattr(
+        "app.worker.celery_app.control.ping", lambda timeout: [{"worker@localhost": {"ok": "pong"}}]
+    )
+    monkeypatch.setattr("app.worker.celery_app.control.inspect", lambda timeout: Inspector())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    await app.state.redis_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_production_readiness_requires_recent_beat_heartbeat(monkeypatch, tmp_path):
+    settings = Settings(
+        app_env="production",
+        app_secret_key="test-secret",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'unused.sqlite'}",
+        redis_url="redis://localhost:6379/0",
+        rclone_binary="/bin/true",
+        megacmd_binary_dir=str(_fake_mega_binaries(tmp_path)),
+        session_cookie_secure=False,
+    )
+    app = create_app(settings, store=MemoryStore())
+
+    class ReadyBus:
+        async def ping(self):
+            return True
+
+        async def beat_is_alive(self):
+            return False
+
+    class Inspector:
+        def active_queues(self):
+            return {
+                "transfer@localhost": [{"name": "transfers"}],
+                "control@localhost": [{"name": "control"}],
+            }
+
+    app.state.event_bus = ReadyBus()
+    monkeypatch.setattr(
+        "app.worker.celery_app.control.ping", lambda timeout: [{"worker@localhost": {"ok": "pong"}}]
+    )
+    monkeypatch.setattr("app.worker.celery_app.control.inspect", lambda timeout: Inspector())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/health/ready")
+
+    assert response.status_code == 503
     await app.state.redis_client.aclose()
 
 
@@ -102,10 +294,22 @@ async def test_production_readiness_requires_mega_cmd_binary(monkeypatch, tmp_pa
         async def ping(self):
             return True
 
+        async def beat_is_alive(self):
+            return True
+
     app.state.event_bus = ReadyBus()
     monkeypatch.setattr(
         "app.worker.celery_app.control.ping", lambda timeout: [{"worker@localhost": {"ok": "pong"}}]
     )
+
+    class Inspector:
+        def active_queues(self):
+            return {
+                "transfer@localhost": [{"name": "transfers"}],
+                "control@localhost": [{"name": "control"}],
+            }
+
+    monkeypatch.setattr("app.worker.celery_app.control.inspect", lambda timeout: Inspector())
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:

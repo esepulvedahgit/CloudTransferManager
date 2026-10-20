@@ -58,7 +58,9 @@ class MockStorageProvider(StorageProvider):
         sort_by: str = "name",
         direction: str = "asc",
         search: str | None = None,
+        parent_object_id: str | None = None,
     ) -> PaginatedItems:
+        del parent_object_id
         await self._wait()
         parent = self.normalize_path(path)
         if page_size < 1 or page_size > 200:
@@ -110,7 +112,14 @@ class MockStorageProvider(StorageProvider):
             total_count=len(children),
         )
 
-    async def get_item(self, path: str) -> StorageItem | None:
+    async def get_item(
+        self,
+        path: str,
+        object_id: str | None = None,
+        parent_object_id: str | None = None,
+    ) -> StorageItem | None:
+        del object_id
+        del parent_object_id
         await self._wait()
         item_path = self.normalize_path(path)
         entry = self._tree.get(item_path)

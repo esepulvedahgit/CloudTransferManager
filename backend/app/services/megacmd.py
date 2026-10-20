@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import stat
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Literal
+
+from app.services.megacmd_failures import classify_megacmd_failure
 
 MegaCmdAction = Literal["logout", "ls", "get", "put", "mkdir", "df", "quit", "version"]
 LineCallback = Callable[[str], Awaitable[None]]
@@ -52,6 +55,7 @@ class MegaCmdCommandError(MegaCmdError):
 
     def __init__(self, return_code: int, output: bytes = b"") -> None:
         self.return_code = return_code
+        self.failure_diagnostic = classify_megacmd_failure(return_code, output)
         message = output.decode("utf-8", errors="ignore").casefold()
         self._retryable = not any(marker in message for marker in self._fatal_markers) and any(
             marker in message for marker in self._retryable_markers
@@ -61,6 +65,27 @@ class MegaCmdCommandError(MegaCmdError):
     @property
     def retryable(self) -> bool:
         return self._retryable
+
+
+class MegaCmdDownloadOutputMissingError(MegaCmdError):
+    """The MEGAcmd client exited successfully without creating the downloaded file."""
+
+    return_code = 0
+
+    @property
+    def retryable(self) -> bool:
+        return True
+
+    def __init__(self) -> None:
+        super().__init__("MEGAcmd terminó sin crear el archivo descargado esperado")
+
+
+class MegaCmdListingError(MegaCmdError):
+    """A node row cannot be interpreted without risking an incomplete inventory."""
+
+
+class MegaCmdDownloadValidationError(MegaCmdError):
+    """The downloaded output has an unexpected name or unsafe filesystem type."""
 
 
 class MegaCmdCancelledError(MegaCmdError):
@@ -147,13 +172,22 @@ class MegaCmdRunner:
             self._validate_token(value)
 
         if action == "ls":
-            if len(values) != 3 or values[0] != "-l" or values[1] != self._ls_time_format:
+            legacy_listing = (
+                len(values) == 3 and values[:2] == ["-l", self._ls_time_format]
+            )
+            handle_listing = (
+                len(values) == 4
+                and values[:3] == ["-l", "--show-handles", self._ls_time_format]
+            )
+            if not legacy_listing and not handle_listing:
                 raise ValueError("Invalid MEGAcmd arguments for ls")
-            values[2] = self._normalize_remote_path(values[2])
+            if not re.fullmatch(r"H:[A-Za-z0-9_-]{8}", values[-1]):
+                values[-1] = self._normalize_remote_path(values[-1])
         elif action == "get":
             if len(values) != 2:
                 raise ValueError("Invalid MEGAcmd arguments for get")
-            values[0] = self._normalize_remote_path(values[0])
+            if not re.fullmatch(r"H:[A-Za-z0-9_-]{8}", values[0]):
+                values[0] = self._normalize_remote_path(values[0])
             values[1] = self._absolute_local_path(values[1])
         elif action == "put":
             if len(values) != 3 or values[0] != "-c":
@@ -258,6 +292,11 @@ class MegaCmdRunner:
             wait_task = asyncio.create_task(process.wait())
             started_at = time.monotonic()
             while not (wait_task.done() and all(task.done() for task in reader_tasks)):
+                for task in reader_tasks:
+                    if task.done() and not task.cancelled():
+                        reader_error = task.exception()
+                        if reader_error is not None:
+                            raise reader_error
                 if should_cancel is not None and await should_cancel():
                     await self._terminate(process, wait_task)
                     raise MegaCmdCancelledError("La operación MEGAcmd fue cancelada")
@@ -270,7 +309,8 @@ class MegaCmdRunner:
                 else:
                     interval = self._poll_interval_seconds
                 pending = {task for task in [wait_task, *reader_tasks] if not task.done()}
-                await asyncio.wait(pending, timeout=interval)
+                if pending:
+                    await asyncio.wait(pending, timeout=interval)
 
             stdout_result, stderr_result = await asyncio.gather(*reader_tasks)
             if process.returncode != 0:

@@ -252,7 +252,9 @@ class SeafileApiProvider(StorageProvider):
         sort_by: str = "name",
         direction: str = "asc",
         search: str | None = None,
+        parent_object_id: str | None = None,
     ) -> PaginatedItems:
+        del parent_object_id
         async with await self._client() as client:
             return await self._list_items(
                 client, path, cursor, page_size, sort_by, direction, search
@@ -334,7 +336,14 @@ class SeafileApiProvider(StorageProvider):
             total_count=len(items),
         )
 
-    async def get_item(self, path: str) -> StorageItem | None:
+    async def get_item(
+        self,
+        path: str,
+        object_id: str | None = None,
+        parent_object_id: str | None = None,
+    ) -> StorageItem | None:
+        del object_id
+        del parent_object_id
         safe_path = self._normalize_path(path)
         if safe_path == "/":
             return StorageItem(name="/", path="/", is_dir=True, provider_type=self.provider_type)

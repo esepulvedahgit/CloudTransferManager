@@ -133,6 +133,14 @@ async def test_runner_rejects_unapproved_actions_and_control_characters(tmp_path
         await runner.run("put", ["/tmp/file"], home=tmp_path / "home")
 
 
+def test_runner_keeps_valid_mega_handle_as_a_node_reference(tmp_path: Path):
+    runner = _runner_type()(str(tmp_path))
+
+    command = runner._build_command("get", ["H:AbCd1234", str(tmp_path)])
+
+    assert command[-2] == "H:AbCd1234"
+
+
 @pytest.mark.asyncio
 async def test_runner_rejects_symlink_components_in_isolated_home(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -266,6 +274,64 @@ async def test_runner_terminates_process_when_transfer_is_cancelled(
 
 
 @pytest.mark.asyncio
+async def test_runner_handles_process_finishing_during_cancellation_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    runner_type = _runner_type()
+    process = _FakeProcess(returncode=None)
+
+    async def start(*args: Any, **kwargs: Any) -> _FakeProcess:
+        return process
+
+    async def cancellation_check() -> bool:
+        process.returncode = 0
+        process._finished.set()
+        await asyncio.sleep(0)
+        return False
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    runner = runner_type("/usr/bin")
+
+    stdout, stderr = await runner.run(
+        "ls",
+        _ls_arguments(),
+        home=tmp_path / "home",
+        should_cancel=cancellation_check,
+    )
+
+    assert stdout == b""
+    assert stderr == b""
+
+
+@pytest.mark.asyncio
+async def test_line_callback_failure_stops_megacmd_without_waiting_for_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    runner_type = _runner_type()
+    process = _FakeProcess(stderr=b"progress\n", returncode=None)
+
+    async def start(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        return process
+
+    async def fail_callback(_line: str) -> None:
+        raise RuntimeError("callback failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    runner = runner_type("/usr/bin")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        await runner.run(
+            "ls",
+            _ls_arguments(),
+            home=tmp_path / "home",
+            line_callback=fail_callback,
+            timeout_seconds=0.1,
+        )
+
+    assert process.terminated
+
+
+@pytest.mark.asyncio
 async def test_runner_terminates_process_on_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
@@ -339,3 +405,15 @@ async def test_login_sends_credentials_only_over_stdin_and_redacts_echoed_output
     assert username.encode() not in stdout + stderr
     assert password.encode() not in stdout + stderr
     assert stdout == b'login "[REDACTED]" "[REDACTED]"\n'
+
+
+def test_megacmd_command_error_keeps_only_safe_unclassified_diagnostic():
+    error = MegaCmdCommandError(
+        16,
+        b"API error for /private/archive/restricted.rar: resource administratively blocked",
+    )
+
+    assert error.failure_diagnostic.safe_code == "MEGACMD_FAILURE_UNCLASSIFIED"
+    assert error.failure_diagnostic.category == "UNKNOWN"
+    assert not hasattr(error, "output")
+    assert "/private/archive" not in repr(error.failure_diagnostic)

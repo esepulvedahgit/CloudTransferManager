@@ -23,6 +23,14 @@ def network_names(service: dict[str, Any]) -> set[str]:
     return set(networks)
 
 
+def secret_names(service: dict[str, Any]) -> set[str]:
+    return {
+        str(secret if isinstance(secret, str) else secret.get("source"))
+        for secret in service.get("secrets", [])
+        if isinstance(secret, str) or isinstance(secret, dict) and secret.get("source")
+    }
+
+
 def main() -> None:
     rendered = subprocess.run(
         ["docker", "compose", "config", "--format", "json"],
@@ -52,7 +60,17 @@ def main() -> None:
     if any(not port.get("published") for port in proxy_ports):
         fail("reverse-proxy host ports must be published")
 
-    for name in ("backend", "worker", "postgres", "redis"):
+    internal_services = (
+        "backend",
+        "worker",
+        "control-worker",
+        "evaluation-worker",
+        "notification-worker",
+        "beat",
+        "postgres",
+        "redis",
+    )
+    for name in internal_services:
         service = services[name]
         names = network_names(service)
         if "ctm_internal" not in names or "ctm_proxy_edge" in names:
@@ -73,6 +91,27 @@ def main() -> None:
                 target = normpath(tmpfs_mount.split(":", 1)[0])
                 if staging_path == target or staging_path.startswith(target.rstrip("/") + "/"):
                     fail(f"{name} staging path must remain disk-backed, not tmpfs")
+
+    evaluation = services["evaluation-worker"]
+    evaluation_command = evaluation.get("command", [])
+    if "--queues=evaluations" not in evaluation_command:
+        fail("evaluation-worker must consume the evaluations queue")
+    if "--concurrency=1" not in evaluation_command:
+        fail("evaluation-worker concurrency must be one")
+    if not {"postgres_password", "master_key"} <= secret_names(evaluation):
+        fail("evaluation-worker must receive PostgreSQL and provider credential secrets")
+    evaluation_tmpfs = evaluation.get("tmpfs", [])
+    if not any(
+        normpath(mount.split(":", 1)[0]) == "/var/lib/cloud-transfer/tmp"
+        and "size=64m" in mount
+        for mount in evaluation_tmpfs
+    ):
+        fail("evaluation-worker must have private ephemeral Rclone/MEGAcmd config storage")
+    limits = evaluation.get("deploy", {}).get("resources", {}).get("limits", {})
+    if not {"cpus", "memory", "pids"} <= set(limits):
+        fail("evaluation-worker must have CPU, memory, and PID limits")
+    if "master_key" in secret_names(services["control-worker"]):
+        fail("control-worker must not receive provider credential secrets")
 
     print("Compose network exposure is valid.")
 

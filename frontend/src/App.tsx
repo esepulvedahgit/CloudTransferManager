@@ -2,6 +2,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import {
   Alert,
   AppBar,
+  Badge,
   Box,
   Button,
   Card,
@@ -14,14 +15,21 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Divider,
+  FormHelperText,
   FormControl,
   FormControlLabel,
   InputLabel,
+  IconButton,
   LinearProgress,
+  ListItemIcon,
+  Menu,
   MenuItem,
   Paper,
+  Popover,
   Select,
   Stack,
+  SvgIcon,
   Tab,
   Tabs,
   TextField,
@@ -30,13 +38,27 @@ import {
   createTheme,
   ThemeProvider,
 } from '@mui/material';
-import { QueryClient, QueryClientProvider, useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useMemo, useState } from 'react';
+import {
+  type InfiniteData,
+  QueryClient,
+  QueryClientProvider,
+  useInfiniteQuery,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Controller, useForm } from 'react-hook-form';
-import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { z } from 'zod';
 import { apiRequest, ApiError } from './api';
+import DocumentationSection from './DocumentationSection';
+import ScheduledTransferEvaluation, { type TransferEvaluation } from './ScheduledTransferEvaluation';
+import TransferIncidentPanel from './TransferIncidentPanel';
+import TransferFileReport from './TransferFileReport';
+import type { TransferManifestPage, TransferRecord } from './transferTypes';
 import './styles.css';
+
+const MetricsDashboard = lazy(() => import('./MetricsDashboard'));
 
 type User = { id: string; username: string; email: string; role: 'ADMIN' | 'USER'; must_change_password?: boolean };
 type Connection = {
@@ -66,29 +88,120 @@ type StorageItem = {
   modified_at: string | null;
   mime_type: string | null;
   provider_type: string;
+  object_id?: string | null;
+  parent_object_id?: string | null;
 };
 type ItemPage = { items: StorageItem[]; next_cursor: string | null; total_count: number };
-type Transfer = {
-  id: string;
-  public_id: string;
-  status: string;
-  destination_connection_id: string;
-  destination_path: string;
-  progress_percent: number;
-  files_completed: number;
-  files_total: number;
-  bytes_transferred: number;
-  bytes_total: number;
-  current_item: string | null;
-  average_speed_bps: number | null;
-  current_speed_bps: number | null;
-  estimated_remaining_seconds?: number | null;
+export type Transfer = TransferRecord;
+type TransferListPage = { items: Transfer[]; total_count: number };
+type TransferEventRecord = {
+  event_type: string;
+  provider_error_code: string | null;
+};
+type TransferCapabilities = {
+  max_files_by_source_provider: { default: number; SMB: number };
 };
 const terminalTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED'];
+const successfulTransferStatuses = ['COMPLETED', 'COMPLETED_WITH_WARNINGS'];
+const backgroundTransferStatuses = ['SCHEDULED', 'QUEUED', 'VALIDATING', 'RUNNING', 'RETRYING', 'PAUSING', 'PAUSED', 'CANCELLING'];
+const streamingTransferStatuses = ['VALIDATING', 'RUNNING', 'RETRYING', 'PAUSING', 'CANCELLING'];
+const terminalProgressDisplayMs = 3_000;
+const notRequiredEvaluation: TransferEvaluation = {
+  status: 'NOT_REQUIRED',
+  generation: 0,
+  sequence: 0,
+  files_found: null,
+  count_complete: false,
+  max_files: null,
+  started_at: null,
+  updated_at: null,
+  completed_at: null,
+  safe_error_code: null,
+  safe_message: null,
+};
+
+function isProgrammedBackgroundTransfer(transfer: Transfer): boolean {
+  if (transfer.status === 'PAUSING' || transfer.status === 'PAUSED') return true;
+  return backgroundTransferStatuses.includes(transfer.status) && Boolean(
+    transfer.scheduled_at
+    || transfer.wait_reason
+    || transfer.execution_mode === 'EXCLUSIVE'
+    || transfer.depends_on_transfer_id,
+  );
+}
+
+export function mergeTransferState(current: Transfer, incoming: Transfer): Transfer {
+  const currentEvaluation = current.evaluation;
+  const incomingEvaluation = incoming.evaluation;
+  let latestEvaluation = currentEvaluation;
+  if (incomingEvaluation && !currentEvaluation) {
+    latestEvaluation = incomingEvaluation;
+  } else if (incomingEvaluation && currentEvaluation) {
+    if (
+      incomingEvaluation.generation > currentEvaluation.generation
+      || (
+        incomingEvaluation.generation === currentEvaluation.generation
+        && incomingEvaluation.sequence >= currentEvaluation.sequence
+      )
+    ) latestEvaluation = incomingEvaluation;
+  }
+
+  let merged: Transfer;
+  const currentAttempt = current.attempt_count ?? 1;
+  const incomingAttempt = incoming.attempt_count ?? 1;
+  const currentStateVersion = current.state_version;
+  const incomingStateVersion = incoming.state_version;
+  if (incomingAttempt < currentAttempt) merged = current;
+  else if (incomingAttempt > currentAttempt) merged = incoming;
+  else if (
+    currentStateVersion !== undefined
+    && incomingStateVersion !== undefined
+    && incomingStateVersion < currentStateVersion
+  ) merged = current;
+  else if (
+    currentStateVersion !== undefined
+    && incomingStateVersion !== undefined
+    && incomingStateVersion > currentStateVersion
+  ) merged = incoming;
+  else {
+    const currentIsTerminal = terminalTransferStatuses.includes(current.status);
+    const incomingIsTerminal = terminalTransferStatuses.includes(incoming.status);
+    if (currentIsTerminal && !incomingIsTerminal) merged = current;
+    else if (currentIsTerminal && incomingIsTerminal) merged = current;
+    else if (
+      incoming.progress_percent < current.progress_percent
+      || incoming.files_completed < current.files_completed
+      || incoming.bytes_transferred < current.bytes_transferred
+    ) merged = current;
+    else merged = incoming;
+  }
+  if (incomingAttempt === currentAttempt && current.manifest_summary) {
+    const summary = merged.manifest_summary ?? current.manifest_summary;
+    const omitted = Math.max(
+      current.manifest_summary.omitted ?? 0,
+      incoming.manifest_summary?.omitted ?? 0,
+    );
+    const omittedBytes = Math.max(
+      current.manifest_summary.omitted_bytes ?? 0,
+      incoming.manifest_summary?.omitted_bytes ?? 0,
+    );
+    merged = {
+      ...merged,
+      manifest_summary: {
+        ...summary,
+        omitted,
+        omitted_bytes: omittedBytes,
+        skipped: Math.max(summary.skipped, omitted),
+      },
+    };
+  }
+  if (merged.evaluation === latestEvaluation) return merged;
+  return { ...merged, evaluation: latestEvaluation };
+}
 type LoginForm = { username_or_email: string; password: string };
 type ConnectionForm = {
   name: string;
-  provider_type: 'MOCK' | 'MEGA' | 'GOOGLE_DRIVE' | 'SEAFILE';
+  provider_type: 'MOCK' | 'MEGA' | 'GOOGLE_DRIVE' | 'SEAFILE' | 'SMB' | 'NEXTCLOUD';
   seafile_adapter_type: 'RCLONE' | 'SEAFILE_API';
   is_global: boolean;
   mega_username: string;
@@ -102,8 +215,26 @@ type ConnectionForm = {
   seafile_password: string;
   seafile_library: string;
   seafile_library_password: string;
+  nextcloud_url: string;
+  nextcloud_username: string;
+  nextcloud_password: string;
+  smb_host: string;
+  smb_port: string;
+  smb_share: string;
+  smb_base_path: string;
+  smb_username: string;
+  smb_password: string;
+  smb_domain: string;
 };
 type PasswordForm = { current_password: string; new_password: string };
+type SmtpSettings = {
+  host: string;
+  port: number;
+  use_tls: boolean;
+  from_address: string;
+  credentials_configured: boolean;
+};
+type SmtpFormValues = SmtpSettings & { username: string; password: string };
 
 const theme = createTheme({
   palette: {
@@ -121,6 +252,77 @@ const theme = createTheme({
 });
 
 const loginSchema = z.object({ username_or_email: z.string().min(1), password: z.string().min(1) });
+const smtpFormSchema = z.object({
+  host: z.string().trim().min(1, 'Ingresa el servidor SMTP.').max(255),
+  port: z.number().int('Ingresa un puerto válido.').min(1, 'El puerto debe ser mayor que 0.').max(65535, 'El puerto no puede superar 65535.'),
+  use_tls: z.boolean(),
+  from_address: z.string().trim().email('Ingresa un correo remitente válido.'),
+  credentials_configured: z.boolean(),
+  username: z.string().max(255),
+  password: z.string().max(1024),
+}).superRefine((values, context) => {
+  const hasUsername = Boolean(values.username.trim());
+  const hasPassword = Boolean(values.password);
+  if (hasUsername !== hasPassword) {
+    context.addIssue({
+      code: 'custom',
+      path: [hasUsername ? 'password' : 'username'],
+      message: 'Completa usuario y contraseña juntos.',
+    });
+  }
+});
+
+function InterfaceIcon({ name }: { name: 'folder' | 'file' | 'copy' | 'transfer' | 'refresh' | 'archive' | 'settings' | 'key' | 'logout' | 'clock' }) {
+  const paths = {
+    folder: <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h5l2 2h8A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z" />,
+    file: <path d="M7 3.75h7l4 4v12.5H7a2 2 0 0 1-2-2v-12.5a2 2 0 0 1 2-2Zm7 0v4h4M8.5 12h7M8.5 15h7" />,
+    copy: <path d="M8 8V4.75A1.75 1.75 0 0 1 9.75 3h9.5A1.75 1.75 0 0 1 21 4.75v9.5A1.75 1.75 0 0 1 19.25 16H16M4.75 8H14A2 2 0 0 1 16 10v9.25A1.75 1.75 0 0 1 14.25 21h-9.5A1.75 1.75 0 0 1 3 19.25v-9.5A1.75 1.75 0 0 1 4.75 8Z" />,
+    transfer: <><path d="M3.5 6.5h5v11h-5zM15.5 6.5h5v11h-5z" /><path d="M9 12h6m-2.5-2.5L15 12l-2.5 2.5" /></>,
+    refresh: <path d="M20 7v5h-5M4 17v-5h5m10.25-3A7 7 0 0 0 6.1 6.1L4 8m16 8-2.1 1.9A7 7 0 0 1 4.75 15" />,
+    archive: <path d="M4 7h16v13H4zM3 4h18v3H3zm5 7h8" />,
+    settings: <><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z" /><path d="m19.4 15 .1.1 1.2.9-1.5 2.6-1.4-.6a8 8 0 0 1-1.8 1l-.2 1.5h-3l-.3-1.5a8 8 0 0 1-1.8-1l-1.4.6-1.5-2.6 1.2-.9a7 7 0 0 1 0-2.1l-1.2-.9 1.5-2.6 1.4.6a8 8 0 0 1 1.8-1l.3-1.5h3l.2 1.5a8 8 0 0 1 1.8 1l1.4-.6 1.5 2.6-1.2.9a7 7 0 0 1 0 2Z" transform="translate(-1 -1) scale(.98)" /></>,
+    key: <path d="M14.5 9a5 5 0 1 1-1.47-3.54L21 13v3h-3v3h-3v-3h-3l-2.1-2.1M7.5 9h.01" />,
+    logout: <path d="M10 5H5v14h5m4-3 4-4-4-4m4 4H9" />,
+    clock: <><circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3.5 2" /></>,
+  };
+  return <SvgIcon fontSize="small" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</g></SvgIcon>;
+}
+
+function CloudNetworkMark() {
+  return (
+    <svg className="cloud-network-mark" viewBox="0 0 48 48" role="img" aria-label="Cloud Transfer Manager" focusable="false">
+      <path
+        className="cloud-network-outline"
+        d="M14.7 36h18a8.25 8.25 0 0 0 .45-16.49A11.6 11.6 0 0 0 10.8 17.6 8.5 8.5 0 0 0 14.7 36Z"
+      />
+      <path className="cloud-network-links" d="m15.5 27.5 7-7 9 7-9 5.5-7-5.5Zm7-7v12.5m-7-5.5h16" />
+      <circle className="cloud-network-node" cx="15.5" cy="27.5" r="2.7" />
+      <circle className="cloud-network-node" cx="22.5" cy="20.5" r="2.7" />
+      <circle className="cloud-network-node cloud-network-node-accent" cx="31.5" cy="27.5" r="2.7" />
+      <circle className="cloud-network-node" cx="22.5" cy="33" r="2.7" />
+    </svg>
+  );
+}
+
+const providerAssets: Record<string, { label: string; src: string }> = {
+  MEGA: { label: 'MEGA', src: '/brand/mega.svg' },
+  GOOGLE_DRIVE: { label: 'Google Drive', src: '/brand/google-drive.png' },
+  SEAFILE: { label: 'Seafile', src: '/brand/seafile.svg' },
+  NEXTCLOUD: { label: 'Nextcloud', src: '/brand/nextcloud.svg' },
+};
+
+function ProviderLogo({ provider, decorative = true }: { provider: string; decorative?: boolean }) {
+  const asset = providerAssets[provider];
+  if (!asset) return <span className="provider-logo-fallback" aria-hidden="true">☁</span>;
+  return (
+    <img
+      className={`provider-logo${decorative ? ' provider-logo-decorative' : ''}`}
+      src={asset.src}
+      alt={decorative ? '' : asset.label}
+      aria-hidden={decorative || undefined}
+    />
+  );
+}
 
 function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   const [error, setError] = useState('');
@@ -152,7 +354,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
     <Box className="login-shell">
       <Box className="login-aside">
         <Stack direction="row" alignItems="center" spacing={1.5}>
-          <Box className="brand-mark" aria-hidden="true">CT</Box>
+          <Box className="brand-mark"><CloudNetworkMark /></Box>
           <Typography variant="h6" component="h1" fontWeight={750}>Cloud Transfer Manager</Typography>
         </Stack>
         <Typography variant="overline" className="eyebrow">TRANSFERENCIAS PRIVADAS</Typography>
@@ -160,10 +362,14 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
         <Typography className="login-copy">
           Explora tus conexiones de almacenamiento y mueve información con trazabilidad de principio a fin.
         </Typography>
-        <Box className="login-visual" aria-hidden="true">
-          <Box className="cloud-node">MEGA</Box>
+        <Box className="login-visual">
+          <Box className="cloud-node"><ProviderLogo provider="MEGA" decorative={false} /><span>MEGA</span></Box>
           <Box className="transfer-line"><span /><span /><span /></Box>
-          <Box className="cloud-node drive-node">DRIVE</Box>
+          <Box className="cloud-node drive-node"><ProviderLogo provider="GOOGLE_DRIVE" decorative={false} /><span>Google Drive</span></Box>
+          <Box className="provider-strip" role="group" aria-label="Proveedores disponibles">
+            <ProviderLogo provider="SEAFILE" decorative={false} />
+            <Typography variant="caption">Seafile</Typography>
+          </Box>
           <Box className="visual-caption">Transferencias seguras · Progreso en vivo</Box>
         </Box>
       </Box>
@@ -205,7 +411,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
 
 const connectionSchema = z.object({
   name: z.string().trim().min(1, 'Ingresa un nombre.'),
-  provider_type: z.enum(['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE']),
+  provider_type: z.enum(['MOCK', 'MEGA', 'GOOGLE_DRIVE', 'SEAFILE', 'SMB', 'NEXTCLOUD']),
   seafile_adapter_type: z.enum(['RCLONE', 'SEAFILE_API']),
   is_global: z.boolean(),
   mega_username: z.string(),
@@ -219,6 +425,16 @@ const connectionSchema = z.object({
   seafile_password: z.string(),
   seafile_library: z.string(),
   seafile_library_password: z.string(),
+  nextcloud_url: z.string(),
+  nextcloud_username: z.string(),
+  nextcloud_password: z.string(),
+  smb_host: z.string(),
+  smb_port: z.string(),
+  smb_share: z.string(),
+  smb_base_path: z.string(),
+  smb_username: z.string(),
+  smb_password: z.string(),
+  smb_domain: z.string(),
 }).superRefine((values, context) => {
   const required: Array<[keyof ConnectionForm, string]> = values.provider_type === 'MEGA'
     ? [['mega_username', values.mega_username], ['mega_password', values.mega_password]]
@@ -230,6 +446,19 @@ const connectionSchema = z.object({
             ['seafile_username', values.seafile_username],
             ['seafile_password', values.seafile_password],
           ]
+        : values.provider_type === 'NEXTCLOUD'
+          ? [
+              ['nextcloud_url', values.nextcloud_url],
+              ['nextcloud_username', values.nextcloud_username],
+              ['nextcloud_password', values.nextcloud_password],
+            ]
+        : values.provider_type === 'SMB'
+          ? [
+              ['smb_host', values.smb_host],
+              ['smb_share', values.smb_share],
+              ['smb_username', values.smb_username],
+              ['smb_password', values.smb_password],
+            ]
         : [];
   required.forEach(([field, value]) => {
     if (!value) context.addIssue({ code: 'custom', path: [field], message: 'Este campo es obligatorio.' });
@@ -241,27 +470,37 @@ const emptyConnectionForm: ConnectionForm = {
   mega_username: '', mega_password: '', drive_client_id: '', drive_client_secret: '',
   drive_team_drive: '', drive_root_folder_id: '', seafile_url: '', seafile_username: '',
   seafile_password: '', seafile_library: '', seafile_library_password: '',
+  nextcloud_url: '', nextcloud_username: '', nextcloud_password: '',
+  smb_host: '', smb_port: '445', smb_share: '', smb_base_path: '', smb_username: '',
+  smb_password: '', smb_domain: '',
 };
 
 function ConnectionDialog({
   open,
   onClose,
   onCreated,
+  initialProvider = 'MEGA',
 }: {
   open: boolean;
   onClose: () => void;
   onCreated: (connection: Connection) => void;
+  initialProvider?: ConnectionForm['provider_type'];
 }) {
+  const formDefaults = { ...emptyConnectionForm, provider_type: initialProvider };
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const { register, control, handleSubmit, reset, watch, formState: { errors } } = useForm<ConnectionForm>({
     resolver: zodResolver(connectionSchema),
-    defaultValues: emptyConnectionForm,
+    defaultValues: formDefaults,
   });
   const provider = watch('provider_type');
 
+  useEffect(() => {
+    if (open) reset(formDefaults);
+  }, [formDefaults.provider_type, open, reset]);
+
   const close = () => {
-    reset(emptyConnectionForm);
+    reset(formDefaults);
     setError('');
     onClose();
   };
@@ -288,7 +527,23 @@ function ConnectionDialog({
                 ? { library_password: values.seafile_library_password }
                 : {}),
             }
-          : undefined;
+          : values.provider_type === 'NEXTCLOUD'
+            ? {
+                url: values.nextcloud_url,
+                username: values.nextcloud_username,
+                password: values.nextcloud_password,
+              }
+          : values.provider_type === 'SMB'
+            ? {
+                host: values.smb_host,
+                port: values.smb_port || '445',
+                share: values.smb_share,
+                ...(values.smb_base_path.trim() ? { base_path: values.smb_base_path.trim() } : {}),
+                username: values.smb_username,
+                password: values.smb_password,
+                ...(values.smb_domain.trim() ? { domain: values.smb_domain.trim() } : {}),
+              }
+            : undefined;
     try {
       const connection = await apiRequest<Connection>('/api/v1/connections', {
         method: 'POST',
@@ -310,7 +565,7 @@ function ConnectionDialog({
         window.location.assign(authorization.authorization_url);
         return;
       }
-      reset(emptyConnectionForm);
+      reset(formDefaults);
       onCreated(connection);
       onClose();
     } catch (caught) {
@@ -322,7 +577,12 @@ function ConnectionDialog({
 
   return (
     <Dialog open={open} onClose={close} fullWidth maxWidth="sm" aria-labelledby="connection-dialog-title">
-      <DialogTitle id="connection-dialog-title">Agregar conexión</DialogTitle>
+      <DialogTitle id="connection-dialog-title">
+        Agregar conexión
+        <Typography component="span" display="block" variant="body2" color="text.secondary" sx={{ mt: 0.5, fontWeight: 400, letterSpacing: 0 }}>
+          Configura el acceso y define quién podrá usar este almacenamiento.
+        </Typography>
+      </DialogTitle>
       <Box component="form" onSubmit={handleSubmit(submit)} noValidate>
         <DialogContent>
           <Stack spacing={2}>
@@ -339,10 +599,12 @@ function ConnectionDialog({
                 control={control}
                 render={({ field }) => (
                   <Select {...field} labelId="provider-label" label="Proveedor">
-                    <MenuItem value="MEGA">MEGA</MenuItem>
-                    <MenuItem value="GOOGLE_DRIVE">Google Drive</MenuItem>
-                    <MenuItem value="SEAFILE">Seafile</MenuItem>
-                    <MenuItem value="MOCK">Simulado (pruebas)</MenuItem>
+                    <MenuItem value="MEGA"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MEGA" />MEGA</Stack></MenuItem>
+                    <MenuItem value="GOOGLE_DRIVE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="GOOGLE_DRIVE" />Google Drive</Stack></MenuItem>
+                    <MenuItem value="SEAFILE"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="SEAFILE" />Seafile</Stack></MenuItem>
+                    <MenuItem value="NEXTCLOUD"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="NEXTCLOUD" />Nextcloud</Stack></MenuItem>
+                    <MenuItem value="SMB">NAS privado (SMB)</MenuItem>
+                    <MenuItem value="MOCK"><Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider="MOCK" />Simulado (pruebas)</Stack></MenuItem>
                   </Select>
                 )}
               />
@@ -417,6 +679,48 @@ function ConnectionDialog({
                 />
               </>
             )}
+            {provider === 'NEXTCLOUD' && (
+              <>
+                <Alert severity="info">
+                  Ingresa la URL del servidor y una contraseña de aplicación. La ruta WebDAV se configura automáticamente. La prueba verifica lectura; para usar Nextcloud como destino, la cuenta también necesita permiso de escritura.
+                </Alert>
+                <TextField
+                  label="URL base de Nextcloud"
+                  placeholder="https://cloud.example.com"
+                  autoComplete="url"
+                  error={Boolean(errors.nextcloud_url)}
+                  helperText={errors.nextcloud_url?.message ?? 'Usa HTTPS; si está instalado en un subdirectorio, incluye ese prefijo.'}
+                  {...register('nextcloud_url')}
+                />
+                <TextField
+                  label="Usuario de Nextcloud"
+                  autoComplete="username"
+                  error={Boolean(errors.nextcloud_username)}
+                  helperText={errors.nextcloud_username?.message ?? ' '}
+                  {...register('nextcloud_username')}
+                />
+                <TextField
+                  label="Contraseña de aplicación"
+                  type="password"
+                  autoComplete="new-password"
+                  error={Boolean(errors.nextcloud_password)}
+                  helperText={errors.nextcloud_password?.message ?? ' '}
+                  {...register('nextcloud_password')}
+                />
+              </>
+            )}
+            {provider === 'SMB' && (
+              <>
+                <Alert severity="info">CTM debe alcanzar el NAS desde la LAN o una VPN ya configurada. La cuenta debe tener acceso de solo lectura al recurso.</Alert>
+                <TextField label="Servidor NAS" placeholder="nas.intranet.local" {...register('smb_host')} error={Boolean(errors.smb_host)} helperText={errors.smb_host?.message ?? ' '} />
+                <TextField label="Puerto SMB" inputMode="numeric" {...register('smb_port')} />
+                <TextField label="Recurso compartido" placeholder="Datos" {...register('smb_share')} error={Boolean(errors.smb_share)} helperText={errors.smb_share?.message ?? ' '} />
+                <TextField label="Carpeta raíz opcional" placeholder="Departamentos" {...register('smb_base_path')} />
+                <TextField label="Dominio opcional" {...register('smb_domain')} />
+                <TextField label="Usuario SMB" autoComplete="username" {...register('smb_username')} error={Boolean(errors.smb_username)} helperText={errors.smb_username?.message ?? ' '} />
+                <TextField label="Contraseña SMB" type="password" autoComplete="new-password" {...register('smb_password')} error={Boolean(errors.smb_password)} helperText={errors.smb_password?.message ?? ' '} />
+              </>
+            )}
             {provider === 'MOCK' && <Alert severity="info">Conexión local de demostración; no usa credenciales externas.</Alert>}
             <Controller
               name="is_global"
@@ -478,7 +782,12 @@ function ChangePasswordDialog({
   };
   return (
     <Dialog open={open} onClose={canClose ? onClose : undefined} fullWidth maxWidth="xs" aria-labelledby="password-dialog-title">
-      <DialogTitle id="password-dialog-title">Cambia tu contraseña</DialogTitle>
+      <DialogTitle id="password-dialog-title">
+        Cambia tu contraseña
+        <Typography component="span" display="block" variant="body2" color="text.secondary" sx={{ mt: 0.5, fontWeight: 400, letterSpacing: 0 }}>
+          Elige una clave de al menos 12 caracteres.
+        </Typography>
+      </DialogTitle>
       <Box component="form" onSubmit={handleSubmit(submit)} noValidate>
         <DialogContent>
           <Stack spacing={2}>
@@ -511,22 +820,31 @@ function AdminDialog({
   const queryClient = useQueryClient();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [adminTab, setAdminTab] = useState<'general' | 'smtp'>('general');
+  const [smtpSaving, setSmtpSaving] = useState(false);
+  const [smtpTesting, setSmtpTesting] = useState(false);
+  const [smtpResult, setSmtpResult] = useState<{ severity: 'success' | 'error'; message: string } | null>(null);
   const [selectedUser, setSelectedUser] = useState('');
   const [selectedConnection, setSelectedConnection] = useState('');
   const usersQuery = useQuery({
     queryKey: ['admin-users'],
     queryFn: () => apiRequest<{ items: ManagedUser[]; total_count: number }>('/api/v1/users'),
-    enabled: open,
+    enabled: open && adminTab === 'general',
   });
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
     queryFn: () => apiRequest<{ items: Connection[] }>('/api/v1/connections'),
-    enabled: open,
+    enabled: open && adminTab === 'general',
   });
   const auditQuery = useQuery({
     queryKey: ['audit-events'],
     queryFn: () => apiRequest<{ items: Array<{ id: string; action: string; result: string; created_at: string }> }>('/api/v1/audit-events?limit=20'),
-    enabled: open,
+    enabled: open && adminTab === 'general',
+  });
+  const smtpQuery = useQuery({
+    queryKey: ['admin-smtp-settings'],
+    queryFn: () => apiRequest<SmtpSettings>('/api/v1/settings/smtp'),
+    enabled: open && adminTab === 'smtp',
   });
   const { register, control, handleSubmit, reset, formState: { errors } } = useForm({
     resolver: zodResolver(z.object({
@@ -537,6 +855,30 @@ function AdminDialog({
     })),
     defaultValues: { username: '', email: '', password: '', role: 'USER' as const },
   });
+  const {
+    register: registerSmtp,
+    control: smtpControl,
+    handleSubmit: handleSmtpSubmit,
+    reset: resetSmtp,
+    formState: { errors: smtpErrors },
+  } = useForm<SmtpFormValues>({
+    resolver: zodResolver(smtpFormSchema),
+    defaultValues: {
+      host: '',
+      port: 587,
+      use_tls: true,
+      from_address: '',
+      credentials_configured: false,
+      username: '',
+      password: '',
+    },
+  });
+
+  useEffect(() => {
+    if (smtpQuery.data) {
+      resetSmtp({ ...smtpQuery.data, username: '', password: '' });
+    }
+  }, [smtpQuery.data, resetSmtp]);
 
   const createUser = async (values: { username: string; email: string; password: string; role: 'ADMIN' | 'USER' }) => {
     setBusy(true);
@@ -577,15 +919,81 @@ function AdminDialog({
     }
   };
 
+  const saveSmtpSettings = async (values: SmtpFormValues) => {
+    setSmtpSaving(true);
+    setSmtpResult(null);
+    try {
+      await apiRequest<SmtpSettings>('/api/v1/settings/smtp', {
+        method: 'PUT',
+        body: JSON.stringify({
+          host: values.host,
+          port: values.port,
+          use_tls: values.use_tls,
+          from_address: values.from_address,
+          username: values.username,
+          password: values.password,
+        }),
+      });
+      await queryClient.invalidateQueries({ queryKey: ['admin-smtp-settings'] });
+      setSmtpResult({ severity: 'success', message: 'Configuración SMTP guardada.' });
+    } catch {
+      setSmtpResult({ severity: 'error', message: 'No se pudo guardar la configuración SMTP.' });
+    } finally {
+      setSmtpSaving(false);
+    }
+  };
+
+  const testSmtpSettings = async (values: SmtpFormValues) => {
+    setSmtpTesting(true);
+    setSmtpResult(null);
+    try {
+      const result = await apiRequest<{ success: boolean; message: string }>(
+        '/api/v1/settings/smtp/test',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            host: values.host,
+            port: values.port,
+            use_tls: values.use_tls,
+            from_address: values.from_address,
+            username: values.username,
+            password: values.password,
+          }),
+        },
+      );
+      setSmtpResult({ severity: result.success ? 'success' : 'error', message: result.message });
+    } catch {
+      setSmtpResult({ severity: 'error', message: 'No se pudo probar la conexión SMTP.' });
+    } finally {
+      setSmtpTesting(false);
+    }
+  };
+
   const users = usersQuery.data?.items ?? [];
   const privateConnections = (connectionsQuery.data?.items ?? []).filter((connection) => !connection.is_global);
 
   return (
     <Dialog open={open} onClose={onClose} fullWidth maxWidth="md" aria-labelledby="admin-dialog-title">
-      <DialogTitle id="admin-dialog-title">Administración</DialogTitle>
+      <DialogTitle id="admin-dialog-title">
+        Administración
+        <Typography component="span" display="block" variant="body2" color="text.secondary" sx={{ mt: 0.5, fontWeight: 400, letterSpacing: 0 }}>
+          Gestiona usuarios, accesos privados y actividad reciente.
+        </Typography>
+      </DialogTitle>
       <DialogContent>
-        <Stack spacing={3}>
-          <Box>
+        <Tabs
+          className="admin-tabs"
+          value={adminTab}
+          onChange={(_event, value: 'general' | 'smtp') => setAdminTab(value)}
+          aria-label="Pestañas de administración"
+          variant="scrollable"
+          allowScrollButtonsMobile
+        >
+          <Tab value="general" label="General" />
+          <Tab value="smtp" label="Correo SMTP" />
+        </Tabs>
+        {adminTab === 'general' && <Stack spacing={3}>
+          <Box className="admin-section">
             <Typography variant="h6" sx={{ mb: 1.5 }}>Crear usuario</Typography>
             <Box component="form" onSubmit={handleSubmit(createUser)} noValidate>
               <Stack spacing={1.5}>
@@ -608,7 +1016,7 @@ function AdminDialog({
             </Box>
           </Box>
 
-          <Box>
+          <Box className="admin-section">
             <Typography variant="h6" sx={{ mb: 1 }}>Usuarios</Typography>
             <Paper variant="outlined" className="admin-list">
               {usersQuery.isLoading && <LinearProgress />}
@@ -616,7 +1024,7 @@ function AdminDialog({
                 <Box className="admin-user-row" key={managedUser.id}>
                   <Box>
                     <Typography fontWeight={650}>{managedUser.username}</Typography>
-                    <Typography variant="caption" color="text.secondary">{managedUser.email} · {managedUser.role}</Typography>
+                    <Typography variant="caption" color="text.secondary">{managedUser.email} · {managedUser.role === 'ADMIN' ? 'Administrador' : 'Usuario'}</Typography>
                   </Box>
                   {managedUser.is_active
                     ? <Button size="small" color="error" disabled={managedUser.id === currentUserId} onClick={() => void deactivate(managedUser.id)}>Desactivar</Button>
@@ -626,7 +1034,7 @@ function AdminDialog({
             </Paper>
           </Box>
 
-          <Box>
+          <Box className="admin-section">
             <Typography variant="h6" sx={{ mb: 1 }}>Acceso a conexiones privadas</Typography>
             {privateConnections.length === 0
               ? <Typography variant="body2" color="text.secondary">No hay conexiones privadas pendientes de asignación.</Typography>
@@ -640,26 +1048,134 @@ function AdminDialog({
                   <FormControl fullWidth size="small">
                     <InputLabel id="grant-connection-label">Conexión</InputLabel>
                     <Select labelId="grant-connection-label" label="Conexión" value={selectedConnection} onChange={(event) => setSelectedConnection(event.target.value)}>
-                      {privateConnections.map((connection) => <MenuItem key={connection.id} value={connection.id}>{connection.name}</MenuItem>)}
+                      {privateConnections.map((connection) => (
+                        <MenuItem key={connection.id} value={connection.id}>
+                          <Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider={connection.provider_type} />{connection.name}</Stack>
+                        </MenuItem>
+                      ))}
                     </Select>
                   </FormControl>
                   <Button variant="outlined" disabled={!selectedUser || !selectedConnection} onClick={() => void grantConnection()}>Asignar</Button>
                 </Stack>}
           </Box>
 
-          <Box>
+          <Box className="admin-section">
             <Typography variant="h6" sx={{ mb: 1 }}>Auditoría reciente</Typography>
             <Paper variant="outlined" className="admin-list">
               {(auditQuery.data?.items ?? []).slice(0, 5).map((event) => (
                 <Box className="admin-user-row" key={event.id}>
                   <Typography variant="body2">{event.action.replaceAll('_', ' ')}</Typography>
-                  <Typography variant="caption" color="text.secondary">{event.result}</Typography>
+                  <Box className="audit-event-meta">
+                    <Typography variant="caption" color="text.secondary">{event.result}</Typography>
+                    <Typography component="time" dateTime={event.created_at} variant="caption" color="text.secondary">
+                      {formatRequestedAt(event.created_at) ?? 'Fecha no disponible'}
+                    </Typography>
+                  </Box>
                 </Box>
               ))}
             </Paper>
           </Box>
           {error && <Alert severity="error">{error}</Alert>}
-        </Stack>
+        </Stack>}
+        {adminTab === 'smtp' && (
+          <Box className="admin-section smtp-settings-section">
+            <Stack spacing={2.5}>
+              <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'flex-start', sm: 'center' }} spacing={1}>
+                <Box>
+                  <Typography variant="h6">Servidor SMTP</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Configura el correo que envía las notificaciones de transferencia.
+                  </Typography>
+                </Box>
+                {smtpQuery.data && (
+                  <Chip
+                    size="small"
+                    color={smtpQuery.data.credentials_configured ? 'success' : 'default'}
+                    label={smtpQuery.data.credentials_configured ? 'Credenciales SMTP configuradas' : 'Sin credenciales'}
+                  />
+                )}
+              </Stack>
+              {smtpQuery.isLoading && <LinearProgress aria-label="Cargando configuración SMTP" />}
+              {smtpQuery.isError && <Alert severity="error">No se pudo cargar la configuración SMTP.</Alert>}
+              {smtpQuery.data && (
+                <Box component="form" onSubmit={handleSmtpSubmit(saveSmtpSettings)} noValidate>
+                  <Stack spacing={2.5}>
+                    <Box className="smtp-settings-grid">
+                      <TextField
+                        label="Servidor SMTP"
+                        {...registerSmtp('host')}
+                        error={Boolean(smtpErrors.host)}
+                        helperText={smtpErrors.host?.message ?? ' '}
+                        autoComplete="url"
+                      />
+                      <TextField
+                        label="Puerto"
+                        type="number"
+                        inputProps={{ min: 1, max: 65535 }}
+                        {...registerSmtp('port', { valueAsNumber: true })}
+                        error={Boolean(smtpErrors.port)}
+                        helperText={smtpErrors.port?.message ?? ' '}
+                      />
+                      <TextField
+                        label="Usuario SMTP"
+                        autoComplete="username"
+                        {...registerSmtp('username')}
+                        error={Boolean(smtpErrors.username)}
+                        helperText={smtpErrors.username?.message ?? ' '}
+                      />
+                      <TextField
+                        label="Contraseña SMTP"
+                        type="password"
+                        autoComplete="new-password"
+                        {...registerSmtp('password')}
+                        error={Boolean(smtpErrors.password)}
+                        helperText={smtpErrors.password?.message ?? ' '}
+                      />
+                      <TextField
+                        label="Correo remitente"
+                        type="email"
+                        {...registerSmtp('from_address')}
+                        error={Boolean(smtpErrors.from_address)}
+                        helperText={smtpErrors.from_address?.message ?? ' '}
+                      />
+                    </Box>
+                    <FormHelperText className="smtp-credentials-hint">
+                      Deja usuario y contraseña vacíos para conservar las credenciales guardadas.
+                    </FormHelperText>
+                    <Box className="smtp-tls-option">
+                      <Controller
+                        name="use_tls"
+                        control={smtpControl}
+                        render={({ field }) => (
+                          <FormControlLabel
+                            control={<Checkbox {...field} checked={field.value} />}
+                            label="Usar STARTTLS"
+                          />
+                        )}
+                      />
+                      <Typography variant="caption" color="text.secondary">
+                        Cifra la conexión entre la aplicación y el servidor de correo.
+                      </Typography>
+                    </Box>
+                    {smtpResult && <Alert severity={smtpResult.severity}>{smtpResult.message}</Alert>}
+                    <Stack direction={{ xs: 'column-reverse', sm: 'row' }} justifyContent="flex-end" spacing={1.25}>
+                      <Button
+                        variant="outlined"
+                        disabled={smtpSaving || smtpTesting}
+                        onClick={handleSmtpSubmit(testSmtpSettings)}
+                      >
+                        {smtpTesting ? <><CircularProgress size={16} color="inherit" />&nbsp; Probando conexión</> : 'Probar conexión'}
+                      </Button>
+                      <Button type="submit" variant="contained" disabled={smtpSaving || smtpTesting}>
+                        {smtpSaving ? <><CircularProgress size={16} color="inherit" />&nbsp; Guardando</> : 'Guardar configuración'}
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </Box>
+              )}
+            </Stack>
+          </Box>
+        )}
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2.5 }}><Button onClick={onClose}>Cerrar</Button></DialogActions>
     </Dialog>
@@ -673,7 +1189,7 @@ function pathCrumbs(path: string): string[] {
 function formatBytes(size: number | null): string {
   if (size === null) return '—';
   if (size < 1024) return `${size} B`;
-  const units = ['KB', 'MB', 'GB', 'TB'];
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
   let value = size / 1024;
   let index = 0;
   while (value >= 1024 && index < units.length - 1) {
@@ -683,9 +1199,105 @@ function formatBytes(size: number | null): string {
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[index]}`;
 }
 
+function formatProgressPercent(value: number, fractionDigits = 0): string {
+  const bounded = Math.max(0, Math.min(100, value));
+  const precision = 10 ** fractionDigits;
+  const rounded = Math.round(bounded * precision) / precision;
+  const displayValue = bounded < 100 && rounded >= 100 ? 100 - 1 / precision : rounded;
+  return displayValue.toFixed(fractionDigits);
+}
+
+function formatTransferBytes(transferred: number, total: number): string {
+  return total > 0
+    ? `${formatBytes(transferred)} de ${formatBytes(total)}`
+    : `${formatBytes(transferred)} transferidos`;
+}
+
+function formatRequestedAt(value?: string | null): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return new Intl.DateTimeFormat('es-CL', { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+}
+
+function localDateTimeValue(date: Date): string {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function transferWaitReasonLabel(reason?: string | null): string | null {
+  if (!reason) return null;
+  const labels: Record<string, string> = {
+    WAITING_UNTIL: 'A la espera de la hora programada',
+    WAITING_PARENT: 'A la espera de la transferencia padre',
+    WAITING_EVALUATION: 'Esperando que termine la evaluación de la selección',
+    BLOCKED_EVALUATION: 'Selección bloqueada por la evaluación previa',
+    BLOCKED_PARENT_FAILED: 'Bloqueada: la transferencia padre no terminó correctamente',
+    WAITING_CAPACITY: 'En cola: no hay un espacio de ejecución disponible',
+    WAITING_EXCLUSIVE: 'En cola: espera a que terminen las otras transferencias',
+    WAITING_CONNECTION: 'En cola: una conexión está ocupada',
+    WAITING_STAGING: 'En cola: espera el espacio temporal de transferencia',
+    WAITING_CONNECTION_ACTIVE: 'En espera: activa las conexiones de origen y destino',
+    WAITING_CONNECTION_ACCESS: 'En espera: restaura el acceso a las conexiones',
+    WAITING_USER_ACTIVE: 'En espera: la cuenta solicitante está inactiva',
+    BLOCKED_CONNECTION_CHANGED: 'Bloqueada: cambiaron las credenciales. Crea una transferencia nueva para usar la conexión actualizada.',
+  };
+  return labels[reason] ?? 'En espera de condiciones para iniciar';
+}
+
+function localTimeOffsetLabel(value: string, timeZone: string): string {
+  const date = new Date(value);
+  const part = new Intl.DateTimeFormat('es-CL', {
+    timeZone,
+    timeZoneName: 'shortOffset',
+  }).formatToParts(date).find((item) => item.type === 'timeZoneName');
+  return part?.value ?? timeZone;
+}
+
+function formatTransferDuration(transfer: Transfer): string {
+  const isTerminal = terminalTransferStatuses.includes(transfer.status);
+  if (!transfer.started_at) {
+    return isTerminal ? 'Duración no disponible' : 'En cola';
+  }
+  if (isTerminal && !transfer.completed_at) return 'Duración no disponible';
+  const start = new Date(transfer.started_at).getTime();
+  const end = transfer.completed_at ? new Date(transfer.completed_at).getTime() : Date.now();
+  if (Number.isNaN(start) || Number.isNaN(end)) return 'Duración no disponible';
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  const elapsed = hours > 0
+    ? `${hours} h ${minutes} min`
+    : minutes > 0
+      ? `${minutes} min ${remainingSeconds} s`
+      : `${remainingSeconds} s`;
+  return transfer.completed_at ? `Duración: ${elapsed}` : `En curso · ${elapsed}`;
+}
+
+function transferStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    SCHEDULED: 'Programada',
+    QUEUED: 'En cola',
+    VALIDATING: 'Validando',
+    RUNNING: 'En curso',
+    RETRYING: 'Reintentando',
+    PAUSING: 'Pausando',
+    PAUSED: 'Pausada',
+    CANCELLING: 'Cancelando',
+    COMPLETED: 'Completada',
+    COMPLETED_WITH_WARNINGS: 'Completada con avisos',
+    FAILED: 'Fallida',
+    CANCELLED: 'Cancelada',
+  };
+  return labels[status] ?? status.replaceAll('_', ' ').toLowerCase();
+}
+
 function providerLabel(provider: string): string {
   if (provider === 'GOOGLE_DRIVE') return 'Google Drive';
   if (provider === 'SEAFILE') return 'Seafile Community Edition';
+  if (provider === 'NEXTCLOUD') return 'Nextcloud';
+  if (provider === 'SMB') return 'NAS privado (SMB)';
   if (provider === 'MOCK') return 'Simulada';
   return provider;
 }
@@ -714,7 +1326,9 @@ function lastTestLabel(connection: Connection): string {
   const result = connection.last_test_status === 'SUCCESS' ? 'Prueba exitosa' : 'Prueba fallida';
   if (!connection.last_tested_at) return result;
   const date = new Date(connection.last_tested_at);
-  return Number.isNaN(date.getTime()) ? result : `${result} · ${date.toLocaleString()}`;
+  return Number.isNaN(date.getTime())
+    ? result
+    : `${result} · ${new Intl.DateTimeFormat('es-CL', { dateStyle: 'medium', timeStyle: 'short' }).format(date)}`;
 }
 
 function ConnectionManagementSection({
@@ -733,32 +1347,13 @@ function ConnectionManagementSection({
   onArchive: (connection: Connection) => Promise<void>;
 }) {
   const [selectedConnection, setSelectedConnection] = useState<Connection | null>(null);
-  const [archiveError, setArchiveError] = useState('');
-  const [archiving, setArchiving] = useState(false);
 
   const requestArchive = (connection: Connection) => {
-    setArchiveError('');
     setSelectedConnection(connection);
   };
 
   const closeArchiveDialog = () => {
-    if (archiving) return;
     setSelectedConnection(null);
-    setArchiveError('');
-  };
-
-  const confirmArchive = async () => {
-    if (!selectedConnection || archiving) return;
-    setArchiving(true);
-    setArchiveError('');
-    try {
-      await onArchive(selectedConnection);
-      setSelectedConnection(null);
-    } catch (caught) {
-      setArchiveError(caught instanceof Error ? caught.message : 'No se pudo archivar la conexión.');
-    } finally {
-      setArchiving(false);
-    }
   };
 
   return (
@@ -770,7 +1365,7 @@ function ConnectionManagementSection({
             Revisa su estado y archiva las que ya no uses. El historial de transferencias se conserva.
           </Typography>
         </Box>
-        <Button variant="contained" onClick={onAdd}>＋ Agregar conexión</Button>
+        <Button variant="contained" onClick={onAdd} startIcon={<span aria-hidden="true">＋</span>}>Agregar conexión</Button>
       </Box>
 
       <Paper className="connection-inventory" elevation={0} role="list" aria-label="Inventario de conexiones">
@@ -802,8 +1397,13 @@ function ConnectionManagementSection({
           <Box className="connection-row" component="article" role="listitem" key={connection.id}>
             <Box className="connection-name-field">
               <span className="connection-field-label">Conexión</span>
-              <Typography fontWeight={700}>{connection.name}</Typography>
-              <Typography variant="caption" color="text.secondary">{providerLabel(connection.provider_type)}</Typography>
+              <Box className="connection-identity">
+                <ProviderLogo provider={connection.provider_type} />
+                <Box className="connection-name-field">
+                  <Typography fontWeight={700}>{connection.name}</Typography>
+                  <Typography variant="caption" color="text.secondary">{providerLabel(connection.provider_type)}</Typography>
+                </Box>
+              </Box>
               {connectionAdapterLabel(connection) && (
                 <Typography variant="caption" color="text.secondary">
                   {connectionAdapterLabel(connection)}
@@ -826,6 +1426,7 @@ function ConnectionManagementSection({
               <Button
                 color="error"
                 variant="text"
+                startIcon={<InterfaceIcon name="archive" />}
                 aria-label={`Archivar ${connection.name}`}
                 onClick={() => requestArchive(connection)}
               >
@@ -836,35 +1437,156 @@ function ConnectionManagementSection({
         ))}
       </Paper>
 
-      <Dialog
-        open={Boolean(selectedConnection)}
+      <ConnectionArchiveDialog
+        connection={selectedConnection}
         onClose={closeArchiveDialog}
-        fullWidth
-        maxWidth="xs"
-        aria-labelledby="archive-connection-title"
-      >
-        <DialogTitle id="archive-connection-title">Archivar conexión</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2}>
-            <Typography>
-              ¿Quieres archivar <strong>{selectedConnection?.name}</strong>? Dejará de aparecer en el explorador y se quitarán sus credenciales guardadas.
-            </Typography>
-            <Typography variant="body2" color="text.secondary">
-              Proveedor: {selectedConnection ? providerLabel(selectedConnection.provider_type) : ''}
-            </Typography>
-            <Typography color="text.secondary" variant="body2">
-              El historial de transferencias se conservará. No se puede archivar una conexión mientras tenga una transferencia activa.
-            </Typography>
-            {archiveError && <Alert severity="error">{archiveError}</Alert>}
-          </Stack>
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2.5 }}>
-          <Button onClick={closeArchiveDialog} disabled={archiving}>Cancelar</Button>
-          <Button color="error" variant="contained" aria-label="Confirmar archivado" onClick={() => void confirmArchive()} disabled={archiving}>
-            {archiving ? <CircularProgress size={20} color="inherit" /> : 'Confirmar archivado'}
-          </Button>
-        </DialogActions>
-      </Dialog>
+        onArchive={onArchive}
+      />
+    </Box>
+  );
+}
+
+function ConnectionArchiveDialog({
+  connection,
+  onClose,
+  onArchive,
+}: {
+  connection: Connection | null;
+  onClose: () => void;
+  onArchive: (connection: Connection) => Promise<void>;
+}) {
+  const [archiveError, setArchiveError] = useState('');
+  const [archiving, setArchiving] = useState(false);
+
+  const closeArchiveDialog = () => {
+    if (archiving) return;
+    setArchiveError('');
+    onClose();
+  };
+
+  const confirmArchive = async () => {
+    if (!connection || archiving) return;
+    setArchiving(true);
+    setArchiveError('');
+    try {
+      await onArchive(connection);
+      onClose();
+    } catch (caught) {
+      setArchiveError(caught instanceof Error ? caught.message : 'No se pudo archivar la conexión.');
+    } finally {
+      setArchiving(false);
+    }
+  };
+
+  return (
+    <Dialog
+      open={Boolean(connection)}
+      onClose={closeArchiveDialog}
+      fullWidth
+      maxWidth="xs"
+      aria-labelledby="archive-connection-title"
+    >
+      <DialogTitle id="archive-connection-title">Archivar conexión</DialogTitle>
+      <DialogContent>
+        <Stack spacing={2}>
+          <Typography>
+            ¿Quieres archivar <strong>{connection?.name}</strong>? Dejará de aparecer en el explorador y se quitarán sus credenciales guardadas.
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            <span className="dialog-provider"><ProviderLogo provider={connection?.provider_type ?? ''} />Proveedor: {connection ? providerLabel(connection.provider_type) : ''}</span>
+          </Typography>
+          <Typography color="text.secondary" variant="body2">
+            El historial de transferencias se conservará. No se puede archivar una conexión mientras tenga una transferencia activa.
+          </Typography>
+          {archiveError && <Alert severity="error">{archiveError}</Alert>}
+        </Stack>
+      </DialogContent>
+      <DialogActions sx={{ px: 3, pb: 2.5 }}>
+        <Button onClick={closeArchiveDialog} disabled={archiving}>Cancelar</Button>
+        <Button color="error" variant="contained" aria-label="Confirmar archivado" onClick={() => void confirmArchive()} disabled={archiving}>
+          {archiving ? <CircularProgress size={20} color="inherit" /> : 'Confirmar archivado'}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+function PrivateServicesSection({
+  connections,
+  loading,
+  isAdmin,
+  onAdd,
+  onExplore,
+  onArchive,
+}: {
+  connections: Connection[];
+  loading: boolean;
+  isAdmin: boolean;
+  onAdd: () => void;
+  onExplore: (connection: Connection) => void;
+  onArchive: (connection: Connection) => Promise<void>;
+}) {
+  const [selectedConnection, setSelectedConnection] = useState<Connection | null>(null);
+
+  return (
+    <Box component="section" aria-labelledby="private-services-title">
+      <Box className="connection-management-heading">
+        <Box>
+          <Typography variant="h5" component="h2" id="private-services-title">Servicios privados</Typography>
+          <Typography color="text.secondary" sx={{ mt: 0.5 }}>
+            NAS accesibles desde la red de CTM o desde una VPN ya configurada.
+          </Typography>
+        </Box>
+        {isAdmin && <Button variant="contained" onClick={onAdd}>Agregar NAS</Button>}
+      </Box>
+      {loading && <LinearProgress aria-label="Cargando servicios privados" />}
+      {!loading && connections.length === 0 && (
+        <Paper className="connection-empty-state" elevation={0}>
+          <Typography variant="h6">Aún no hay NAS configurados</Typography>
+          <Typography color="text.secondary">
+            Un administrador puede conectar un recurso compartido SMB accesible desde CTM.
+          </Typography>
+        </Paper>
+      )}
+      <Stack spacing={1.5}>
+        {connections.map((connection) => (
+          <Paper key={connection.id} className="connection-inventory" elevation={0}>
+            <Box className="connection-row private-service-row">
+              <Box className="connection-name-field">
+                <Typography fontWeight={700}>{connection.name}</Typography>
+                <Typography variant="caption" color="text.secondary">NAS · SMB</Typography>
+              </Box>
+              <Chip size="small" color={connectionStatusColor(connection.status)} label={connectionStatusLabel(connection.status)} />
+              <Stack className="private-service-actions" direction="row" spacing={1}>
+                <Button
+                  variant="outlined"
+                  disabled={connection.status !== 'ACTIVE'}
+                  onClick={() => onExplore(connection)}
+                  aria-label={`Explorar ${connection.name}`}
+                >
+                  Explorar NAS
+                </Button>
+                {isAdmin && (
+                  <Button
+                    color="error"
+                    variant="text"
+                    startIcon={<InterfaceIcon name="archive" />}
+                    aria-label={`Archivar ${connection.name}`}
+                    onClick={() => setSelectedConnection(connection)}
+                  >
+                    Archivar
+                  </Button>
+                )}
+              </Stack>
+            </Box>
+          </Paper>
+        ))}
+      </Stack>
+      <ConnectionArchiveDialog
+        connection={selectedConnection}
+        onClose={() => setSelectedConnection(null)}
+        onArchive={onArchive}
+      />
     </Box>
   );
 }
@@ -877,7 +1599,8 @@ function ExplorerPanel({
   onConnectionChange,
   path,
   onPathChange,
-  selectedPaths,
+  directoryIds,
+  selectedItems,
   onToggle,
   isAdmin,
   onTestConnection,
@@ -888,8 +1611,9 @@ function ExplorerPanel({
   connectionId: string;
   onConnectionChange: (id: string) => void;
   path: string;
-  onPathChange: (path: string) => void;
-  selectedPaths?: string[];
+  onPathChange: (path: string, objectId?: string | null) => void;
+  directoryIds?: Record<string, string>;
+  selectedItems?: StorageItem[];
   onToggle?: (item: StorageItem) => void;
   isAdmin: boolean;
   onTestConnection: (connectionId: string, otp?: string) => Promise<void>;
@@ -898,12 +1622,14 @@ function ExplorerPanel({
   const [testing, setTesting] = useState(false);
   const [otp, setOtp] = useState('');
   const active = connections.find((connection) => connection.id === connectionId);
+  const parentObjectId = directoryIds?.[path] ?? null;
   const query = useInfiniteQuery({
-    queryKey: ['items', connectionId, path, search],
+    queryKey: ['items', connectionId, path, parentObjectId, search],
     enabled: Boolean(connectionId) && active?.status === 'ACTIVE',
     initialPageParam: undefined as string | undefined,
     queryFn: ({ pageParam }) => {
       const params = new URLSearchParams({ path, page_size: '50', sort: 'name', direction: 'asc' });
+      if (parentObjectId) params.set('parent_object_id', parentObjectId);
       if (search.trim()) params.set('search', search.trim());
       if (pageParam) params.set('cursor', pageParam);
       return apiRequest<ItemPage>(`/api/v1/connections/${connectionId}/items?${params}`);
@@ -933,7 +1659,7 @@ function ExplorerPanel({
             <Typography variant="overline" color="text.secondary">{side === 'source' ? '01 · ORIGEN' : '02 · DESTINO'}</Typography>
             <Typography variant="h6">{title}</Typography>
           </Box>
-          {side === 'source' && <Typography className="selection-count">{selectedPaths?.length ?? 0} seleccionados</Typography>}
+          {side === 'source' && <Typography className="selection-count">{selectedItems?.length ?? 0} seleccionados</Typography>}
         </Stack>
         <FormControl fullWidth size="small" sx={{ mt: 2 }}>
           <InputLabel id={`${side}-connection-label`}>Conexión</InputLabel>
@@ -947,15 +1673,18 @@ function ExplorerPanel({
             }}
           >
             {connections.map((connection) => (
-              <MenuItem key={connection.id} value={connection.id}>{connection.name}</MenuItem>
+              <MenuItem key={connection.id} value={connection.id}>
+                <Stack direction="row" alignItems="center" spacing={1}><ProviderLogo provider={connection.provider_type} />{connection.name}</Stack>
+              </MenuItem>
             ))}
           </Select>
         </FormControl>
         {active && (
           <>
             <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-              <Typography variant="caption" color="text.secondary">
-                Estado: {active.status === 'ACTIVE' ? 'activa' : active.status === 'ERROR' ? 'requiere atención' : 'pendiente de prueba'}
+              <Typography className="explorer-connection-status" variant="caption" color="text.secondary">
+                <ProviderLogo provider={active.provider_type} />
+                {providerLabel(active.provider_type)} · {active.status === 'ACTIVE' ? 'activa' : active.status === 'ERROR' ? 'requiere atención' : 'pendiente de prueba'}
               </Typography>
               {isAdmin && (
                 <Button size="small" onClick={() => void testConnection()} disabled={testing}>
@@ -986,7 +1715,7 @@ function ExplorerPanel({
               <Button size="small" onClick={() => onPathChange('/')}>Mi unidad</Button>
               {crumbs.map((crumb, index) => {
                 const crumbPath = `/${crumbs.slice(0, index + 1).join('/')}`;
-                return <Button key={crumbPath} size="small" onClick={() => onPathChange(crumbPath)}>{crumb}</Button>;
+                return <Button key={crumbPath} size="small" onClick={() => onPathChange(crumbPath, directoryIds?.[crumbPath] ?? null)}>{crumb}</Button>;
               })}
             </Stack>
             <TextField
@@ -999,25 +1728,32 @@ function ExplorerPanel({
             />
             <Paper variant="outlined" className="file-list">
               {path !== '/' && (
-                <Button className="parent-row" fullWidth onClick={() => onPathChange(`/${crumbs.slice(0, -1).join('/')}` || '/')}>↑ Subir un nivel</Button>
+                <Button className="parent-row" fullWidth onClick={() => {
+                  const parentPath = `/${crumbs.slice(0, -1).join('/')}` || '/';
+                  onPathChange(parentPath, directoryIds?.[parentPath] ?? null);
+                }}>↑ Subir un nivel</Button>
               )}
               {query.isLoading && <Box sx={{ p: 2 }}><LinearProgress /></Box>}
               {query.isError && <Alert severity="error" sx={{ m: 1 }}>No se pudo cargar esta carpeta.</Alert>}
               {items.map((item) => (
-                <Box className="file-row" key={item.path}>
+                <Box className="file-row" key={item.object_id ?? `${item.is_dir ? 'dir' : 'file'}:${item.path}`}>
                   {side === 'source' ? (
                     <Checkbox
                       size="small"
-                      checked={selectedPaths?.includes(item.path) ?? false}
+                      checked={selectedItems?.some((selected) => (
+                        item.object_id
+                          ? selected.object_id === item.object_id
+                          : !selected.object_id && selected.path === item.path
+                      )) ?? false}
                       onChange={() => onToggle?.(item)}
                       inputProps={{ 'aria-label': `Seleccionar ${item.name}` }}
                     />
                   ) : <Box className="file-row-spacer" />}
                   <Button
                     className="file-name"
-                    onClick={() => item.is_dir && onPathChange(item.path)}
+                    onClick={() => item.is_dir && onPathChange(item.path, item.object_id ?? null)}
                     disabled={!item.is_dir}
-                    startIcon={<span aria-hidden="true">{item.is_dir ? '▰' : '↗'}</span>}
+                    startIcon={<InterfaceIcon name={item.is_dir ? 'folder' : 'file'} />}
                   >
                     <span>{item.name}</span>
                   </Button>
@@ -1055,39 +1791,289 @@ function TransferWorkspace({
   onUserUpdated: (patch: Partial<User>) => void;
 }) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const pendingTransferKeys = useRef(new Map<string, string>());
+  const createTransfer = async (payload: Record<string, unknown>) => {
+    const fingerprint = JSON.stringify(payload);
+    const key = pendingTransferKeys.current.get(fingerprint) ?? crypto.randomUUID();
+    pendingTransferKeys.current.set(fingerprint, key);
+    const transfer = await apiRequest<Transfer>('/api/v1/transfers', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': key },
+      body: fingerprint,
+    });
+    pendingTransferKeys.current.delete(fingerprint);
+    return transfer;
+  };
+  const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections' | 'private' | 'scheduled' | 'documentation' | 'metrics'>(location.pathname === '/metrics' ? 'metrics' : 'explorer');
+  useEffect(() => {
+    if (location.pathname === '/metrics') setWorkspaceSection('metrics');
+    else if (location.pathname === '/' && workspaceSection === 'metrics') setWorkspaceSection('explorer');
+  }, [location.pathname, workspaceSection]);
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
     queryFn: () => apiRequest<{ items: Connection[] }>('/api/v1/connections'),
   });
+  const transferCapabilitiesQuery = useQuery({
+    queryKey: ['transfer-capabilities'],
+    queryFn: () => apiRequest<TransferCapabilities>('/api/v1/transfers/capabilities'),
+  });
   const transfersQuery = useQuery({
     queryKey: ['transfers'],
-    queryFn: () => apiRequest<{ items: Transfer[] }>('/api/v1/transfers'),
-    refetchInterval: 3_000,
+    queryFn: () => apiRequest<TransferListPage>('/api/v1/transfers?exclude_background=true&offset=0&page_size=50'),
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+  });
+  const backgroundTransfersQuery = useQuery({
+    queryKey: ['background-transfers'],
+    queryFn: () => apiRequest<TransferListPage>('/api/v1/transfers?background_only=true&offset=0&page_size=200'),
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+  });
+  const scheduledBackgroundTransfersQuery = useInfiniteQuery({
+    queryKey: ['programmed-background-transfers'],
+    enabled: workspaceSection === 'scheduled',
+    initialPageParam: 0,
+    queryFn: ({ pageParam }) => apiRequest<TransferListPage>(
+      `/api/v1/transfers?background_only=true&offset=${pageParam}&page_size=200`,
+    ),
+    getNextPageParam: (lastPage, pages) => {
+      const loadedCount = pages.reduce((count, page) => count + page.items.length, 0);
+      return loadedCount < lastPage.total_count ? loadedCount : undefined;
+    },
+    refetchInterval: workspaceSection === 'scheduled' ? 15_000 : false,
+    refetchIntervalInBackground: false,
+  });
+  const pendingTransfersQuery = useInfiniteQuery({
+    queryKey: ['pending-transfers'],
+    initialPageParam: 0,
+    queryFn: ({ pageParam }) => apiRequest<{ items: Transfer[]; total_count: number }>(
+      `/api/v1/transfers?pending_only=true&offset=${pageParam}&page_size=200`,
+    ),
+    getNextPageParam: (lastPage, pages) => {
+      const loadedCount = pages.reduce((count, page) => count + page.items.length, 0);
+      return loadedCount < lastPage.total_count ? loadedCount : undefined;
+    },
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+  });
+  const [reportTransferId, setReportTransferId] = useState<string | null>(null);
+  const reportCardRef = useRef<HTMLDivElement | null>(null);
+  const [parentOmissionPrompt, setParentOmissionPrompt] = useState<{
+    child: Transfer;
+    parent: Transfer;
+    requestId: string;
+  } | null>(null);
+  const [acceptingParentOmissions, setAcceptingParentOmissions] = useState(false);
+  const [backgroundPopoverAnchor, setBackgroundPopoverAnchor] = useState<HTMLButtonElement | null>(null);
+  const [accountMenuAnchor, setAccountMenuAnchor] = useState<HTMLButtonElement | null>(null);
+  const transferManifestQuery = useInfiniteQuery({
+    queryKey: ['transfer-manifest', reportTransferId],
+    enabled: Boolean(reportTransferId),
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam }) => {
+      const params = new URLSearchParams({ limit: '100' });
+      if (pageParam) params.set('after_id', pageParam);
+      return apiRequest<TransferManifestPage>(
+        `/api/v1/transfers/${reportTransferId}/items?${params}`,
+      );
+    },
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
   });
   const connections = connectionsQuery.data?.items ?? [];
+  const destinationConnections = useMemo(
+    () => connections.filter((connection) => connection.provider_type !== 'SMB'),
+    [connections],
+  );
+  const connectionById = new Map(connections.map((connection) => [connection.id, connection]));
   const [sourceId, setSourceId] = useState('');
   const [destinationId, setDestinationId] = useState('');
   const [sourcePath, setSourcePath] = useState('/');
+  const [sourceDirectoryIds, setSourceDirectoryIds] = useState<Record<string, string>>({});
   const [destinationPath, setDestinationPath] = useState('/');
-  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
-  const [conflictPolicy, setConflictPolicy] = useState<'SKIP' | 'OVERWRITE_IF_DIFFERENT'>('OVERWRITE_IF_DIFFERENT');
+  const [selectedItems, setSelectedItems] = useState<StorageItem[]>([]);
+  const selectedPaths = selectedItems.map((item) => item.path);
+  const sourceConnection = connectionById.get(sourceId);
+  const destinationConnection = connectionById.get(destinationId);
+  const canTransfer = Boolean(
+    sourceId
+    && destinationId
+    && sourceId !== destinationId
+    && selectedPaths.length > 0
+    && selectedPaths.length <= 100,
+  );
   const [sendEmailNotification, setSendEmailNotification] = useState(false);
   const [mobileStep, setMobileStep] = useState(0);
-  const [workspaceSection, setWorkspaceSection] = useState<'explorer' | 'connections'>('explorer');
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
+  const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
+  const [megaOmissionDialogOpen, setMegaOmissionDialogOpen] = useState(false);
+  const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
+  const [scheduleDateTime, setScheduleDateTime] = useState(() => localDateTimeValue(new Date(Date.now() + 60 * 60_000)));
+  const [scheduleMode, setScheduleMode] = useState<'AUTO' | 'EXCLUSIVE'>('AUTO');
+  const [scheduleParentId, setScheduleParentId] = useState('');
+  const [scheduleError, setScheduleError] = useState('');
+  const [transferFailure, setTransferFailure] = useState<{ transferId: string; message: string } | null>(null);
+  const [retryingEvaluationId, setRetryingEvaluationId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [noticeSeverity, setNoticeSeverity] = useState<'error' | 'info' | 'success' | 'warning'>('error');
   const [busy, setBusy] = useState(false);
   const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
+  const [connectionDialogProvider, setConnectionDialogProvider] = useState<ConnectionForm['provider_type']>('MEGA');
   const [adminDialogOpen, setAdminDialogOpen] = useState(false);
   const [passwordDialogOpen, setPasswordDialogOpen] = useState(Boolean(user.must_change_password));
   const latestTransfer = useMemo(() => transfersQuery.data?.items[0], [transfersQuery.data]);
+  const backgroundTransfers = backgroundTransfersQuery.data?.items ?? [];
+  const allScheduledBackgroundTransfers = workspaceSection === 'scheduled'
+    ? scheduledBackgroundTransfersQuery.data?.pages.flatMap((page) => page.items) ?? []
+    : [];
+  const backgroundTransferCount = backgroundTransfersQuery.data?.total_count ?? backgroundTransfers.length;
+  const visibleActiveTransfer = activeTransfer && !isProgrammedBackgroundTransfer(activeTransfer)
+    ? activeTransfer
+    : null;
+  const historyTransfers = (transfersQuery.data?.items ?? [])
+    .filter((transfer) => !isProgrammedBackgroundTransfer(transfer))
+    .map((transfer) => (
+      visibleActiveTransfer?.id === transfer.id
+        ? mergeTransferState(transfer, visibleActiveTransfer)
+        : transfer
+    ));
+  if (visibleActiveTransfer && !historyTransfers.some((transfer) => transfer.id === visibleActiveTransfer.id)) {
+    historyTransfers.unshift(visibleActiveTransfer);
+  }
+  const reportTransfer = reportTransferId
+    ? historyTransfers.find((transfer) => transfer.id === reportTransferId) ?? null
+    : null;
+  useEffect(() => {
+    if (!reportTransferId) return;
+    const behavior = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+      ? 'auto'
+      : 'smooth';
+    reportCardRef.current?.scrollIntoView?.({ behavior, block: 'start' });
+  }, [reportTransferId]);
+  const transferEventsQuery = useQuery({
+    queryKey: ['transfer-events', reportTransferId, reportTransfer?.attempt_count],
+    enabled: Boolean(reportTransfer && reportTransfer.status === 'FAILED'),
+    queryFn: () => apiRequest<{ items: TransferEventRecord[] }>(
+      `/api/v1/transfers/${reportTransferId}/events`,
+    ),
+  });
+  const latestFailureDiagnostic = transferEventsQuery.data?.items
+    .slice()
+    .reverse()
+    .find((event) => event.event_type === 'FAILURE_DIAGNOSTIC');
+  const liveTransfers = historyTransfers.filter((transfer) => (
+    ['VALIDATING', 'RUNNING', 'RETRYING', 'PAUSING', 'CANCELLING'].includes(transfer.status)
+    || visibleActiveTransfer?.id === transfer.id
+  ));
+  const pendingTransferItems = pendingTransfersQuery.data?.pages.flatMap((page) => page.items) ?? [];
+  const programmedTransfers = [...new Map(
+    [...pendingTransferItems, ...allScheduledBackgroundTransfers]
+      .filter(isProgrammedBackgroundTransfer)
+      .map((transfer) => [transfer.id, transfer]),
+  ).values()];
+  const scheduleParentOptions = [...new Map(
+    [...historyTransfers, ...pendingTransferItems, ...backgroundTransfers, ...allScheduledBackgroundTransfers]
+      .map((transfer) => [transfer.id, transfer]),
+  ).values()];
+  const streamTransferSignature = [...new Map(
+    [...historyTransfers, ...backgroundTransfers, ...allScheduledBackgroundTransfers]
+      .map((transfer) => [transfer.id, transfer]),
+  ).values()]
+    .filter((transfer) => (
+      streamingTransferStatuses.includes(transfer.status)
+      || transfer.evaluation?.status === 'EVALUATING'
+      || (transfer.status === 'QUEUED' && !isProgrammedBackgroundTransfer(transfer))
+    ))
+    .map((transfer) => `${transfer.id}:${transfer.status}`)
+    .join('|');
+  const streamTransferIds = useMemo(
+    () => streamTransferSignature
+      ? streamTransferSignature.split('|').map((entry) => entry.slice(0, entry.lastIndexOf(':')))
+      : [],
+    [streamTransferSignature],
+  );
+  const backgroundTransferIdSignature = [...new Set(
+    [...backgroundTransfers, ...allScheduledBackgroundTransfers].map((transfer) => transfer.id),
+  )].join('|');
+  const backgroundTransferIds = useMemo(
+    () => new Set(backgroundTransferIdSignature ? backgroundTransferIdSignature.split('|') : []),
+    [backgroundTransferIdSignature],
+  );
 
   useEffect(() => {
-    if (!activeTransfer && latestTransfer && ['QUEUED', 'VALIDATING', 'RUNNING', 'RETRYING', 'CANCELLING'].includes(latestTransfer.status)) {
+    if (!activeTransfer && latestTransfer && !isProgrammedBackgroundTransfer(latestTransfer)
+      && ['QUEUED', 'VALIDATING', 'RUNNING', 'RETRYING', 'CANCELLING'].includes(latestTransfer.status)) {
       setActiveTransfer(latestTransfer);
     }
   }, [activeTransfer, latestTransfer]);
+
+  useEffect(() => {
+    if (!activeTransfer) return;
+    const refreshed = transfersQuery.data?.items.find((transfer) => transfer.id === activeTransfer.id);
+    if (refreshed) {
+      const merged = mergeTransferState(activeTransfer, refreshed);
+      if (merged !== activeTransfer) setActiveTransfer(merged);
+    }
+  }, [activeTransfer?.id, activeTransfer?.status, transfersQuery.data]);
+
+  useEffect(() => {
+    if (!activeTransfer || !isProgrammedBackgroundTransfer(activeTransfer)) return;
+    const refreshed = transfersQuery.data?.items.find(
+      (transfer) => transfer.id === activeTransfer.id && terminalTransferStatuses.includes(transfer.status),
+    );
+    if (refreshed) {
+      setActiveTransfer((current) => current?.id === activeTransfer.id ? null : current);
+    }
+  }, [activeTransfer?.id, activeTransfer?.status, transfersQuery.data]);
+
+  useEffect(() => {
+    if (!transferFailure) return;
+    const refreshed = transfersQuery.data?.items.find(
+      (transfer) => transfer.id === transferFailure.transferId,
+    );
+    if (refreshed && successfulTransferStatuses.includes(refreshed.status)) {
+      setTransferFailure((current) => (
+        current?.transferId === transferFailure.transferId ? null : current
+      ));
+    }
+  }, [transferFailure?.transferId, transfersQuery.data]);
+
+  useEffect(() => {
+    if (!activeTransfer || !terminalTransferStatuses.includes(activeTransfer.status)) return;
+
+    const terminalTransfer = activeTransfer;
+    queryClient.setQueryData<TransferListPage>(['transfers'], (current) => {
+      const items = current?.items ?? [];
+      const existingTransfer = items.some((transfer) => transfer.id === terminalTransfer.id);
+      return {
+        ...(current ?? { items: [], total_count: 0 }),
+        items: existingTransfer
+          ? items.map((transfer) => (
+            transfer.id === terminalTransfer.id
+              ? mergeTransferState(transfer, terminalTransfer)
+              : transfer
+          ))
+          : [terminalTransfer, ...items],
+        total_count: existingTransfer ? current?.total_count ?? items.length : (current?.total_count ?? items.length) + 1,
+      };
+    });
+    void queryClient.invalidateQueries({ queryKey: ['transfers'] });
+    void queryClient.invalidateQueries({ queryKey: ['background-transfers'] });
+    void queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] });
+    void queryClient.invalidateQueries({ queryKey: ['pending-transfers'] });
+    void queryClient.invalidateQueries({
+      queryKey: ['items', terminalTransfer.destination_connection_id, terminalTransfer.destination_path],
+    });
+
+    const timeout = window.setTimeout(() => {
+      setActiveTransfer((current) => (
+        current?.id === terminalTransfer.id ? null : current
+      ));
+    }, terminalProgressDisplayMs);
+
+    return () => window.clearTimeout(timeout);
+  }, [activeTransfer, queryClient]);
 
   useEffect(() => {
     const oauthResult = new URLSearchParams(window.location.search).get('google_oauth');
@@ -1102,24 +2088,26 @@ function TransferWorkspace({
 
   useEffect(() => {
     const sourceIsAvailable = connections.some((connection) => connection.id === sourceId);
-    const destinationIsAvailable = connections.some((connection) => connection.id === destinationId);
+    const destinationIsAvailable = destinationConnections.some((connection) => connection.id === destinationId);
     if (sourceId && !sourceIsAvailable) {
       setSourceId(connections[0]?.id ?? '');
       setSourcePath('/');
-      setSelectedPaths([]);
+      setSourceDirectoryIds({});
+      setSelectedItems([]);
     } else if (!sourceId && connections[0]) {
       setSourceId(connections[0].id);
     }
     if (destinationId && !destinationIsAvailable) {
-      const fallback = connections.find((connection) => connection.id !== sourceId) ?? connections[0];
+      const fallback = destinationConnections.find((connection) => connection.id !== sourceId)
+        ?? destinationConnections[0];
       setDestinationId(fallback?.id ?? '');
       setDestinationPath('/');
-    } else if (!destinationId && connections.length > 1) {
-      const currentSource = sourceId || connections[0].id;
-      const fallback = connections.find((connection) => connection.id !== currentSource) ?? connections[1];
-      setDestinationId(fallback.id);
+    } else if (!destinationId && destinationConnections.length > 0) {
+      const currentSource = sourceId || connections[0]?.id;
+      const fallback = destinationConnections.find((connection) => connection.id !== currentSource)
+      if (fallback) setDestinationId(fallback.id);
     }
-  }, [connections, destinationId, sourceId]);
+  }, [connections, destinationConnections, destinationId, sourceId]);
 
   const runConnectionTest = async (connectionId: string, otp?: string) => {
     setNotice('');
@@ -1142,47 +2130,192 @@ function TransferWorkspace({
   };
 
   useEffect(() => {
-    if (!activeTransfer || terminalTransferStatuses.includes(activeTransfer.status)) return;
-    const stream = new EventSource(`/api/v1/transfers/${activeTransfer.id}/stream`);
-    stream.onmessage = (event) => {
-      const update = JSON.parse(event.data) as Transfer;
-      setActiveTransfer(update);
-      if (terminalTransferStatuses.includes(update.status)) {
-        stream.close();
-        void queryClient.invalidateQueries({ queryKey: ['transfers'] });
-        void queryClient.invalidateQueries({
-          queryKey: ['items', update.destination_connection_id, update.destination_path],
+    const streams = streamTransferIds.map((transferId) => {
+      const stream = new EventSource(`/api/v1/transfers/${transferId}/stream`);
+      stream.onmessage = (event) => {
+        const update = JSON.parse(event.data) as Transfer;
+        const isBackground = backgroundTransferIds.has(update.id) || isProgrammedBackgroundTransfer(update);
+        if (!isBackground) {
+          setActiveTransfer((current) => (
+            current?.id === update.id ? mergeTransferState(current, update) : current
+          ));
+        }
+        const targetQueryKey = isBackground && !terminalTransferStatuses.includes(update.status)
+          ? ['background-transfers']
+          : ['transfers'];
+        queryClient.setQueryData<TransferListPage>(targetQueryKey, (current) => {
+          const items = current?.items ?? [];
+          const found = items.some((item) => item.id === update.id);
+          return {
+            ...(current ?? { items: [], total_count: 0 }),
+            items: found
+              ? items.map((item) => (
+                item.id === update.id ? mergeTransferState(item, update) : item
+              ))
+              : [update, ...items],
+            total_count: found ? current?.total_count ?? items.length : (current?.total_count ?? items.length) + 1,
+          };
         });
-      }
-    };
-    return () => stream.close();
-  }, [activeTransfer?.id, activeTransfer?.status, queryClient]);
+        if (isBackground && !terminalTransferStatuses.includes(update.status)) {
+          queryClient.setQueryData<InfiniteData<TransferListPage, number>>(
+            ['programmed-background-transfers'],
+            (current) => current && ({
+              ...current,
+              pages: current.pages.map((page) => ({
+                ...page,
+                items: page.items.map((item) => (
+                  item.id === update.id ? mergeTransferState(item, update) : item
+                )),
+              })),
+            }),
+          );
+        }
+        if (terminalTransferStatuses.includes(update.status)) {
+          stream.close();
+          if (isBackground) {
+            setActiveTransfer((current) => current?.id === update.id ? null : current);
+            queryClient.setQueryData<TransferListPage>(['background-transfers'], (current) => ({
+              ...(current ?? { items: [], total_count: 0 }),
+              items: (current?.items ?? []).filter((item) => item.id !== update.id),
+              total_count: Math.max(0, (current?.total_count ?? 0) - 1),
+            }));
+            void queryClient.invalidateQueries({ queryKey: ['background-transfers'] });
+            void queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] });
+            void queryClient.invalidateQueries({ queryKey: ['transfers'] });
+            void queryClient.invalidateQueries({ queryKey: ['pending-transfers'] });
+          }
+          if (update.status === 'FAILED') {
+            void apiRequest<{ items: Array<{ event_type: string; message: string }> }>(
+              `/api/v1/transfers/${update.id}/events`,
+            ).then(({ items }) => {
+              const failure = [...items].reverse().find((item) => item.event_type === 'FAILURE_DIAGNOSTIC');
+              if (failure) setTransferFailure({ transferId: update.id, message: failure.message });
+            }).catch(() => undefined);
+          }
+        } else if (update.status === 'PAUSED') {
+          stream.close();
+          setActiveTransfer((current) => current?.id === update.id ? null : current);
+          void queryClient.invalidateQueries({ queryKey: ['background-transfers'] });
+          void queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] });
+          void queryClient.invalidateQueries({ queryKey: ['transfers'] });
+        }
+      };
+      return stream;
+    });
+    return () => streams.forEach((stream) => stream.close());
+  }, [streamTransferIds, backgroundTransferIds, queryClient]);
 
   const toggleItem = (item: StorageItem) => {
-    setSelectedPaths((current) => current.includes(item.path)
-      ? current.filter((path) => path !== item.path)
-      : [...current, item.path]);
+    setSelectedItems((current) => {
+      const selected = current.some((candidate) => (
+        item.object_id
+          ? candidate.object_id === item.object_id
+          : !candidate.object_id && candidate.path === item.path
+      ));
+      return selected
+        ? current.filter((candidate) => item.object_id
+          ? candidate.object_id !== item.object_id
+          : Boolean(candidate.object_id) || candidate.path !== item.path)
+        : [...current, item];
+    });
+  };
+
+  const openScheduleDialog = (transfer?: Transfer) => {
+    setEditingScheduleId(transfer?.id ?? null);
+    setScheduleDateTime(transfer?.scheduled_at
+      ? localDateTimeValue(new Date(transfer.scheduled_at))
+      : localDateTimeValue(new Date(Date.now() + 60 * 60_000)));
+    setScheduleMode(transfer?.execution_mode ?? 'AUTO');
+    setScheduleParentId(transfer?.depends_on_transfer_id ?? '');
+    setScheduleError('');
+    setScheduleDialogOpen(true);
+  };
+
+  const saveScheduledTransfer = async () => {
+    const scheduledDate = new Date(scheduleDateTime);
+    if (Number.isNaN(scheduledDate.getTime()) || localDateTimeValue(scheduledDate) !== scheduleDateTime) {
+      setScheduleError('Esa hora local no existe por el cambio de horario. Elige otra hora.');
+      return;
+    }
+    if (scheduledDate.getTime() <= Date.now()) {
+      setScheduleError('Elige una fecha y hora futura.');
+      return;
+    }
+    const scheduleTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    const scheduling = {
+      scheduled_at: scheduledDate.toISOString(),
+      schedule_timezone: scheduleTimezone,
+      execution_mode: scheduleMode,
+      depends_on_transfer_id: scheduleParentId || null,
+    };
+    setBusy(true);
+    setScheduleError('');
+    try {
+      const transfer = editingScheduleId
+        ? await apiRequest<Transfer>(`/api/v1/transfers/${editingScheduleId}`, {
+          method: 'PATCH',
+          body: JSON.stringify(scheduling),
+        })
+        : await createTransfer({
+            source_connection_id: sourceId,
+            destination_connection_id: destinationId,
+            source_paths: selectedPaths,
+            source_item_ids: selectedItems.map((item) => item.object_id ?? null),
+            source_parent_ids: selectedItems.map((item) => item.parent_object_id ?? null),
+            destination_path: destinationPath,
+            operation: 'COPY',
+            conflict_policy: 'KEEP_BOTH',
+            send_email_notification: sendEmailNotification,
+            ...scheduling,
+        });
+      setActiveTransfer((current) => (
+        isProgrammedBackgroundTransfer(transfer)
+          ? current?.id === transfer.id ? null : current
+          : transfer
+      ));
+      setScheduleDialogOpen(false);
+      setSelectedItems(editingScheduleId ? selectedItems : []);
+      setNotice(editingScheduleId
+        ? 'La transferencia se reprogramó.'
+        : 'Solicitud guardada; evaluando selección.');
+      setNoticeSeverity('success');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      ]);
+    } catch (error) {
+      setScheduleError(error instanceof Error ? error.message : 'No se pudo programar la transferencia.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const startTransfer = async () => {
     setBusy(true);
     setNotice('');
+    setTransferFailure(null);
     try {
-      const transfer = await apiRequest<Transfer>('/api/v1/transfers', {
-        method: 'POST',
-        body: JSON.stringify({
+      const transfer = await createTransfer({
           source_connection_id: sourceId,
           destination_connection_id: destinationId,
           source_paths: selectedPaths,
+          source_item_ids: selectedItems.map((item) => item.object_id ?? null),
+          source_parent_ids: selectedItems.map((item) => item.parent_object_id ?? null),
           destination_path: destinationPath,
           operation: 'COPY',
-          conflict_policy: conflictPolicy,
+          conflict_policy: 'KEEP_BOTH',
           send_email_notification: sendEmailNotification,
-        }),
       });
       setActiveTransfer(transfer);
-      setSelectedPaths([]);
-      await queryClient.invalidateQueries({ queryKey: ['transfers'] });
+      setSelectedItems([]);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      ]);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'No se pudo iniciar la transferencia.');
       setNoticeSeverity('error');
@@ -1191,18 +2324,267 @@ function TransferWorkspace({
     }
   };
 
-  const cancelTransfer = async () => {
-    if (!activeTransfer) return;
+  const cancelTransfer = async (transfer: Transfer) => {
     setBusy(true);
     try {
-      const updated = await apiRequest<Transfer>(`/api/v1/transfers/${activeTransfer.id}/cancel`, { method: 'POST' });
-      setActiveTransfer(updated);
-      await queryClient.invalidateQueries({ queryKey: ['transfers'] });
+      const updated = await apiRequest<Transfer>(`/api/v1/transfers/${transfer.id}/cancel`, { method: 'POST' });
+      if (activeTransfer?.id === updated.id) setActiveTransfer(updated);
+      setNotice(updated.status === 'CANCELLED' ? 'La transferencia pendiente se canceló.' : 'Se solicitó cancelar la transferencia.');
+      setNoticeSeverity('info');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      ]);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'No se pudo cancelar la transferencia.');
       setNoticeSeverity('error');
     } finally {
       setBusy(false);
+    }
+  };
+
+  const pauseTransfer = async (transfer: Transfer) => {
+    setBusy(true);
+    try {
+      const updated = await apiRequest<Transfer>(`/api/v1/transfers/${transfer.id}/pause`, {
+        method: 'POST',
+      });
+      if (activeTransfer?.id === updated.id) setActiveTransfer(updated);
+      setNotice(updated.status === 'PAUSED'
+        ? 'Transferencia pausada entre archivos.'
+        : 'Se pausará después de terminar el archivo actual.');
+      setNoticeSeverity('info');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      ]);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo pausar la transferencia.');
+      setNoticeSeverity('error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const retryTransferEvaluation = async (transfer: Transfer) => {
+    setRetryingEvaluationId(transfer.id);
+    try {
+      await apiRequest<TransferEvaluation>(`/api/v1/transfers/${transfer.id}/evaluation`, {
+        method: 'POST',
+      });
+      setNotice('Se solicitó volver a evaluar la selección.');
+      setNoticeSeverity('info');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      ]);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo solicitar la evaluación.');
+      setNoticeSeverity('error');
+    } finally {
+      setRetryingEvaluationId(null);
+    }
+  };
+
+  const resumeTransfer = async (transfer: Transfer) => {
+    setBusy(true);
+    setNotice('');
+    try {
+      const updated = await apiRequest<Transfer>(
+        `/api/v1/transfers/${transfer.id}/resume`,
+        { method: 'POST' },
+      );
+      setActiveTransfer((current) => (
+        isProgrammedBackgroundTransfer(updated)
+          ? current?.id === updated.id ? null : current
+          : updated
+      ));
+      setNotice('La transferencia se reanudó.');
+      setNoticeSeverity('success');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      ]);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo reanudar la transferencia.');
+      setNoticeSeverity('error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refreshTransferReport = (transferId: string) => {
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['transfer-manifest', transferId] }),
+      queryClient.invalidateQueries({ queryKey: ['transfer-events', transferId] }),
+    ]);
+  };
+
+  const skipReportItemAndResume = async (itemId: string, requestId: string) => {
+    if (!reportTransfer) return;
+    const updated = await apiRequest<Transfer>(
+      `/api/v1/transfers/${reportTransfer.id}/items/${itemId}/skip-and-resume`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_attempt: reportTransfer.attempt_count ?? 1,
+          request_id: requestId,
+          reason: 'USER_ACCEPTED_SOURCE_FAILURE',
+        }),
+      },
+    );
+    setActiveTransfer((current) => current?.id === updated.id ? updated : current);
+    setNotice('Archivo omitido. La transferencia continuará con los archivos restantes.');
+    setNoticeSeverity('warning');
+    refreshTransferReport(reportTransfer.id);
+  };
+
+  const skipIncidentAndResume = async (
+    transferId: string,
+    itemId: string,
+    expectedAttempt: number,
+    requestId: string,
+  ) => {
+    const updated = await apiRequest<Transfer>(
+      `/api/v1/transfers/${transferId}/items/${itemId}/skip-and-resume`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_attempt: expectedAttempt,
+          request_id: requestId,
+          reason: 'USER_ACCEPTED_SOURCE_FAILURE',
+        }),
+      },
+    );
+    setActiveTransfer((current) => current?.id === updated.id ? updated : current);
+    setNotice('Archivo omitido. La transferencia continuará con los archivos restantes.');
+    setNoticeSeverity('warning');
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['transfer-incidents'] }),
+    ]);
+  };
+
+  const retryIncidentOmission = async (
+    transferId: string,
+    itemId: string,
+    expectedAttempt: number,
+    requestId: string,
+  ) => {
+    const updated = await apiRequest<Transfer>(
+      `/api/v1/transfers/${transferId}/retry-omitted`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ expected_attempt: expectedAttempt, request_id: requestId, item_ids: [itemId] }),
+      },
+    );
+    setActiveTransfer((current) => current?.id === updated.id ? updated : current);
+    setNotice('El archivo omitido volvió a la cola.');
+    setNoticeSeverity('success');
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['programmed-background-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
+      queryClient.invalidateQueries({ queryKey: ['transfer-incidents'] }),
+    ]);
+  };
+
+  const retryOmittedReportItems = async (itemIds: string[], requestId: string) => {
+    if (!reportTransfer) return;
+    const updated = await apiRequest<Transfer>(
+      `/api/v1/transfers/${reportTransfer.id}/retry-omitted`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_attempt: reportTransfer.attempt_count ?? 1,
+          request_id: requestId,
+          item_ids: itemIds,
+        }),
+      },
+    );
+    setActiveTransfer((current) => current?.id === updated.id ? updated : current);
+    setNotice('Se reintentará la selección de archivos omitidos.');
+    setNoticeSeverity('info');
+    refreshTransferReport(reportTransfer.id);
+  };
+
+  const downloadOmissionReport = () => {
+    if (!reportTransfer) return;
+    const link = document.createElement('a');
+    link.href = `/api/v1/transfers/${reportTransfer.id}/omissions.csv`;
+    link.download = `${reportTransfer.public_id}-omissions.csv`;
+    link.click();
+  };
+
+  const openParentOmissionPrompt = async (child: Transfer) => {
+    if (!child.depends_on_transfer_id) return;
+    try {
+      const parent = await apiRequest<Transfer>(
+        `/api/v1/transfers/${child.depends_on_transfer_id}`,
+      );
+      if (
+        !terminalTransferStatuses.includes(parent.status)
+        || (parent.manifest_summary?.omitted ?? 0) === 0
+        || parent.attempt_count === undefined
+      ) {
+        setNotice('El padre cambió o ya no tiene omisiones pendientes de aceptación. Se actualizará la cola.');
+        setNoticeSeverity('info');
+        refreshTransferReport(child.id);
+        return;
+      }
+      setParentOmissionPrompt({ child, parent, requestId: crypto.randomUUID() });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo revisar la transferencia padre.');
+      setNoticeSeverity('error');
+    }
+  };
+
+  const acceptCurrentParentOmissions = async () => {
+    if (!parentOmissionPrompt) return;
+    const { child, parent, requestId } = parentOmissionPrompt;
+    setAcceptingParentOmissions(true);
+    try {
+      await apiRequest<Transfer>(
+        `/api/v1/transfers/${child.id}/accept-parent-omissions`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            expected_parent_attempt: parent.attempt_count,
+            request_id: requestId,
+          }),
+        },
+      );
+      setParentOmissionPrompt(null);
+      setNotice(`Se aceptaron las omisiones del intento ${parent.attempt_count} del padre. La cola revisará la dependencia.`);
+      setNoticeSeverity('info');
+      refreshTransferReport(child.id);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        setParentOmissionPrompt(null);
+        setNotice('El intento del padre cambió. Revisa de nuevo sus omisiones antes de aceptar.');
+        setNoticeSeverity('warning');
+        refreshTransferReport(child.id);
+      } else {
+        setNotice(error instanceof Error ? error.message : 'No se pudieron aceptar las omisiones del padre.');
+        setNoticeSeverity('error');
+      }
+    } finally {
+      setAcceptingParentOmissions(false);
     }
   };
 
@@ -1216,7 +2598,8 @@ function TransferWorkspace({
     if (sourceId === connection.id) {
       setSourceId('');
       setSourcePath('/');
-      setSelectedPaths([]);
+      setSourceDirectoryIds({});
+      setSelectedItems([]);
     }
     if (destinationId === connection.id) {
       setDestinationId('');
@@ -1233,10 +2616,23 @@ function TransferWorkspace({
         side="source"
         connections={connections}
         connectionId={sourceId}
-        onConnectionChange={(id) => { setSourceId(id); setSourcePath('/'); setSelectedPaths([]); }}
+        onConnectionChange={(id) => { setSourceId(id); setSourcePath('/'); setSourceDirectoryIds({}); setSelectedItems([]); }}
         path={sourcePath}
-        onPathChange={setSourcePath}
-        selectedPaths={selectedPaths}
+        directoryIds={sourceDirectoryIds}
+        onPathChange={(path, objectId) => {
+          setSourcePath(path);
+          if (path === '/') {
+            setSourceDirectoryIds({});
+          } else {
+            setSourceDirectoryIds((current) => {
+              const next = { ...current };
+              if (objectId) next[path] = objectId;
+              else delete next[path];
+              return next;
+            });
+          }
+        }}
+        selectedItems={selectedItems}
         onToggle={toggleItem}
         isAdmin={user.role === 'ADMIN'}
         onTestConnection={runConnectionTest}
@@ -1244,7 +2640,7 @@ function TransferWorkspace({
       <ExplorerPanel
         title="Elige la carpeta de destino"
         side="destination"
-        connections={connections}
+        connections={destinationConnections}
         connectionId={destinationId}
         onConnectionChange={(id) => { setDestinationId(id); setDestinationPath('/'); }}
         path={destinationPath}
@@ -1260,63 +2656,460 @@ function TransferWorkspace({
       <AppBar position="sticky" elevation={0} className="topbar">
         <Toolbar className="topbar-inner">
           <Stack className="topbar-brand" direction="row" alignItems="center" spacing={1.2}>
-            <Box className="small-brand-mark">CT</Box>
-            <Typography variant="subtitle1" fontWeight={750}>Cloud Transfer Manager</Typography>
+            <Box className="small-brand-mark"><CloudNetworkMark /></Box>
+            <Box className="topbar-wordmark">
+              <Typography variant="subtitle1" fontWeight={750}>Cloud Transfer Manager</Typography>
+              <Typography variant="overline">COPIA ENTRE NUBES</Typography>
+            </Box>
           </Stack>
+          <Tabs
+            className="header-navigation"
+            value={workspaceSection === 'documentation' ? false : workspaceSection}
+            onChange={(_event, value: 'explorer' | 'connections' | 'private' | 'scheduled' | 'metrics') => {
+              setWorkspaceSection(value);
+              navigate(value === 'metrics' ? '/metrics' : '/');
+            }}
+            aria-label="Secciones principales"
+          >
+            <Tab value="explorer" label="Explorador" />
+            <Tab value="private" label="Servicios privados" />
+            <Tab value="scheduled" label="Programaciones" />
+            <Tab value="metrics" label="Métricas" />
+            {user.role === 'ADMIN' && <Tab value="connections" label="Conexiones" />}
+          </Tabs>
           <Stack className="topbar-actions" direction="row" alignItems="center" spacing={1.5}>
-            <Box className="user-badge"><span>{user.username.slice(0, 1).toUpperCase()}</span><Typography variant="body2">{user.username}</Typography></Box>
-            {user.role === 'ADMIN' && <Button color="inherit" size="small" onClick={() => setAdminDialogOpen(true)}>Administración</Button>}
-            <Button color="inherit" size="small" onClick={() => setPasswordDialogOpen(true)}>Cambiar contraseña</Button>
-            <Button color="inherit" size="small" onClick={onLogout}>Cerrar sesión</Button>
+            <IconButton
+              className="background-transfers-trigger"
+              aria-label={`${backgroundTransferCount} transferencias en segundo plano`}
+              aria-haspopup="dialog"
+              aria-expanded={Boolean(backgroundPopoverAnchor)}
+              onClick={(event) => setBackgroundPopoverAnchor(event.currentTarget)}
+              size="small"
+            >
+              <Badge
+                badgeContent={backgroundTransferCount}
+                color="primary"
+                max={99}
+                invisible={backgroundTransferCount === 0}
+                overlap="circular"
+              >
+                <InterfaceIcon name="clock" />
+              </Badge>
+            </IconButton>
+            <Button
+              id="account-menu-trigger"
+              className="account-menu-trigger"
+              color="inherit"
+              aria-label={`Menú de cuenta de ${user.username}`}
+              aria-haspopup="menu"
+              aria-expanded={Boolean(accountMenuAnchor)}
+              aria-controls={accountMenuAnchor ? 'account-menu' : undefined}
+              onClick={(event) => setAccountMenuAnchor(event.currentTarget)}
+            >
+              <span className="account-avatar">{user.username.slice(0, 1).toUpperCase()}</span>
+              <span className="account-menu-name">{user.username}</span>
+              <span className="account-menu-chevron" aria-hidden="true" />
+            </Button>
           </Stack>
         </Toolbar>
       </AppBar>
+      <Menu
+        id="account-menu"
+        anchorEl={accountMenuAnchor}
+        open={Boolean(accountMenuAnchor)}
+        onClose={() => setAccountMenuAnchor(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+        transitionDuration={{ enter: 180, exit: 120 }}
+        slotProps={{
+          paper: { className: 'account-menu' },
+          list: { 'aria-labelledby': 'account-menu-trigger' },
+        }}
+      >
+        {user.role === 'ADMIN' && (
+          <MenuItem className="account-menu-item" onClick={() => { setAccountMenuAnchor(null); setAdminDialogOpen(true); }}>
+            <ListItemIcon><InterfaceIcon name="settings" /></ListItemIcon>
+            Administración
+          </MenuItem>
+        )}
+        <MenuItem className="account-menu-item" onClick={() => { setAccountMenuAnchor(null); setPasswordDialogOpen(true); }}>
+          <ListItemIcon><InterfaceIcon name="key" /></ListItemIcon>
+          Cambiar contraseña
+        </MenuItem>
+        <MenuItem className="account-menu-item" onClick={() => { setAccountMenuAnchor(null); setWorkspaceSection('documentation'); }}>
+          <ListItemIcon><InterfaceIcon name="file" /></ListItemIcon>
+          Documentación
+        </MenuItem>
+        <Divider className="account-menu-divider" />
+        <MenuItem className="account-menu-item account-menu-logout" onClick={() => { setAccountMenuAnchor(null); onLogout(); }}>
+          <ListItemIcon><InterfaceIcon name="logout" /></ListItemIcon>
+          Cerrar sesión
+        </MenuItem>
+      </Menu>
+      <Popover
+        open={Boolean(backgroundPopoverAnchor)}
+        anchorEl={backgroundPopoverAnchor}
+        onClose={() => setBackgroundPopoverAnchor(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+        transitionDuration={{ enter: 180, exit: 140 }}
+        slotProps={{ paper: { className: 'background-transfers-popover', role: 'dialog', 'aria-label': 'Transferencias en segundo plano' } }}
+      >
+        <Box className="background-transfers-heading">
+          <Box>
+            <Typography variant="overline" color="text.secondary">TRABAJO EN SEGUNDO PLANO</Typography>
+            <Typography variant="subtitle1" fontWeight={750}>Transferencias activas</Typography>
+          </Box>
+          <Typography variant="caption" color="text.secondary">
+            {backgroundTransferCount} {backgroundTransferCount === 1 ? 'en curso o en espera' : 'en curso o en espera'}
+          </Typography>
+        </Box>
+        {backgroundTransfersQuery.isLoading && <LinearProgress />}
+        {backgroundTransfersQuery.isError && (
+          <Alert severity="error" sx={{ m: 1.5 }}>No se pudo actualizar el estado de las transferencias.</Alert>
+        )}
+        <Stack className="background-transfer-items" spacing={0.75}>
+          {backgroundTransfers.map((transfer) => {
+            const waitLabel = transferWaitReasonLabel(transfer.wait_reason);
+            const isActive = streamingTransferStatuses.includes(transfer.status);
+            return (
+              <Box className="background-transfer-item" key={transfer.id}>
+                <Box className="background-transfer-item-heading">
+                  <Box className="background-transfer-item-copy">
+                    <Typography variant="body2" fontWeight={700} title={transfer.current_item ?? transfer.public_id}>
+                      {transfer.current_item ?? transfer.public_id}
+                    </Typography>
+                    {transfer.current_item && (
+                      <Typography variant="caption" color="text.secondary">{transfer.public_id}</Typography>
+                    )}
+                  </Box>
+                  <Chip size="small" className="history-status" data-status={transfer.status} label={transferStatusLabel(transfer.status)} />
+                </Box>
+                {transfer.status === 'PAUSED' ? (
+                  <Typography className="background-transfer-detail" variant="caption" color="text.secondary">
+                    Pausada entre archivos · reanúdala desde Programaciones
+                  </Typography>
+                ) : waitLabel ? (
+                  <Typography className="background-transfer-detail" variant="caption" color="text.secondary">
+                    {waitLabel}
+                  </Typography>
+              ) : isActive ? (
+                  <>
+                    <Box className="background-transfer-progress-meta">
+                      <Typography variant="caption" color="text.secondary">
+                        {formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">{formatProgressPercent(transfer.progress_percent)}%</Typography>
+                    </Box>
+                    <LinearProgress
+                      variant={transfer.bytes_total ? 'determinate' : 'indeterminate'}
+                      value={transfer.progress_percent}
+                    />
+                  </>
+                ) : (
+                  <Typography className="background-transfer-detail" variant="caption" color="text.secondary">
+                    {formatRequestedAt(transfer.scheduled_at) ?? 'Pendiente de ejecución'}
+                  </Typography>
+                )}
+              </Box>
+            );
+          })}
+          {!backgroundTransfersQuery.isLoading && backgroundTransfers.length === 0 && (
+            <Typography variant="body2" color="text.secondary" sx={{ px: 1.5, py: 2 }}>
+              No hay transferencias en segundo plano.
+            </Typography>
+          )}
+        </Stack>
+        <Box className="background-transfers-footer">
+          <Button
+            size="small"
+            onClick={() => {
+              setBackgroundPopoverAnchor(null);
+              setWorkspaceSection('scheduled');
+            }}
+          >
+            Administrar programaciones
+          </Button>
+        </Box>
+      </Popover>
+      <Dialog
+        open={Boolean(parentOmissionPrompt)}
+        onClose={() => !acceptingParentOmissions && setParentOmissionPrompt(null)}
+      >
+        <DialogTitle>Aceptar omisiones de la transferencia padre</DialogTitle>
+        <DialogContent>
+          {parentOmissionPrompt && (
+            <Stack spacing={1}>
+              <Typography>
+                {parentOmissionPrompt.parent.public_id} terminó con {parentOmissionPrompt.parent.manifest_summary?.omitted ?? 0}{' '}
+                {(parentOmissionPrompt.parent.manifest_summary?.omitted ?? 0) === 1 ? 'archivo omitido.' : 'archivos omitidos.'}
+              </Typography>
+              <Alert severity="warning">
+                Esta aceptación aplica solo al intento {parentOmissionPrompt.parent.attempt_count ?? 1}. Si el padre inicia otro intento, deberás revisarlo y aceptarlo de nuevo.
+              </Alert>
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button disabled={acceptingParentOmissions} onClick={() => setParentOmissionPrompt(null)}>
+            Cancelar
+          </Button>
+          {parentOmissionPrompt && (
+            <Button
+              variant="contained"
+              disabled={acceptingParentOmissions}
+              onClick={() => void acceptCurrentParentOmissions()}
+            >
+              {acceptingParentOmissions && <CircularProgress size={16} sx={{ mr: 1 }} />}
+              Aceptar omisiones del intento {parentOmissionPrompt.parent.attempt_count ?? 1}
+            </Button>
+          )}
+        </DialogActions>
+      </Dialog>
       <Container maxWidth="xl" className="workspace-container">
         <Box className="page-heading">
           <Box>
             <Typography variant="overline" color="primary.main">
-              {workspaceSection === 'connections' ? 'ADMINISTRACIÓN DE CONEXIONES' : 'CENTRO DE TRANSFERENCIAS'}
+              {workspaceSection === 'connections'
+                ? 'ADMINISTRACIÓN DE CONEXIONES'
+                : workspaceSection === 'private'
+                  ? 'ORÍGENES DE RED PRIVADA'
+                  : workspaceSection === 'scheduled'
+                    ? 'COLA DE TRANSFERENCIAS'
+                    : workspaceSection === 'documentation' ? 'GUÍA DE USO' : workspaceSection === 'metrics' ? 'OBSERVABILIDAD' : 'CENTRO DE TRANSFERENCIAS'}
             </Typography>
             <Typography variant="h4" component="h1">
-              {workspaceSection === 'connections' ? 'Conexiones' : 'Explorador de archivos'}
+              {workspaceSection === 'connections'
+                ? 'Conexiones'
+                : workspaceSection === 'private'
+                  ? 'Servicios privados'
+                  : workspaceSection === 'scheduled'
+                    ? 'Programaciones'
+                    : workspaceSection === 'documentation' ? 'Documentación' : workspaceSection === 'metrics' ? 'Métricas' : 'Explorador de archivos'}
             </Typography>
             <Typography color="text.secondary" sx={{ mt: 0.6 }}>
               {workspaceSection === 'connections'
-                ? 'Administra los proveedores disponibles para explorar y transferir archivos.'
-                : 'Mueve archivos entre tus conexiones cloud con visibilidad en tiempo real.'}
+                ? 'Administra las conexiones cloud disponibles para transferir archivos.'
+                : workspaceSection === 'private'
+                  ? 'Explora carpetas del NAS accesible desde la red de Cloud Transfer Manager.'
+                  : workspaceSection === 'scheduled'
+                    ? 'Revisa horarios, dependencias y acciones de las transferencias programadas.'
+                    : workspaceSection === 'documentation'
+                      ? 'Conoce cómo transferir archivos y cómo se administran la cola, la capacidad y el progreso.'
+                      : workspaceSection === 'metrics'
+                        ? 'Consulta volumen, actividad, rendimiento y fiabilidad de las transferencias.'
+                      : 'Copia archivos entre tus servicios cloud y los NAS conectados.'}
             </Typography>
           </Box>
         </Box>
 
-        {user.role === 'ADMIN' && (
-          <Paper className="workspace-tabs" elevation={0}>
-            <Tabs
-              value={workspaceSection}
-              onChange={(_event, value: 'explorer' | 'connections') => setWorkspaceSection(value)}
-              aria-label="Secciones principales"
-            >
-              <Tab value="explorer" label="Explorador" />
-              <Tab value="connections" label="Conexiones" />
-            </Tabs>
-          </Paper>
-        )}
-
         {notice && <Alert severity={noticeSeverity} sx={{ mb: 2 }}>{notice}</Alert>}
-        {workspaceSection === 'connections' && user.role === 'ADMIN' ? (
+        {transferFailure && <Alert severity="error" sx={{ mb: 2 }}>{transferFailure.message}</Alert>}
+        {workspaceSection === 'metrics' ? (
+          <Suspense fallback={<Box sx={{ py: 8, display: 'flex', justifyContent: 'center' }}><CircularProgress /></Box>}>
+            <MetricsDashboard user={user} connections={connections} />
+          </Suspense>
+        ) : workspaceSection === 'connections' && user.role === 'ADMIN' ? (
           <ConnectionManagementSection
-            connections={connections}
+            connections={connections.filter((connection) => connection.provider_type !== 'SMB')}
             loading={connectionsQuery.isLoading}
             loadError={connectionsQuery.isError}
-            onAdd={() => setConnectionDialogOpen(true)}
+            onAdd={() => {
+              setConnectionDialogProvider('MEGA');
+              setConnectionDialogOpen(true);
+            }}
             onRefresh={() => { void connectionsQuery.refetch(); }}
             onArchive={archiveConnection}
           />
+        ) : workspaceSection === 'private' ? (
+          <PrivateServicesSection
+            connections={connections.filter((connection) => connection.provider_type === 'SMB')}
+            loading={connectionsQuery.isLoading}
+            isAdmin={user.role === 'ADMIN'}
+            onAdd={() => {
+              setConnectionDialogProvider('SMB');
+              setConnectionDialogOpen(true);
+            }}
+            onExplore={(connection) => {
+              setSourceId(connection.id);
+              setSourcePath('/');
+              setSourceDirectoryIds({});
+              setSelectedItems([]);
+              setWorkspaceSection('explorer');
+            }}
+            onArchive={archiveConnection}
+          />
+        ) : workspaceSection === 'scheduled' ? (
+          <Paper className="scheduled-transfer-list" elevation={0}>
+            <Box className="scheduled-list-heading">
+              <Box>
+                <Typography variant="overline" color="text.secondary">COLA Y TRABAJOS ACTIVOS</Typography>
+                <Typography variant="h6">Transferencias programadas</Typography>
+              </Box>
+              <Button
+                size="small"
+                onClick={() => {
+                  void pendingTransfersQuery.refetch();
+                  void backgroundTransfersQuery.refetch();
+                  void scheduledBackgroundTransfersQuery.refetch();
+                }}
+                startIcon={<InterfaceIcon name="refresh" />}
+              >
+                Actualizar
+              </Button>
+            </Box>
+            {(pendingTransfersQuery.isLoading || backgroundTransfersQuery.isLoading || scheduledBackgroundTransfersQuery.isLoading) && <LinearProgress />}
+            {(pendingTransfersQuery.isError || backgroundTransfersQuery.isError || scheduledBackgroundTransfersQuery.isError) && (
+              <Alert severity="error" sx={{ mt: 2 }}>No se pudieron cargar las transferencias programadas o en curso.</Alert>
+            )}
+            {programmedTransfers.map((transfer) => {
+              const parent = [...historyTransfers, ...backgroundTransfers, ...allScheduledBackgroundTransfers]
+                .find((item) => item.id === transfer.depends_on_transfer_id);
+              const source = connectionById.get(transfer.source_connection_id ?? '');
+              const destination = connectionById.get(transfer.destination_connection_id);
+              const editable = (transfer.can_edit_schedule ?? ['SCHEDULED', 'QUEUED'].includes(transfer.status))
+                && transfer.wait_reason !== 'BLOCKED_CONNECTION_CHANGED';
+              return (
+                <Box className="scheduled-transfer-row" key={transfer.id}>
+                  <Box className="scheduled-transfer-main">
+                    <Box className="history-title-line">
+                      <Typography fontWeight={700}>{transfer.public_id}</Typography>
+                      <Chip size="small" className="history-status" data-status={transfer.status} label={transferStatusLabel(transfer.status)} />
+                    </Box>
+                    <Typography variant="body2" color="text.secondary">
+                      {source?.name ?? 'Origen'} → {destination?.name ?? 'Destino'}
+                    </Typography>
+                    <Box className="scheduled-transfer-meta">
+                      <Typography variant="caption" color="text.secondary">
+                        <span>Inicio</span>{formatRequestedAt(transfer.scheduled_at) ?? 'Al liberarse la cola'}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        <span>Modo</span>{transfer.execution_mode === 'EXCLUSIVE' ? 'Exclusiva' : 'Automática'}
+                      </Typography>
+                      {transfer.depends_on_transfer_id && (
+                        <Typography variant="caption" color="text.secondary">
+                          <span>Depende de</span>{parent?.public_id ?? transfer.depends_on_transfer_id.slice(0, 8)}
+                        </Typography>
+                      )}
+                    </Box>
+                    {transferWaitReasonLabel(transfer.wait_reason) && (
+                      <Typography className="scheduled-wait-reason" variant="caption" color="text.secondary">
+                        {transferWaitReasonLabel(transfer.wait_reason)}
+                      </Typography>
+                    )}
+                    {transfer.wait_reason === 'BLOCKED_PARENT_OMISSIONS' && (
+                      <Alert severity="warning" sx={{ mt: 1 }}>
+                        La transferencia padre terminó con archivos omitidos. Revisa el intento vigente antes de liberar esta dependencia.
+                      </Alert>
+                    )}
+                    <ScheduledTransferEvaluation
+                      evaluation={transfer.evaluation ?? notRequiredEvaluation}
+                      onRetry={() => void retryTransferEvaluation(transfer)}
+                      retrying={retryingEvaluationId === transfer.id}
+                    />
+                  </Box>
+                  <Stack className="scheduled-transfer-actions" direction="row" spacing={0.75}>
+                    {transfer.wait_reason === 'BLOCKED_PARENT_OMISSIONS' && (
+                      <Button
+                        size="small"
+                        disabled={acceptingParentOmissions}
+                        onClick={() => void openParentOmissionPrompt(transfer)}
+                      >
+                        Revisar omisiones del padre
+                      </Button>
+                    )}
+                    {editable && (
+                      <Button size="small" onClick={() => openScheduleDialog(transfer)}>
+                        Reprogramar
+                      </Button>
+                    )}
+                    {transfer.status === 'PAUSED' && (
+                      <Button size="small" disabled={busy} onClick={() => void resumeTransfer(transfer)}>
+                        Reanudar
+                      </Button>
+                    )}
+                    {['SCHEDULED', 'QUEUED', 'VALIDATING', 'RUNNING', 'RETRYING'].includes(transfer.status) && (
+                      <Button
+                        size="small"
+                        disabled={busy || (transfer.pause_supported === false && source?.provider_type !== 'SMB')}
+                        title={transfer.pause_unavailable_reason === 'LEGACY_BULK_EXECUTION'
+                          ? 'Esta ejecución antigua no puede pausarse entre archivos.'
+                          : undefined}
+                        onClick={() => void pauseTransfer(transfer)}
+                      >
+                        Pausar
+                      </Button>
+                    )}
+                    {!terminalTransferStatuses.includes(transfer.status) && transfer.status !== 'CANCELLING' && (
+                      <Button size="small" color="error" disabled={busy} onClick={() => void cancelTransfer(transfer)}>
+                        Cancelar
+                      </Button>
+                    )}
+                  </Stack>
+                  {transfer.status === 'PAUSING' && (
+                    <Alert severity="info" sx={{ mt: 1 }}>
+                      Pausando al terminar {transfer.current_item ?? 'el archivo actual'}.
+                    </Alert>
+                  )}
+                </Box>
+              );
+            })}
+            {pendingTransfersQuery.hasNextPage && (
+              <Button
+                size="small"
+                onClick={() => void pendingTransfersQuery.fetchNextPage()}
+                disabled={pendingTransfersQuery.isFetchingNextPage}
+                sx={{ mt: 1 }}
+              >
+                {pendingTransfersQuery.isFetchingNextPage ? 'Cargando…' : 'Cargar más pendientes'}
+              </Button>
+            )}
+            {scheduledBackgroundTransfersQuery.hasNextPage && (
+              <Button
+                size="small"
+                onClick={() => void scheduledBackgroundTransfersQuery.fetchNextPage()}
+                disabled={scheduledBackgroundTransfersQuery.isFetchingNextPage}
+                sx={{ mt: 1, ml: 1 }}
+              >
+                {scheduledBackgroundTransfersQuery.isFetchingNextPage ? 'Cargando…' : 'Cargar más trabajos activos'}
+              </Button>
+            )}
+            {!pendingTransfersQuery.isLoading && !scheduledBackgroundTransfersQuery.isLoading && programmedTransfers.length === 0 && (
+              <Typography color="text.secondary" sx={{ p: 3 }}>
+                No hay transferencias programadas, en espera o en ejecución.
+              </Typography>
+            )}
+          </Paper>
+        ) : workspaceSection === 'documentation' ? (
+          <DocumentationSection />
         ) : (
           <>
             {connectionsQuery.isError && <Alert severity="error" sx={{ mb: 2 }}>No se pudieron cargar las conexiones.</Alert>}
-            {connections.length < 2 && (
+            {!connectionsQuery.isLoading && !connectionsQuery.isError && connections.length === 0 && (
+              <Alert
+                severity="info"
+                sx={{ mb: 2 }}
+                action={user.role === 'ADMIN' ? (
+                  <Button
+                    color="inherit"
+                    size="small"
+                    onClick={() => {
+                      setConnectionDialogProvider('MEGA');
+                      setConnectionDialogOpen(true);
+                    }}
+                  >
+                    Crear primera conexión
+                  </Button>
+                ) : undefined}
+              >
+                {user.role === 'ADMIN'
+                  ? 'Aún no hay conexiones. Crea tu primera conexión para empezar a explorar y transferir archivos.'
+                  : 'Aún no tienes conexiones asignadas. Pide a un administrador que te comparta una conexión.'}
+              </Alert>
+            )}
+            {!connectionsQuery.isLoading && !connectionsQuery.isError && connections.length === 1 && (
               <Alert severity="info" sx={{ mb: 2 }}>
-                Se necesitan dos conexiones autorizadas para comenzar. Un administrador puede configurar MEGA, Google Drive o un adaptador simulado.
+                Se necesita otra conexión autorizada para comenzar. Un administrador puede configurar MEGA, Google Drive o un adaptador simulado.
               </Alert>
             )}
 
@@ -1328,92 +3121,295 @@ function TransferWorkspace({
             </Paper>
             <Box className={`mobile-panel mobile-panel-${mobileStep}`}>{panels}</Box>
 
-        <Paper className="transfer-action" elevation={0}>
-          <Box className="transfer-action-copy">
-            <Box className="copy-icon" aria-hidden="true">↗</Box>
-            <Box>
-              <Typography fontWeight={700}>Listo para copiar</Typography>
-              <Typography variant="body2" color="text.secondary">
-                {selectedPaths.length} elementos · destino {destinationPath}
+        <Paper className="transfer-action" elevation={0} role="group" aria-label="Resumen de transferencia">
+          <Box className="transfer-action-overview">
+            <Box className="transfer-symbol" role="img" aria-label="Transferencia de archivos">
+              <InterfaceIcon name="transfer" />
+            </Box>
+            <Box className="transfer-action-copy">
+              <Box className="transfer-action-heading">
+                <Typography variant="h6" component="h2">
+                  {canTransfer ? 'Listo para transferir' : 'Prepara tu transferencia'}
+                </Typography>
+                <Chip
+                  className="transfer-selection-chip"
+                  size="small"
+                  label={selectedPaths.length === 1
+                    ? '1 elemento'
+                    : `${selectedPaths.length} elementos`}
+                />
+              </Box>
+              <Typography variant="body2" color="text.secondary" className="transfer-selection-summary">
+                {selectedPaths.length === 0
+                  ? 'Selecciona elementos en el origen para preparar la copia.'
+                  : canTransfer
+                    ? `${selectedPaths.length} ${selectedPaths.length === 1 ? 'elemento listo' : 'elementos listos'} para copiar`
+                    : sourceId === destinationId
+                      ? 'Elige una conexión distinta como destino.'
+                      : 'Selecciona una conexión de destino para habilitar la copia.'}
               </Typography>
+              {selectedPaths.length > 100 && (
+                <Alert severity="warning" sx={{ mt: 1 }}>
+                  Selecciona como máximo 100 rutas por transferencia. Divide la selección en varias copias.
+                </Alert>
+              )}
+              <Box className="transfer-route" aria-label="Ruta de transferencia">
+                <Box className="transfer-route-point">
+                  <Typography variant="overline">ORIGEN</Typography>
+                  <Box className="transfer-route-connection">
+                    <ProviderLogo provider={sourceConnection?.provider_type ?? ''} decorative={false} />
+                    <Typography variant="body2" title={sourceConnection?.name ?? 'Selecciona un origen'}>
+                      {sourceConnection?.name ?? 'Selecciona un origen'}
+                    </Typography>
+                  </Box>
+                </Box>
+                <span className="transfer-route-arrow" aria-hidden="true">→</span>
+                <Box className="transfer-route-point">
+                  <Typography variant="overline">DESTINO</Typography>
+                  <Box className="transfer-route-connection">
+                    <ProviderLogo provider={destinationConnection?.provider_type ?? ''} decorative={false} />
+                    <Typography variant="body2" title={destinationConnection?.name ?? 'Selecciona un destino'}>
+                      {destinationConnection?.name ?? 'Selecciona un destino'}
+                    </Typography>
+                  </Box>
+                  <Typography variant="caption" className="transfer-destination-path" title={destinationPath}>
+                    <InterfaceIcon name="folder" />
+                    {destinationPath === '/' ? 'Carpeta raíz' : destinationPath}
+                  </Typography>
+                </Box>
+              </Box>
             </Box>
           </Box>
-          <Stack className="transfer-options" spacing={0.5}>
-            <FormControl size="small" fullWidth>
-              <InputLabel id="conflict-policy-label">Si ya existe</InputLabel>
-              <Select
-                labelId="conflict-policy-label"
-                label="Si ya existe"
-                value={conflictPolicy}
-                onChange={(event) => setConflictPolicy(event.target.value as typeof conflictPolicy)}
+          <Stack className="transfer-options" spacing={0.75}>
+            <Box className="transfer-conflict-policy" aria-label="Política de archivos existentes">
+              <Typography variant="caption" color="text.secondary">Si ya existe</Typography>
+              <Typography variant="body2" fontWeight={650}>Conservar ambos · numerar la copia</Typography>
+            </Box>
+            {sourceConnection?.provider_type === 'MEGA' && (
+              <Button
+                className="mega-omission-notice"
+                size="small"
+                variant="outlined"
+                color="warning"
+                startIcon={<SvgIcon fontSize="small" viewBox="0 0 24 24"><path d="M12 3 1.8 21h20.4L12 3Zm0 4.1 6.7 11.9H5.3L12 7.1Zm-1 3.4v4.7h2v-4.7h-2Zm0 5.8v1.8h2v-1.8h-2Z" /></SvgIcon>}
+                aria-haspopup="dialog"
+                onClick={() => setMegaOmissionDialogOpen(true)}
               >
-                <MenuItem value="OVERWRITE_IF_DIFFERENT">Reemplazar si cambió</MenuItem>
-                <MenuItem value="SKIP">Omitir existentes</MenuItem>
-              </Select>
-            </FormControl>
+                Aviso sobre archivos MEGA
+              </Button>
+            )}
             <FormControlLabel
               control={<Checkbox checked={sendEmailNotification} onChange={(_event, checked) => setSendEmailNotification(checked)} size="small" />}
               label={<Typography variant="caption">Avisarme por correo al terminar</Typography>}
             />
           </Stack>
-          <Button
-            variant="contained"
-            size="large"
-            disabled={!sourceId || !destinationId || sourceId === destinationId || selectedPaths.length === 0 || busy}
-            onClick={startTransfer}
-          >
-            {busy ? <CircularProgress size={22} color="inherit" /> : 'Iniciar transferencia'}
-          </Button>
+          <Stack className="transfer-submit-actions" spacing={0.75}>
+            <Button
+              className="transfer-submit"
+              variant="contained"
+              size="large"
+              startIcon={<InterfaceIcon name="copy" />}
+              disabled={!canTransfer || busy}
+              onClick={startTransfer}
+            >
+              {busy ? <CircularProgress size={22} color="inherit" /> : 'Iniciar transferencia'}
+            </Button>
+            <Button
+              className="transfer-schedule-submit"
+              variant="outlined"
+              size="small"
+              startIcon={<InterfaceIcon name="clock" />}
+              disabled={!canTransfer || busy}
+              onClick={() => openScheduleDialog()}
+            >
+              Programar transferencia
+            </Button>
+          </Stack>
         </Paper>
 
-        {activeTransfer && (
-          <Card className="progress-card" variant="outlined">
+        {liveTransfers.map((transfer) => (
+          <Card className="progress-card" variant="outlined" key={transfer.id}>
             <CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2}>
                 <Box>
-                  <Typography variant="overline" color="text.secondary">TRANSFERENCIA ACTIVA · {activeTransfer.public_id}</Typography>
-                  <Typography fontWeight={700}>{activeTransfer.current_item ?? activeTransfer.status}</Typography>
+                  <Typography variant="overline" color="text.secondary">TRANSFERENCIA ACTIVA · {transfer.public_id}</Typography>
+                  <Typography fontWeight={700}>{transfer.current_item ?? transferStatusLabel(transfer.status)}</Typography>
                 </Box>
-                <Typography fontWeight={700}>{activeTransfer.progress_percent.toFixed(1)}%</Typography>
+                <Typography fontWeight={700}>{formatProgressPercent(transfer.progress_percent, 1)}%</Typography>
               </Stack>
-              <LinearProgress variant={activeTransfer.bytes_total ? 'determinate' : 'indeterminate'} value={activeTransfer.progress_percent} sx={{ mt: 2, mb: 1 }} />
+              {transfer.status === 'RETRYING' && (
+                <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                  Reintento automático en curso; próximo intento {transfer.attempt_count ? transfer.attempt_count + 1 : 2}.
+                </Typography>
+              )}
+              <LinearProgress variant={transfer.bytes_total ? 'determinate' : 'indeterminate'} value={transfer.progress_percent} sx={{ mt: 2, mb: 1 }} />
               <Typography variant="caption" color="text.secondary">
-                {formatBytes(activeTransfer.bytes_transferred)} de {formatBytes(activeTransfer.bytes_total)} · {activeTransfer.files_completed}/{activeTransfer.files_total} archivos
+                {formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)} · {transfer.conflict_policy === 'KEEP_BOTH' && connections.find((connection) => connection.id === transfer.source_connection_id)?.provider_type !== 'MOCK' ? `${transfer.manifest_summary?.copied ?? 0}/${transfer.files_total} copiados · ${transfer.manifest_summary?.omitted ?? 0} omitidos · ${transfer.manifest_summary?.failed ?? 0} con error · ${Math.max(0, (transfer.manifest_summary?.skipped ?? 0) - (transfer.manifest_summary?.omitted ?? 0))} SKIPPED históricos · ${transfer.manifest_summary?.pending ?? transfer.files_total} pendientes` : `${transfer.files_completed}/${transfer.files_total} archivos`}
               </Typography>
+              {(transfer.manifest_summary?.omitted ?? 0) > 0 && (
+                <Alert severity="warning" sx={{ mt: 1 }}>
+                  {transfer.status === 'FAILED'
+                    ? `Transferencia detenida con ${transfer.manifest_summary?.omitted} archivos omitidos.`
+                    : transfer.status === 'CANCELLED'
+                      ? `Transferencia cancelada con ${transfer.manifest_summary?.omitted} archivos omitidos.`
+                      : terminalTransferStatuses.includes(transfer.status)
+                        ? `Procesamiento finalizado con advertencias: ${transfer.manifest_summary?.omitted} omitidos.`
+                        : `Se omitieron ${transfer.manifest_summary?.omitted} archivos; la transferencia continúa.`}
+                  {' '}Cobertura de copia: {formatProgressPercent(transfer.progress_percent)}%.
+                </Alert>
+              )}
               <Typography variant="caption" color="text.secondary" display="block">
-                {activeTransfer.current_speed_bps === null ? 'Velocidad calculándose' : `${formatBytes(activeTransfer.current_speed_bps)}/s`}
-                {activeTransfer.estimated_remaining_seconds === null || activeTransfer.estimated_remaining_seconds === undefined
+                {transfer.current_speed_bps === null ? 'Velocidad calculándose' : `${formatBytes(transfer.current_speed_bps)}/s`}
+                {transfer.estimated_remaining_seconds === null || transfer.estimated_remaining_seconds === undefined
                   ? ''
-                  : ` · ETA ${activeTransfer.estimated_remaining_seconds}s`}
+                  : ` · ETA ${transfer.estimated_remaining_seconds}s`}
               </Typography>
-              {!['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED', 'CANCELLING'].includes(activeTransfer.status) && (
-                <Button color="error" size="small" sx={{ mt: 1 }} onClick={() => void cancelTransfer()} disabled={busy}>Cancelar transferencia</Button>
+              {!['COMPLETED', 'COMPLETED_WITH_WARNINGS', 'FAILED', 'CANCELLED', 'CANCELLING'].includes(transfer.status) && (
+                <Stack direction="row" spacing={0.75} sx={{ mt: 1 }}>
+                  {['QUEUED', 'SCHEDULED', 'VALIDATING', 'RUNNING', 'RETRYING'].includes(transfer.status) && (
+                    <Button
+                      size="small"
+                      disabled={busy || (transfer.pause_supported === false && connections.find((item) => item.id === transfer.source_connection_id)?.provider_type !== 'SMB')}
+                      title={transfer.pause_unavailable_reason === 'LEGACY_BULK_EXECUTION'
+                        ? 'Esta ejecución antigua no puede pausarse entre archivos.'
+                        : undefined}
+                      onClick={() => void pauseTransfer(transfer)}
+                    >
+                      Pausar entre archivos
+                    </Button>
+                  )}
+                  <Button color="error" size="small" onClick={() => void cancelTransfer(transfer)} disabled={busy}>Cancelar transferencia</Button>
+                </Stack>
+              )}
+              {transfer.status === 'PAUSING' && (
+                <Alert severity="info" sx={{ mt: 1 }}>
+                  Pausando después del archivo actual{transfer.current_item ? `: ${transfer.current_item}` : '…'}
+                </Alert>
               )}
             </CardContent>
           </Card>
+        ))}
+
+        {reportTransferId && reportTransfer && (
+          <Card ref={reportCardRef} className="progress-card" variant="outlined" aria-label="Resultado de transferencia">
+            <CardContent>
+              <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2} sx={{ mb: 1 }}>
+                <Typography variant="overline" color="text.secondary">INFORME DE TRANSFERENCIA</Typography>
+                <Button size="small" onClick={() => setReportTransferId(null)}>Cerrar</Button>
+              </Stack>
+              <TransferFileReport
+                transfer={reportTransfer}
+                pages={transferManifestQuery.data?.pages ?? []}
+                isLoading={transferManifestQuery.isLoading}
+                isError={transferManifestQuery.isError}
+                hasNextPage={Boolean(transferManifestQuery.hasNextPage)}
+                isFetchingNextPage={transferManifestQuery.isFetchingNextPage}
+                onLoadMore={() => void transferManifestQuery.fetchNextPage()}
+                onSkipAndResume={skipReportItemAndResume}
+                onRetryOmitted={retryOmittedReportItems}
+                onDownloadOmissions={downloadOmissionReport}
+                onConflictRefresh={() => refreshTransferReport(reportTransfer.id)}
+                failureCode={latestFailureDiagnostic?.provider_error_code ?? null}
+                isLoadingFailureDetails={transferEventsQuery.isLoading}
+              />
+            </CardContent>
+          </Card>
         )}
+
+        <TransferIncidentPanel onSkip={skipIncidentAndResume} onRetry={retryIncidentOmission} />
 
         <Box className="history-heading">
           <Box>
             <Typography variant="overline" color="text.secondary">ACTIVIDAD</Typography>
             <Typography variant="h6">Historial reciente</Typography>
+            <Typography variant="caption" color="text.secondary">Fecha y hora en tu zona local</Typography>
           </Box>
-          <Button size="small" onClick={() => void transfersQuery.refetch()}>Actualizar</Button>
+          <Button size="small" onClick={() => void transfersQuery.refetch()} startIcon={<InterfaceIcon name="refresh" />}>Actualizar</Button>
         </Box>
         <Paper className="history-card" elevation={0}>
           {transfersQuery.isLoading && <LinearProgress />}
-          {(transfersQuery.data?.items ?? []).slice(0, 8).map((transfer) => (
+          {historyTransfers.slice(0, 8).map((transfer) => {
+            const sourceConnection = transfer.source_connection_id
+              ? connectionById.get(transfer.source_connection_id)
+              : undefined;
+            const destinationConnection = connectionById.get(transfer.destination_connection_id);
+            const omittedCount = transfer.manifest_summary?.omitted ?? 0;
+            const historicalSkipped = Math.max(
+              0,
+              (transfer.manifest_summary?.skipped ?? 0) - omittedCount,
+            );
+            return (
             <Box className="history-row" key={transfer.id}>
               <Box className="history-status-dot" data-status={transfer.status} />
               <Box className="history-label">
-                <Typography fontWeight={650}>{transfer.public_id}</Typography>
-                <Typography variant="caption" color="text.secondary">{transfer.files_completed} archivos · {formatBytes(transfer.bytes_transferred)}</Typography>
+                <Box className="history-title-line">
+                  <Typography fontWeight={700}>{transfer.public_id}</Typography>
+                  <Chip size="small" className="history-status" data-status={transfer.status} label={transferStatusLabel(transfer.status)} />
+                </Box>
+                <Box className="history-route" aria-label="Ruta de transferencia">
+                  <ProviderLogo provider={sourceConnection?.provider_type ?? ''} />
+                  <span>{sourceConnection?.name ?? (transfer.source_connection_id ? 'Conexión no disponible' : 'Origen')}</span>
+                  <span className="history-route-arrow" aria-hidden="true">→</span>
+                  <ProviderLogo provider={destinationConnection?.provider_type ?? ''} />
+                  <span>{destinationConnection?.name ?? 'Conexión no disponible'}</span>
+                </Box>
+                <Typography variant="caption" color="text.secondary" className="history-counts">
+                  {transfer.conflict_policy === 'KEEP_BOTH' && sourceConnection?.provider_type !== 'MOCK'
+                    ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${omittedCount} omitidos · ${transfer.manifest_summary?.failed ?? 0} con error · ${historicalSkipped} SKIPPED históricos · ${transfer.manifest_summary?.pending ?? transfer.files_total} pendientes · ${transfer.manifest_summary?.renamed ?? 0} nombres numerados · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
+                    : sourceConnection?.provider_type === 'SMB'
+                    ? `${transfer.manifest_summary?.copied ?? 0} copiados · ${omittedCount} omitidos · ${transfer.manifest_summary?.failed ?? 0} con error · ${historicalSkipped} SKIPPED históricos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`
+                    : `${transfer.files_completed} de ${transfer.files_total} archivos · ${formatTransferBytes(transfer.bytes_transferred, transfer.bytes_total)}`}
+                </Typography>
+                {(transfer.manifest_summary?.omitted ?? 0) > 0 && (
+                  <Typography variant="caption" color="warning.dark" display="block">
+                    {terminalTransferStatuses.includes(transfer.status)
+                      ? 'Procesamiento finalizado con advertencias'
+                      : 'Archivos omitidos; procesamiento en curso'}
+                    {' '}· cobertura de copia {formatProgressPercent(transfer.progress_percent)}%
+                  </Typography>
+                )}
+                <Box className="history-meta">
+                  {formatRequestedAt(transfer.created_at) && (
+                    <Typography component="time" dateTime={transfer.created_at ?? undefined} variant="caption" color="text.secondary">
+                      <span>Solicitada</span>{formatRequestedAt(transfer.created_at)}
+                    </Typography>
+                  )}
+                  <Typography variant="caption" color="text.secondary"><span>Tiempo de transferencia</span>{formatTransferDuration(transfer)}</Typography>
+                </Box>
               </Box>
-              <Typography className="history-status" variant="body2">{transfer.status.replaceAll('_', ' ')}</Typography>
-              <Typography variant="body2" color="text.secondary">{transfer.progress_percent.toFixed(0)}%</Typography>
+              <Box className="history-progress" aria-label={`Avance ${formatProgressPercent(transfer.progress_percent)} por ciento`}>
+                <Typography variant="body2" fontWeight={700}>{formatProgressPercent(transfer.progress_percent)}%</Typography>
+                <Box className="history-progress-track"><Box style={{ width: `${Math.max(0, Math.min(100, transfer.progress_percent))}%` }} /></Box>
+              </Box>
+              {(sourceConnection?.provider_type === 'SMB'
+                || transfer.conflict_policy === 'KEEP_BOTH'
+                || transfer.status === 'FAILED') && (
+                <Stack spacing={0.5} alignItems="flex-start">
+                  <Button
+                    size="small"
+                    onClick={() => setReportTransferId(transfer.id)}
+                    aria-label={transfer.status === 'FAILED'
+                      ? `Ver archivos de ${transfer.public_id} (informe de transferencia)`
+                      : `Ver archivos de ${transfer.public_id}`}
+                  >
+                    {transfer.status === 'FAILED' ? 'Ver informe' : 'Ver archivos'}
+                  </Button>
+                  {['FAILED', 'CANCELLED'].includes(transfer.status) && (
+                    <Button
+                      size="small"
+                      disabled={busy}
+                      onClick={() => void resumeTransfer(transfer)}
+                      aria-label={`Reanudar transferencia ${transfer.public_id}`}
+                    >
+                      Reanudar
+                    </Button>
+                  )}
+                </Stack>
+              )}
             </Box>
-          ))}
-          {!transfersQuery.isLoading && (transfersQuery.data?.items.length ?? 0) === 0 && (
+            );
+          })}
+          {!transfersQuery.isLoading && historyTransfers.length === 0 && (
             <Typography color="text.secondary" sx={{ p: 3 }}>Aún no hay transferencias. Las nuevas aparecerán aquí.</Typography>
           )}
           {latestTransfer && latestTransfer.status === 'RUNNING' && (
@@ -1424,8 +3420,118 @@ function TransferWorkspace({
           </>
         )}
       </Container>
+      <Dialog
+        open={scheduleDialogOpen}
+        onClose={() => setScheduleDialogOpen(false)}
+        fullWidth
+        maxWidth="sm"
+        aria-labelledby="schedule-transfer-title"
+      >
+        <DialogTitle id="schedule-transfer-title">
+          {editingScheduleId ? 'Reprogramar transferencia' : 'Programar transferencia'}
+        </DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ pt: 1 }}>
+            <Typography variant="body2" color="text.secondary">
+              {editingScheduleId
+                ? 'Actualiza cuándo debe ejecutarse y qué trabajos deben terminar antes.'
+                : `${selectedPaths.length} ${selectedPaths.length === 1 ? 'elemento' : 'elementos'} · ${sourceConnection?.name ?? 'Origen'} → ${destinationConnection?.name ?? 'Destino'}`}
+            </Typography>
+            {transferCapabilitiesQuery.data && (
+              <Alert severity="info">
+                Se contará la selección en segundo plano. El límite es{' '}
+                {new Intl.NumberFormat('es-CL').format(
+                  sourceConnection?.provider_type === 'SMB'
+                    ? transferCapabilitiesQuery.data.max_files_by_source_provider.SMB
+                    : transferCapabilitiesQuery.data.max_files_by_source_provider.default,
+                )}{' '}archivos; el tiempo depende del tamaño de las carpetas y del proveedor.
+              </Alert>
+            )}
+            <TextField
+              label="Fecha y hora"
+              type="datetime-local"
+              value={scheduleDateTime}
+              onChange={(event) => setScheduleDateTime(event.target.value)}
+              fullWidth
+              required
+              InputLabelProps={{ shrink: true }}
+              inputProps={{ 'aria-label': 'Fecha y hora' }}
+              helperText={`Zona horaria: ${Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'} · ${scheduleDateTime ? localTimeOffsetLabel(scheduleDateTime, Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC') : ''}`}
+            />
+            <FormControl fullWidth size="small">
+              <InputLabel id="schedule-mode-label">Modo de ejecución</InputLabel>
+              <Select
+                labelId="schedule-mode-label"
+                label="Modo de ejecución"
+                value={scheduleMode}
+                onChange={(event) => setScheduleMode(event.target.value as 'AUTO' | 'EXCLUSIVE')}
+              >
+                <MenuItem value="AUTO">Automática · usar capacidad disponible</MenuItem>
+                <MenuItem value="EXCLUSIVE">Exclusiva · esperar a que terminen las demás</MenuItem>
+              </Select>
+              <FormHelperText>
+                {scheduleMode === 'EXCLUSIVE'
+                  ? 'Al llegar su turno, no se iniciarán otras copias hasta que termine.'
+                  : 'Puede ejecutarse en paralelo con trabajos compatibles.'}
+              </FormHelperText>
+            </FormControl>
+            <FormControl fullWidth size="small">
+              <InputLabel id="schedule-parent-label">Transferencia padre (opcional)</InputLabel>
+              <Select
+                labelId="schedule-parent-label"
+                label="Transferencia padre (opcional)"
+                value={scheduleParentId}
+                onChange={(event) => setScheduleParentId(event.target.value)}
+              >
+                <MenuItem value="">Sin dependencia</MenuItem>
+                {scheduleParentOptions
+                  .filter((transfer) => transfer.id !== editingScheduleId)
+                  .map((transfer) => (
+                    <MenuItem key={transfer.id} value={transfer.id}>
+                      {transfer.public_id} · {transferStatusLabel(transfer.status)}
+                    </MenuItem>
+                  ))}
+                {scheduleParentId && !scheduleParentOptions.some((transfer) => transfer.id === scheduleParentId) && (
+                  <MenuItem value={scheduleParentId}>{scheduleParentId.slice(0, 8)}</MenuItem>
+                )}
+              </Select>
+              <FormHelperText>
+                Se habilita después de una finalización correcta, incluso si tuvo avisos.
+              </FormHelperText>
+            </FormControl>
+            {scheduleError && <Alert severity="error">{scheduleError}</Alert>}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setScheduleDialogOpen(false)} disabled={busy}>Cancelar</Button>
+          <Button variant="contained" onClick={() => void saveScheduledTransfer()} disabled={busy}>
+            {busy ? <CircularProgress size={20} color="inherit" /> : 'Confirmar programación'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        className="mega-omission-dialog"
+        open={megaOmissionDialogOpen}
+        onClose={() => setMegaOmissionDialogOpen(false)}
+        fullWidth
+        maxWidth="sm"
+        scroll="paper"
+        aria-labelledby="mega-omission-dialog-title"
+        aria-describedby="mega-omission-dialog-description"
+      >
+        <DialogTitle id="mega-omission-dialog-title">Limitación de omisión automática en MEGA</DialogTitle>
+        <DialogContent>
+          <Alert id="mega-omission-dialog-description" severity="warning" variant="outlined" role="note">
+            La omisión automática de archivos MEGA está deshabilitada hasta validar una firma de restricción por archivo para la versión instalada de MEGAcmd. El informe permite revisar los fallos y omitir manualmente los elegibles.
+          </Alert>
+        </DialogContent>
+        <DialogActions>
+          <Button variant="contained" onClick={() => setMegaOmissionDialogOpen(false)}>Entendido</Button>
+        </DialogActions>
+      </Dialog>
       <ConnectionDialog
         open={connectionDialogOpen}
+        initialProvider={connectionDialogProvider}
         onClose={() => setConnectionDialogOpen(false)}
         onCreated={(created) => {
           setNotice(created.status === 'ACTIVE'
@@ -1481,8 +3587,7 @@ function AppRoutes() {
   return (
     <Routes>
       <Route path="/login" element={user ? <Navigate to="/" replace /> : <LoginPage onLogin={setUser} />} />
-      <Route path="/" element={user ? <TransferWorkspace user={user} onUserUpdated={(patch) => setUser({ ...user, ...patch })} onLogout={() => void logout()} /> : <Navigate to="/login" replace />} />
-      <Route path="*" element={<Navigate to={user ? '/' : '/login'} replace />} />
+      <Route path="*" element={user ? <TransferWorkspace user={user} onUserUpdated={(patch) => setUser({ ...user, ...patch })} onLogout={() => void logout()} /> : <Navigate to="/login" replace />} />
     </Routes>
   );
 }

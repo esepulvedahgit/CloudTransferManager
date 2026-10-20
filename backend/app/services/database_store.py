@@ -1,19 +1,32 @@
-import uuid
-from datetime import UTC, datetime
-from typing import Any
+from __future__ import annotations
 
-from sqlalchemy import delete, func, or_, select, text
+import hashlib
+import uuid
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import PurePosixPath
+from typing import Any, cast
+
+from sqlalchemy import and_, case, delete, exists, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import aliased
 
 from app.models import (
     AuditEvent,
     Base,
+    SMTPSettings,
     StorageConnection,
     TransferCounter,
+    TransferEvaluation,
     TransferEvent,
     TransferJob,
+    TransferManifestItem,
+    TransferMetricSpan,
+    TransferNotificationOutbox,
     User,
     UserConnectionGrant,
 )
@@ -23,10 +36,65 @@ from app.services.memory_store import (
     ConnectionInUseError,
     ConnectionRecord,
     ConnectionUnavailableError,
+    IdempotencyConflictError,
+    SMTPSettingsRecord,
+    TransferIncidentRecord,
+    TransferManifestItemRecord,
     TransferRecord,
     UserAccount,
 )
+from app.services.source_inventory import InventoryProgress
+from app.services.transfer_evaluation import (
+    EvaluationClaim,
+    EvaluationConflictError,
+    EvaluationRecord,
+    restart_evaluation,
+)
+from app.services.transfer_omissions import (
+    OmissionKind,
+    TransferRecoveryConflictError,
+    TransferRecoveryNotFoundError,
+    can_skip_manifest_item,
+    normalize_source_file_error_policy,
+    parent_omissions_request_hash,
+    recovery_request_hash,
+    resolve_failure_evidence,
+    retry_omissions_request_hash,
+    skip_unavailable_reason,
+)
+from app.services.transfer_progress import smb_manifest_progress_percent
+from app.services.transfer_scheduling import (
+    DispatchBatch,
+    TransferReservation,
+    admission_wait_reason,
+    dependency_error_code,
+    dependency_wait_message,
+    dependency_wait_reason,
+    evaluation_wait_reason,
+    transfer_requires_staging,
+)
 from app.settings import Settings, get_settings
+
+_TERMINAL_TRANSFER_STATUSES = frozenset(
+    {"COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "CANCELLED"}
+)
+_TRANSFER_STATUS_RANK = {
+    "SCHEDULED": 0,
+    "QUEUED": 1,
+    "VALIDATING": 2,
+    "RUNNING": 3,
+    "RETRYING": 3,
+    "PAUSING": 4,
+    "PAUSED": 4,
+    "CANCELLING": 4,
+    "CANCELLED": 5,
+    "COMPLETED": 5,
+    "COMPLETED_WITH_WARNINGS": 5,
+    "FAILED": 5,
+}
+_NOTIFICATION_LEASE_SECONDS = 300
+_EVALUATION_LEASE_SECONDS = 60
+_NO_EVALUATION_OVERRIDE = object()
 
 
 class DatabaseStore:
@@ -34,6 +102,7 @@ class DatabaseStore:
 
     def __init__(self, settings: Settings | None = None) -> None:
         config = settings or get_settings()
+        self.settings = config
         self.engine = create_async_engine(config.resolved_database_url(), pool_pre_ping=True)
         self.sessions: async_sessionmaker[AsyncSession] = async_sessionmaker(
             self.engine, expire_on_commit=False
@@ -44,6 +113,1041 @@ class DatabaseStore:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
 
+    @staticmethod
+    def _metrics_int(value: Any) -> int:
+        return int(value or 0)
+
+    @staticmethod
+    def _metrics_file_columns() -> dict[str, Any]:
+        item = TransferManifestItem
+        return {
+            "total": func.count(item.id).label("total"),
+            "copied": func.sum(case((item.status == "COPIED", 1), else_=0)).label("copied"),
+            "copied_bytes": func.coalesce(
+                func.sum(
+                    case((item.status == "COPIED", func.coalesce(item.size_bytes, 0)), else_=0)
+                ),
+                0,
+            ).label("copied_bytes"),
+            "copied_size_unknown": func.sum(
+                case((and_(item.status == "COPIED", item.size_bytes.is_(None)), 1), else_=0)
+            ).label("copied_size_unknown"),
+            "failed": func.sum(case((item.status == "FAILED", 1), else_=0)).label("failed"),
+            "skipped_historical": func.sum(
+                case((and_(item.status == "SKIPPED", item.omission_kind.is_(None)), 1), else_=0)
+            ).label("skipped_historical"),
+            "omitted": func.sum(
+                case((and_(item.status == "SKIPPED", item.omission_kind.is_not(None)), 1), else_=0)
+            ).label("omitted"),
+            "omitted_bytes": func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(item.status == "SKIPPED", item.omission_kind.is_not(None)),
+                            func.coalesce(item.size_bytes, 0),
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("omitted_bytes"),
+            "pending": func.sum(case((item.status == "PENDING", 1), else_=0)).label("pending"),
+            "renamed": func.sum(case((item.rename_reason.is_not(None), 1), else_=0)).label(
+                "renamed"
+            ),
+        }
+
+    @staticmethod
+    def _metrics_file_values(row: Any) -> dict[str, int]:
+        return {
+            key: DatabaseStore._metrics_int(row._mapping.get(key, 0))
+            for key in DatabaseStore._metrics_file_columns()
+        }
+
+    async def ametric_dashboard(
+        self,
+        *,
+        requested_by: uuid.UUID | None,
+        date_from: datetime,
+        date_to: datetime,
+        timezone: str,
+        source_provider: str | None = None,
+        destination_provider: str | None = None,
+        source_connection_id: uuid.UUID | None = None,
+        destination_connection_id: uuid.UUID | None = None,
+        include_mock: bool = False,
+    ) -> dict[str, Any]:
+        """Return aggregates only; manifest paths and connection credentials never leave SQL."""
+        source = aliased(StorageConnection)
+        destination = aliased(StorageConnection)
+
+        def job_filters(*, in_range: bool) -> list[Any]:
+            criteria: list[Any] = []
+            if requested_by is not None:
+                criteria.append(TransferJob.requested_by == requested_by)
+            if in_range:
+                criteria.extend(
+                    (TransferJob.created_at >= date_from, TransferJob.created_at < date_to)
+                )
+            if not include_mock:
+                criteria.extend(
+                    (source.provider_type != "MOCK", destination.provider_type != "MOCK")
+                )
+            if source_provider is not None:
+                criteria.append(source.provider_type == source_provider)
+            if destination_provider is not None:
+                criteria.append(destination.provider_type == destination_provider)
+            if source_connection_id is not None:
+                criteria.append(TransferJob.source_connection_id == source_connection_id)
+            if destination_connection_id is not None:
+                criteria.append(TransferJob.destination_connection_id == destination_connection_id)
+            return criteria
+
+        def from_jobs(*, in_range: bool) -> Any:
+            return (
+                select(
+                    TransferJob,
+                    source.provider_type.label("source_type"),
+                    destination.provider_type.label("destination_type"),
+                )
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(*job_filters(in_range=in_range))
+            )
+
+        async with self.sessions() as session:
+            job_rows = (await session.execute(from_jobs(in_range=True))).all()
+            transfer_ids = [row.TransferJob.id for row in job_rows]
+            statuses: dict[str, int] = {}
+            for row in job_rows:
+                job = row.TransferJob
+                statuses[job.status] = statuses.get(job.status, 0) + 1
+
+            file_summary = {key: 0 for key in self._metrics_file_columns()}
+            if transfer_ids:
+                aggregate = await session.execute(
+                    select(*self._metrics_file_columns().values())
+                    .select_from(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id.in_(transfer_ids),
+                        TransferManifestItem.is_dir.is_(False),
+                    )
+                )
+                file_summary = self._metrics_file_values(aggregate.one())
+
+            provider_stats: dict[str, dict[str, dict[str, int]]] = {
+                "source": {},
+                "destination": {},
+                "pairs": {},
+            }
+            transfer_counts: dict[str, dict[str, int]] = {
+                "source": {},
+                "destination": {},
+                "pairs": {},
+            }
+            for row in job_rows:
+                job = row.TransferJob
+                source_type = row.source_type
+                destination_type = row.destination_type
+                for kind, key in (
+                    ("source", source_type),
+                    ("destination", destination_type),
+                    ("pairs", f"{source_type} → {destination_type}"),
+                ):
+                    transfer_counts[kind][key] = transfer_counts[kind].get(key, 0) + 1
+            if transfer_ids:
+                for kind, group_columns in (
+                    ("source", [source.provider_type]),
+                    ("destination", [destination.provider_type]),
+                    ("pairs", [source.provider_type, destination.provider_type]),
+                ):
+                    grouped = await session.execute(
+                        select(*group_columns, *self._metrics_file_columns().values())
+                        .select_from(TransferManifestItem)
+                        .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                        .join(source, source.id == TransferJob.source_connection_id)
+                        .join(destination, destination.id == TransferJob.destination_connection_id)
+                        .where(
+                            *job_filters(in_range=True),
+                            TransferManifestItem.is_dir.is_(False),
+                        )
+                        .group_by(*group_columns)
+                    )
+                    for values in grouped.all():
+                        if kind == "source":
+                            key = values[0]
+                        elif kind == "destination":
+                            key = values[0]
+                        else:
+                            key = f"{values[0]} → {values[1]}"
+                        provider_stats[kind][key] = self._metrics_file_values(values)
+
+            # Activity uses the viewer timezone; undated legacy rows stay undated.
+            dialect = self.engine.dialect.name
+            if dialect == "postgresql":
+                created_day = func.date(func.timezone(timezone, TransferJob.created_at))
+                copied_day = func.date(func.timezone(timezone, TransferManifestItem.copied_at))
+            else:
+                created_day = func.date(TransferJob.created_at)
+                copied_day = func.date(TransferManifestItem.copied_at)
+            daily: dict[str, dict[str, int]] = {}
+            created_rows = await session.execute(
+                select(created_day.label("day"), func.count(TransferJob.id))
+                .select_from(TransferJob)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(*job_filters(in_range=True))
+                .group_by(created_day)
+            )
+            for day, count in created_rows.all():
+                if day is not None:
+                    daily[str(day)] = {
+                        "transfers_created": self._metrics_int(count),
+                        "copied": 0,
+                        "copied_bytes": 0,
+                    }
+            copied_rows = await session.execute(
+                select(
+                    copied_day.label("day"),
+                    func.count(TransferManifestItem.id),
+                    func.coalesce(func.sum(func.coalesce(TransferManifestItem.size_bytes, 0)), 0),
+                )
+                .select_from(TransferManifestItem)
+                .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=False),
+                    TransferManifestItem.is_dir.is_(False),
+                    TransferManifestItem.status == "COPIED",
+                    TransferManifestItem.copied_at >= date_from,
+                    TransferManifestItem.copied_at < date_to,
+                )
+                .group_by(copied_day)
+            )
+            for day, count, byte_count in copied_rows.all():
+                if day is not None:
+                    entry = daily.setdefault(
+                        str(day), {"transfers_created": 0, "copied": 0, "copied_bytes": 0}
+                    )
+                    entry["copied"] = self._metrics_int(count)
+                    entry["copied_bytes"] = self._metrics_int(byte_count)
+
+            stage_filters = [
+                TransferMetricSpan.span_type == "STAGE",
+                TransferMetricSpan.started_at >= date_from,
+                TransferMetricSpan.started_at < date_to,
+            ]
+            if requested_by is not None:
+                stage_filters.append(TransferJob.requested_by == requested_by)
+            if source_provider is not None:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.connection_role != "SOURCE",
+                        TransferMetricSpan.provider_type == source_provider,
+                    )
+                )
+            if destination_provider is not None:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.connection_role != "DESTINATION",
+                        TransferMetricSpan.provider_type == destination_provider,
+                    )
+                )
+            if source_connection_id is not None:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.connection_role != "SOURCE",
+                        TransferMetricSpan.connection_id == source_connection_id,
+                    )
+                )
+            if destination_connection_id is not None:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.connection_role != "DESTINATION",
+                        TransferMetricSpan.connection_id == destination_connection_id,
+                    )
+                )
+            if not include_mock:
+                stage_filters.append(
+                    or_(
+                        TransferMetricSpan.provider_type.is_(None),
+                        TransferMetricSpan.provider_type != "MOCK",
+                    )
+                )
+            stage_from = TransferMetricSpan.__table__.join(
+                TransferJob.__table__, TransferJob.id == TransferMetricSpan.transfer_job_id
+            )
+            stage_select = select(
+                TransferMetricSpan.code,
+                TransferMetricSpan.provider_type,
+                TransferMetricSpan.connection_role,
+                func.count(TransferMetricSpan.id),
+                func.sum(case((TransferMetricSpan.outcome == "SUCCESS", 1), else_=0)),
+                func.sum(case((TransferMetricSpan.outcome == "FAILED", 1), else_=0)),
+                func.sum(case((TransferMetricSpan.outcome == "OPEN", 1), else_=0)),
+                func.percentile_disc(0.5).within_group(TransferMetricSpan.duration_ms),
+                func.percentile_disc(0.95).within_group(TransferMetricSpan.duration_ms),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                TransferMetricSpan.outcome == "SUCCESS",
+                                TransferMetricSpan.bytes_count,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                TransferMetricSpan.outcome == "SUCCESS",
+                                TransferMetricSpan.duration_ms,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+            ).select_from(stage_from)
+            if dialect == "postgresql":
+                stage_rows = await session.execute(
+                    stage_select.where(*stage_filters).group_by(
+                        TransferMetricSpan.code,
+                        TransferMetricSpan.provider_type,
+                        TransferMetricSpan.connection_role,
+                    )
+                )
+                performance = [
+                    {
+                        "stage": code,
+                        "provider_type": provider_type,
+                        "connection_role": role,
+                        "samples": self._metrics_int(samples),
+                        "successful_samples": self._metrics_int(successes),
+                        "failed_samples": self._metrics_int(failures),
+                        "incomplete_samples": self._metrics_int(incomplete),
+                        "median_ms": self._metrics_int(median) if median is not None else None,
+                        "p95_ms": self._metrics_int(p95) if p95 is not None else None,
+                        "bytes_count": self._metrics_int(total_bytes),
+                        "effective_bytes_per_second": (
+                            round(
+                                self._metrics_int(total_bytes) * 1000 / self._metrics_int(total_ms)
+                            )
+                            if self._metrics_int(total_ms)
+                            else None
+                        ),
+                    }
+                    for (
+                        code,
+                        provider_type,
+                        role,
+                        samples,
+                        successes,
+                        failures,
+                        incomplete,
+                        median,
+                        p95,
+                        total_bytes,
+                        total_ms,
+                    ) in stage_rows.all()
+                ]
+            else:
+                from app.services.transfer_metrics import percentile
+
+                raw_stage_rows = await session.execute(
+                    select(
+                        TransferMetricSpan.code,
+                        TransferMetricSpan.provider_type,
+                        TransferMetricSpan.connection_role,
+                        TransferMetricSpan.outcome,
+                        TransferMetricSpan.duration_ms,
+                        TransferMetricSpan.bytes_count,
+                    )
+                    .select_from(stage_from)
+                    .where(*stage_filters)
+                )
+                grouped_stages: dict[tuple[str, str | None, str | None], list[Any]] = {}
+                for value in raw_stage_rows.all():
+                    grouped_stages.setdefault((value[0], value[1], value[2]), []).append(value)
+                performance = []
+                for (code, provider_type, role), samples in sorted(grouped_stages.items()):
+                    successful = [
+                        value for value in samples if value[3] == "SUCCESS" and value[4] is not None
+                    ]
+                    durations = [self._metrics_int(value[4]) for value in successful]
+                    total_bytes = sum(self._metrics_int(value[5]) for value in successful)
+                    total_ms = sum(durations)
+                    performance.append(
+                        {
+                            "stage": code,
+                            "provider_type": provider_type,
+                            "connection_role": role,
+                            "samples": len(samples),
+                            "successful_samples": len(successful),
+                            "failed_samples": sum(value[3] == "FAILED" for value in samples),
+                            "incomplete_samples": sum(value[3] == "OPEN" for value in samples),
+                            "median_ms": percentile(durations, 0.5),
+                            "p95_ms": percentile(durations, 0.95),
+                            "bytes_count": total_bytes,
+                            "effective_bytes_per_second": round(total_bytes * 1000 / total_ms)
+                            if total_ms
+                            else None,
+                        }
+                    )
+
+            state_query = (
+                select(
+                    TransferMetricSpan.code,
+                    func.count(TransferMetricSpan.id),
+                    func.percentile_disc(0.5).within_group(TransferMetricSpan.duration_ms),
+                    func.percentile_disc(0.95).within_group(TransferMetricSpan.duration_ms),
+                )
+                .join(TransferJob, TransferJob.id == TransferMetricSpan.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    TransferMetricSpan.span_type == "STATE",
+                    TransferMetricSpan.outcome == "SUCCESS",
+                    TransferMetricSpan.duration_ms.is_not(None),
+                    TransferMetricSpan.started_at < date_to,
+                    TransferMetricSpan.completed_at >= date_from,
+                    *job_filters(in_range=False),
+                )
+                .group_by(TransferMetricSpan.code)
+            )
+            if dialect == "postgresql":
+                state_rows = await session.execute(state_query)
+                states = [
+                    {
+                        "state": code,
+                        "samples": self._metrics_int(count),
+                        "median_ms": self._metrics_int(median),
+                        "p95_ms": self._metrics_int(p95),
+                    }
+                    for code, count, median, p95 in state_rows.all()
+                    if median is not None and p95 is not None
+                ]
+            else:
+                from app.services.transfer_metrics import percentile
+
+                state_samples_rows = await session.execute(
+                    select(TransferMetricSpan.code, TransferMetricSpan.duration_ms)
+                    .select_from(stage_from)
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(
+                        TransferMetricSpan.span_type == "STATE",
+                        TransferMetricSpan.outcome == "SUCCESS",
+                        TransferMetricSpan.duration_ms.is_not(None),
+                        TransferMetricSpan.started_at < date_to,
+                        TransferMetricSpan.completed_at >= date_from,
+                        *job_filters(in_range=False),
+                    )
+                )
+                values_by_state: dict[str, list[int]] = {}
+                for code, duration_ms in state_samples_rows.all():
+                    values_by_state.setdefault(code, []).append(self._metrics_int(duration_ms))
+                states = [
+                    {
+                        "state": code,
+                        "samples": len(values),
+                        "median_ms": percentile(values, 0.5),
+                        "p95_ms": percentile(values, 0.95),
+                    }
+                    for code, values in sorted(values_by_state.items())
+                ]
+
+            errors = await session.execute(
+                select(TransferManifestItem.error_code, func.count(TransferManifestItem.id))
+                .select_from(TransferManifestItem)
+                .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=True),
+                    TransferManifestItem.is_dir.is_(False),
+                    TransferManifestItem.status == "FAILED",
+                )
+                .group_by(TransferManifestItem.error_code)
+                .order_by(func.count(TransferManifestItem.id).desc())
+                .limit(10)
+            )
+            error_rows = [
+                {"error_code": code or "UNKNOWN", "files": self._metrics_int(count)}
+                for code, count in errors.all()
+            ]
+            size_rows = await session.execute(
+                select(
+                    func.sum(case((TransferManifestItem.size_bytes == 0, 1), else_=0)),
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    TransferManifestItem.size_bytes > 0,
+                                    TransferManifestItem.size_bytes < 1024**2,
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    TransferManifestItem.size_bytes >= 1024**2,
+                                    TransferManifestItem.size_bytes < 100 * 1024**2,
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    TransferManifestItem.size_bytes >= 100 * 1024**2,
+                                    TransferManifestItem.size_bytes < 1024**3,
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(case((TransferManifestItem.size_bytes >= 1024**3, 1), else_=0)),
+                    func.sum(case((TransferManifestItem.size_bytes.is_(None), 1), else_=0)),
+                )
+                .select_from(TransferManifestItem)
+                .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=True),
+                    TransferManifestItem.is_dir.is_(False),
+                    TransferManifestItem.status == "COPIED",
+                )
+            )
+            size_values = size_rows.one()
+            size_distribution = [
+                {"bucket": bucket, "files": self._metrics_int(count)}
+                for bucket, count in zip(
+                    (
+                        "zero",
+                        "under_1_mib",
+                        "1_to_100_mib",
+                        "100_mib_to_1_gib",
+                        "over_1_gib",
+                        "unknown",
+                    ),
+                    size_values,
+                    strict=True,
+                )
+            ]
+            extensions: dict[str, int] = {}
+            extension_filter = (
+                *job_filters(in_range=True),
+                TransferManifestItem.is_dir.is_(False),
+                TransferManifestItem.status == "COPIED",
+            )
+            if dialect == "postgresql":
+                basename = func.regexp_replace(TransferManifestItem.source_path, r"^.*/", "")
+                has_extension = basename.op("~")(r"[^./]+\.[^./]+$")
+                extension = case(
+                    (
+                        has_extension,
+                        func.lower(func.regexp_replace(basename, r"^.*\.([^./]+)$", r"\1")),
+                    ),
+                    else_="Sin extensión",
+                )
+                extension_rows = await session.execute(
+                    select(extension, func.count(TransferManifestItem.id))
+                    .select_from(TransferManifestItem)
+                    .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(*extension_filter)
+                    .group_by(extension)
+                )
+                for extension_name, count in extension_rows.all():
+                    extensions[str(extension_name)] = self._metrics_int(count)
+            else:
+                # SQLite is used only in development tests; PostgreSQL aggregates in the database.
+                from pathlib import PurePosixPath
+
+                extension_rows = await session.execute(
+                    select(TransferManifestItem.source_path)
+                    .select_from(TransferManifestItem)
+                    .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(*extension_filter)
+                )
+                for (path,) in extension_rows:
+                    extension_name = (
+                        PurePosixPath(str(path)).suffix.casefold().lstrip(".") or "Sin extensión"
+                    )
+                    extensions[extension_name] = extensions.get(extension_name, 0) + 1
+
+            waiting_rows = await session.execute(
+                select(TransferJob.status, TransferJob.wait_reason, func.count(TransferJob.id))
+                .select_from(TransferJob)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=True),
+                    TransferJob.status.in_(["SCHEDULED", "QUEUED", "PAUSING", "PAUSED"]),
+                )
+                .group_by(TransferJob.status, TransferJob.wait_reason)
+            )
+            waiting = paused = 0
+            wait_reasons: dict[str, int] = {}
+            for status_value, reason, count in waiting_rows.all():
+                if status_value in {"SCHEDULED", "QUEUED"}:
+                    waiting += self._metrics_int(count)
+                    wait_reasons[reason or "OTHER"] = wait_reasons.get(
+                        reason or "OTHER", 0
+                    ) + self._metrics_int(count)
+                else:
+                    paused += self._metrics_int(count)
+
+            active_query = (
+                select(
+                    TransferJob.status,
+                    func.count(),
+                    func.coalesce(func.sum(TransferJob.current_speed_bps), 0),
+                )
+                .select_from(TransferJob)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=False),
+                    TransferJob.status.in_(
+                        ["VALIDATING", "RUNNING", "RETRYING", "PAUSING", "PAUSED", "CANCELLING"]
+                    ),
+                )
+                .group_by(TransferJob.status)
+            )
+            active_rows = await session.execute(active_query)
+            active_values = active_rows.all()
+            active_by_status = {
+                status_value: int(count) for status_value, count, _speed in active_values
+            }
+            active_speed = sum(int(speed or 0) for _status, _count, speed in active_values)
+            all_transfer_status_counts = {key: value for key, value in statuses.items()}
+            completed = all_transfer_status_counts.get("COMPLETED", 0)
+            warnings = all_transfer_status_counts.get("COMPLETED_WITH_WARNINGS", 0)
+            failed = all_transfer_status_counts.get("FAILED", 0)
+            eligible = completed + warnings + failed
+
+            manifest_counts_query = await session.execute(
+                select(
+                    func.count(func.distinct(TransferManifestItem.transfer_job_id)),
+                    func.count(func.distinct(TransferJob.id)),
+                )
+                .select_from(TransferJob)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .outerjoin(
+                    TransferManifestItem, TransferManifestItem.transfer_job_id == TransferJob.id
+                )
+                .where(*job_filters(in_range=True))
+            )
+            with_manifest, all_count = manifest_counts_query.one()
+            copied_coverage = await session.execute(
+                select(
+                    func.sum(case((TransferManifestItem.copied_at.is_not(None), 1), else_=0)),
+                    func.sum(case((TransferManifestItem.copied_at.is_(None), 1), else_=0)),
+                )
+                .select_from(TransferManifestItem)
+                .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=True),
+                    TransferManifestItem.is_dir.is_(False),
+                    TransferManifestItem.status == "COPIED",
+                )
+            )
+            copied_with_date, copied_without_date = copied_coverage.one()
+            span_coverage = await session.execute(
+                select(
+                    func.count(TransferMetricSpan.id),
+                    func.sum(case((TransferMetricSpan.outcome == "OPEN", 1), else_=0)),
+                )
+                .select_from(TransferMetricSpan)
+                .join(TransferJob, TransferJob.id == TransferMetricSpan.transfer_job_id)
+                .join(source, source.id == TransferJob.source_connection_id)
+                .join(destination, destination.id == TransferJob.destination_connection_id)
+                .where(
+                    *job_filters(in_range=False),
+                    TransferMetricSpan.span_type == "STAGE",
+                    TransferMetricSpan.started_at >= date_from,
+                    TransferMetricSpan.started_at < date_to,
+                )
+            )
+            stage_count, incomplete_count = span_coverage.one()
+
+        def provider_payload(kind: str, key_name: str) -> list[dict[str, Any]]:
+            result = []
+            for key, count in sorted(transfer_counts[kind].items()):
+                result.append(
+                    {
+                        key_name: key,
+                        "transfers": count,
+                        "files": provider_stats[kind].get(
+                            key, {name: 0 for name in self._metrics_file_columns()}
+                        ),
+                    }
+                )
+            return result
+
+        return {
+            "summary": {
+                "transfers": {
+                    "total": len(job_rows),
+                    "by_status": statuses,
+                    "completed_cleanly": completed,
+                    "completed_with_warnings": warnings,
+                    "failed": failed,
+                    "cancelled": statuses.get("CANCELLED", 0),
+                    "success_rate": round((completed + warnings) * 100 / eligible, 1)
+                    if eligible
+                    else 0,
+                    "additional_attempts": sum(
+                        max(0, row.TransferJob.attempt_count - 1) for row in job_rows
+                    ),
+                },
+                "files": file_summary,
+            },
+            "providers": {
+                "source": provider_payload("source", "provider_type"),
+                "destination": provider_payload("destination", "provider_type"),
+                "pairs": provider_payload("pairs", "label"),
+            },
+            "activity": [{"date": day, **values} for day, values in sorted(daily.items())],
+            "performance": {"stages": performance, "states": states},
+            "reliability": {
+                "errors": error_rows,
+                "size_distribution": size_distribution,
+                "extensions": [
+                    {"extension": key, "files": count}
+                    for key, count in sorted(
+                        extensions.items(), key=lambda entry: (-entry[1], entry[0])
+                    )[:6]
+                ],
+            },
+            "scheduling": {
+                "waiting": waiting,
+                "paused": paused,
+                "by_wait_reason": [
+                    {"reason": key, "transfers": count}
+                    for key, count in sorted(wait_reasons.items())
+                ],
+            },
+            "live": {
+                "active": sum(active_by_status.values()),
+                "by_status": active_by_status,
+                "reported_speed_bps": active_speed,
+            },
+            "coverage": {
+                "transfers": int(all_count or 0),
+                "with_manifest": int(with_manifest or 0),
+                "manifestless_transfers": max(0, int(all_count or 0) - int(with_manifest or 0)),
+                "copied_files_with_date": int(copied_with_date or 0),
+                "copied_files_without_date": int(copied_without_date or 0),
+                "stage_samples": int(stage_count or 0),
+                "stage_samples_incomplete": int(incomplete_count or 0),
+            },
+            "system": None,
+        }
+
+    async def ametric_system_summary(self) -> dict[str, Any]:
+        async with self.sessions() as session:
+            outbox_rows = await session.execute(
+                select(TransferNotificationOutbox.status, func.count()).group_by(
+                    TransferNotificationOutbox.status
+                )
+            )
+            evaluation_rows = await session.execute(
+                select(TransferEvaluation.status, func.count()).group_by(TransferEvaluation.status)
+            )
+            connection_rows = await session.execute(
+                select(
+                    StorageConnection.provider_type,
+                    StorageConnection.status,
+                    StorageConnection.last_test_status,
+                    func.count(StorageConnection.id),
+                ).group_by(
+                    StorageConnection.provider_type,
+                    StorageConnection.status,
+                    StorageConnection.last_test_status,
+                )
+            )
+        return {
+            "notifications": {
+                "by_status": {status: int(count) for status, count in outbox_rows.all()}
+            },
+            "evaluations": {
+                "by_status": {status: int(count) for status, count in evaluation_rows.all()}
+            },
+            "connections": [
+                {
+                    "provider_type": provider,
+                    "status": status,
+                    "last_test_status": last_test,
+                    "count": int(count),
+                }
+                for provider, status, last_test, count in connection_rows.all()
+            ],
+        }
+
+    async def _ensure_notification_outbox(
+        self, session: AsyncSession, transfer: TransferJob
+    ) -> None:
+        if (
+            not transfer.send_email_notification
+            or transfer.status not in _TERMINAL_TRANSFER_STATUSES
+        ):
+            return
+        user = await session.get(User, transfer.requested_by)
+        source = await session.get(StorageConnection, transfer.source_connection_id)
+        destination = await session.get(StorageConnection, transfer.destination_connection_id)
+        if user is None or source is None or destination is None:
+            return
+        omitted_count, omitted_bytes = (
+            await session.execute(
+                select(
+                    func.count(TransferManifestItem.id),
+                    func.coalesce(func.sum(TransferManifestItem.size_bytes), 0),
+                ).where(
+                    TransferManifestItem.transfer_job_id == transfer.id,
+                    TransferManifestItem.is_dir.is_(False),
+                    TransferManifestItem.omission_kind.is_not(None),
+                )
+            )
+        ).one()
+        dialect = session.bind.dialect.name if session.bind is not None else "postgresql"
+        insert = pg_insert if dialect == "postgresql" else sqlite_insert
+        statement = insert(TransferNotificationOutbox).values(
+            id=uuid.uuid4(),
+            transfer_job_id=transfer.id,
+            transfer_attempt=transfer.attempt_count,
+            status="PENDING",
+            attempt_count=0,
+            snapshot={
+                "public_id": transfer.public_id,
+                "status": transfer.status,
+                "bytes_transferred": transfer.bytes_transferred,
+                "omitted": int(omitted_count or 0),
+                "omitted_bytes": int(omitted_bytes or 0),
+                "created_at": transfer.created_at.isoformat(),
+                "completed_at": (transfer.completed_at or datetime.now(UTC)).isoformat(),
+                "recipient": user.email,
+                "source_name": source.name,
+                "destination_name": destination.name,
+            },
+            last_error_code=None,
+        )
+        await session.execute(
+            statement.on_conflict_do_nothing(
+                index_elements=[
+                    TransferNotificationOutbox.transfer_job_id,
+                    TransferNotificationOutbox.transfer_attempt,
+                ]
+            )
+        )
+
+    async def aensure_transfer_notification_outbox(self, transfer_id: uuid.UUID) -> None:
+        """Materialize a legacy queued notification as durable database state."""
+        async with self.sessions() as session:
+            async with session.begin():
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if transfer is not None:
+                    await self._ensure_notification_outbox(session, transfer)
+
+    async def adispatch_pending_notifications(
+        self,
+        now: datetime,
+        limit: int = 100,
+        lease_seconds: int = _NOTIFICATION_LEASE_SECONDS,
+    ) -> list[tuple[uuid.UUID, uuid.UUID]]:
+        now = now.astimezone(UTC)
+        expired_claim = now - timedelta(seconds=lease_seconds)
+        async with self.sessions() as session:
+            async with session.begin():
+                rows = list(
+                    await session.scalars(
+                        select(TransferNotificationOutbox)
+                        .where(
+                            or_(
+                                and_(
+                                    TransferNotificationOutbox.status == "PENDING",
+                                    TransferNotificationOutbox.next_attempt_at <= now,
+                                ),
+                                and_(
+                                    TransferNotificationOutbox.status.in_({"QUEUED", "SENDING"}),
+                                    TransferNotificationOutbox.claimed_at < expired_claim,
+                                ),
+                            )
+                        )
+                        .order_by(TransferNotificationOutbox.created_at)
+                        .limit(max(1, min(limit, 500)))
+                        .with_for_update(skip_locked=True)
+                    )
+                )
+                dispatch_ids: list[tuple[uuid.UUID, uuid.UUID]] = []
+                for row in rows:
+                    if row.attempt_count >= 5:
+                        row.status = "FAILED"
+                        row.last_error_code = "ATTEMPTS_EXHAUSTED"
+                        row.claimed_at = None
+                        row.claim_token = None
+                        continue
+                    row.status = "QUEUED"
+                    row.claimed_at = now
+                    dispatch_token = uuid.uuid4()
+                    row.claim_token = dispatch_token
+                    dispatch_ids.append((row.id, dispatch_token))
+                return dispatch_ids
+
+    async def arelease_notification_dispatch(
+        self, notification_id: uuid.UUID, now: datetime, dispatch_token: uuid.UUID
+    ) -> None:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferNotificationOutbox)
+                    .where(
+                        TransferNotificationOutbox.id == notification_id,
+                        TransferNotificationOutbox.status == "QUEUED",
+                        TransferNotificationOutbox.claim_token == dispatch_token,
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    return
+                row.status = "PENDING"
+                row.claimed_at = None
+                row.claim_token = None
+                row.next_attempt_at = now.astimezone(UTC) + timedelta(seconds=15)
+                row.last_error_code = "QUEUE_UNAVAILABLE"
+
+    async def aclaim_notification_delivery(
+        self,
+        notification_id: uuid.UUID,
+        now: datetime,
+        dispatch_token: uuid.UUID,
+        lease_seconds: int = _NOTIFICATION_LEASE_SECONDS,
+    ) -> tuple[dict[str, Any], uuid.UUID] | None:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferNotificationOutbox)
+                    .where(TransferNotificationOutbox.id == notification_id)
+                    .with_for_update()
+                )
+                if (
+                    row is None
+                    or row.status != "QUEUED"
+                    or row.claim_token != dispatch_token
+                    or row.claimed_at is None
+                ):
+                    return None
+                claimed_at = row.claimed_at
+                if claimed_at.tzinfo is None:
+                    claimed_at = claimed_at.replace(tzinfo=UTC)
+                if claimed_at <= now - timedelta(seconds=lease_seconds):
+                    return None
+                if row.attempt_count >= 5:
+                    row.status = "FAILED"
+                    row.last_error_code = "ATTEMPTS_EXHAUSTED"
+                    row.claimed_at = None
+                    row.claim_token = None
+                    return None
+                row.status = "SENDING"
+                row.attempt_count += 1
+                row.claimed_at = now
+                row.claim_token = uuid.uuid4()
+                return dict(row.snapshot), row.claim_token
+
+    async def amark_notification_sent(
+        self, notification_id: uuid.UUID, claim_token: uuid.UUID
+    ) -> None:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferNotificationOutbox)
+                    .where(TransferNotificationOutbox.id == notification_id)
+                    .with_for_update()
+                )
+                if row is not None and row.status == "SENDING" and row.claim_token == claim_token:
+                    row.status = "SENT"
+                    row.claimed_at = None
+                    row.claim_token = None
+                    row.last_error_code = None
+
+    async def afail_notification_delivery(
+        self,
+        notification_id: uuid.UUID,
+        now: datetime,
+        claim_token: uuid.UUID,
+        error_code: str = "SMTP_DELIVERY_FAILED",
+    ) -> None:
+        safe_codes = {"SMTP_CONFIGURATION_INVALID", "SMTP_DELIVERY_FAILED"}
+        error_code = error_code if error_code in safe_codes else "SMTP_DELIVERY_FAILED"
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferNotificationOutbox)
+                    .where(TransferNotificationOutbox.id == notification_id)
+                    .with_for_update()
+                )
+                if row is None or row.status != "SENDING" or row.claim_token != claim_token:
+                    return
+                row.claimed_at = None
+                row.claim_token = None
+                row.last_error_code = error_code
+                if row.attempt_count >= 5:
+                    row.status = "FAILED"
+                else:
+                    row.status = "PENDING"
+                    row.next_attempt_at = now + timedelta(
+                        seconds=min(3600, 15 * (2 ** (row.attempt_count - 1)))
+                    )
+
+    async def alist_notification_outbox(self, limit: int = 100) -> list[dict[str, Any]]:
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(TransferNotificationOutbox, TransferJob.public_id)
+                    .join(TransferJob, TransferJob.id == TransferNotificationOutbox.transfer_job_id)
+                    .order_by(TransferNotificationOutbox.created_at.desc())
+                    .limit(max(1, min(limit, 200)))
+                )
+            ).all()
+            return [
+                {
+                    "id": str(outbox.id),
+                    "transfer_public_id": public_id,
+                    "transfer_attempt": outbox.transfer_attempt,
+                    "status": outbox.status,
+                    "attempt_count": outbox.attempt_count,
+                    "last_error_code": outbox.last_error_code,
+                    "next_attempt_at": outbox.next_attempt_at.isoformat(),
+                    "created_at": outbox.created_at.isoformat(),
+                }
+                for outbox, public_id in rows
+            ]
+
     async def aclose(self) -> None:
         await self.engine.dispose()
 
@@ -51,6 +1155,105 @@ class DatabaseStore:
         async with self.engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
         return True
+
+    @asynccontextmanager
+    async def transfer_execution_lock(self, transfer_id: uuid.UUID) -> AsyncIterator[bool]:
+        """Hold a PostgreSQL session lock for the full lifetime of one worker task."""
+        async with self.engine.connect() as connection:
+            if connection.dialect.name != "postgresql":
+                yield True
+                return
+
+            lock_key = self._transfer_lock_key(transfer_id)
+            lock_parameters = {"lock_key": lock_key}
+            acquired = bool(
+                await connection.scalar(
+                    text("SELECT pg_try_advisory_lock(:lock_key)"), lock_parameters
+                )
+            )
+            await connection.commit()
+            if not acquired:
+                yield False
+                return
+
+            try:
+                yield True
+            finally:
+                await connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_key)"), lock_parameters
+                )
+                await connection.commit()
+
+    @staticmethod
+    def _transfer_lock_key(transfer_id: uuid.UUID) -> int:
+        return int.from_bytes(hashlib.sha256(transfer_id.bytes).digest()[:8], "big", signed=True)
+
+    @staticmethod
+    def _smtp_settings(row: SMTPSettings) -> SMTPSettingsRecord:
+        return SMTPSettingsRecord(
+            id=row.id,
+            host=row.host,
+            port=row.port,
+            use_tls=row.use_tls,
+            from_address=row.from_address,
+            encrypted_credentials=bytes(row.encrypted_credentials),
+        )
+
+    async def aget_smtp_settings(self) -> SMTPSettingsRecord | None:
+        async with self.sessions() as session:
+            row = await session.scalar(select(SMTPSettings).where(SMTPSettings.scope == "global"))
+            return self._smtp_settings(row) if row else None
+
+    async def acreate_smtp_settings_if_absent(
+        self, settings: SMTPSettingsRecord
+    ) -> SMTPSettingsRecord:
+        async with self.sessions() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else "postgresql"
+            insert = pg_insert if dialect == "postgresql" else sqlite_insert
+            statement = insert(SMTPSettings).values(
+                id=settings.id,
+                scope="global",
+                host=settings.host,
+                port=settings.port,
+                use_tls=settings.use_tls,
+                from_address=settings.from_address,
+                encrypted_credentials=settings.encrypted_credentials,
+            )
+            await session.execute(
+                statement.on_conflict_do_nothing(index_elements=[SMTPSettings.scope])
+            )
+            row = await session.scalar(select(SMTPSettings).where(SMTPSettings.scope == "global"))
+            if row is None:
+                raise RuntimeError("SMTP settings reservation failed")
+            await session.commit()
+            return self._smtp_settings(row)
+
+    async def asave_smtp_settings(self, settings: SMTPSettingsRecord) -> SMTPSettingsRecord:
+        async with self.sessions() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else "postgresql"
+            insert = pg_insert if dialect == "postgresql" else sqlite_insert
+            statement = insert(SMTPSettings).values(
+                id=settings.id,
+                scope="global",
+                host=settings.host,
+                port=settings.port,
+                use_tls=settings.use_tls,
+                from_address=settings.from_address,
+                encrypted_credentials=settings.encrypted_credentials,
+            )
+            upsert = statement.on_conflict_do_update(
+                index_elements=[SMTPSettings.scope],
+                set_={
+                    "host": settings.host,
+                    "port": settings.port,
+                    "use_tls": settings.use_tls,
+                    "from_address": settings.from_address,
+                    "encrypted_credentials": settings.encrypted_credentials,
+                },
+            ).returning(SMTPSettings)
+            row = (await session.scalars(upsert)).one()
+            await session.commit()
+            return self._smtp_settings(row)
 
     @staticmethod
     def _user(row: User) -> UserAccount:
@@ -77,6 +1280,7 @@ class DatabaseStore:
             created_by=row.created_by,
             encrypted_credentials=bytes(row.encrypted_credentials),
             status=row.status,
+            credential_version=row.credential_version,
             last_tested_at=row.last_tested_at,
             last_test_status=row.last_test_status,
             is_global=row.is_global,
@@ -84,18 +1288,47 @@ class DatabaseStore:
         )
 
     @staticmethod
-    def _transfer(row: TransferJob) -> TransferRecord:
+    def _transfer(
+        row: TransferJob,
+        *,
+        evaluation_override: TransferEvaluation | None | object = _NO_EVALUATION_OVERRIDE,
+    ) -> TransferRecord:
+        if evaluation_override is _NO_EVALUATION_OVERRIDE:
+            evaluation_row = row.evaluation
+        else:
+            evaluation_row = cast(TransferEvaluation | None, evaluation_override)
         return TransferRecord(
             id=row.id,
             public_id=row.public_id,
             requested_by=row.requested_by,
             source_connection_id=row.source_connection_id,
             destination_connection_id=row.destination_connection_id,
+            source_credential_version=row.source_credential_version,
+            destination_credential_version=row.destination_credential_version,
             source_paths=list(row.source_paths),
+            source_item_ids=list(row.source_item_ids) if row.source_item_ids is not None else None,
+            source_parent_ids=(
+                list(row.source_parent_ids) if row.source_parent_ids is not None else None
+            ),
             destination_path=row.destination_path,
             conflict_policy=row.conflict_policy,
             send_email_notification=row.send_email_notification,
             status=row.status,
+            scheduled_at=row.scheduled_at,
+            schedule_timezone=row.schedule_timezone,
+            execution_mode=row.execution_mode,
+            depends_on_transfer_id=row.depends_on_transfer_id,
+            source_file_error_policy=row.source_file_error_policy,
+            accepted_parent_omissions_attempt=row.accepted_parent_omissions_attempt,
+            wait_reason=row.wait_reason,
+            dispatch_token=row.dispatch_token,
+            dispatch_claimed_at=row.dispatch_claimed_at,
+            execution_started_at=row.execution_started_at,
+            execution_heartbeat_at=row.execution_heartbeat_at,
+            cancel_requested_at=row.cancel_requested_at,
+            pause_requested_at=row.pause_requested_at,
+            paused_at=row.paused_at,
+            state_version=row.state_version,
             progress_percent=float(row.progress_percent or 0),
             files_total=row.files_total or 0,
             files_completed=row.files_completed,
@@ -111,6 +1344,37 @@ class DatabaseStore:
             created_at=row.created_at,
             started_at=row.started_at,
             completed_at=row.completed_at,
+            evaluation=(
+                EvaluationRecord.from_row(evaluation_row) if evaluation_row is not None else None
+            ),
+        )
+
+    @staticmethod
+    def _manifest_item(row: TransferManifestItem) -> TransferManifestItemRecord:
+        return TransferManifestItemRecord(
+            id=row.id,
+            transfer_id=row.transfer_job_id,
+            source_path=row.source_path,
+            source_object_id=row.source_object_id,
+            destination_path=row.destination_path,
+            requested_destination_path=row.requested_destination_path or row.destination_path,
+            rename_reason=row.rename_reason,
+            is_dir=row.is_dir,
+            size_bytes=row.size_bytes,
+            modified_at=row.modified_at,
+            scan_complete=row.scan_complete,
+            status=row.status,
+            copy_started=row.copy_started,
+            destination_existed_before=row.destination_existed_before,
+            error_code=row.error_code,
+            verified_by=row.verified_by,
+            omission_kind=row.omission_kind,
+            omitted_at=row.omitted_at,
+            omitted_by=row.omitted_by,
+            last_failure_stage=row.last_failure_stage,
+            last_failure_attempt=row.last_failure_attempt,
+            copied_at=row.copied_at,
+            updated_at=row.updated_at,
         )
 
     async def acreate_user(
@@ -170,21 +1434,109 @@ class DatabaseStore:
             )
             return self._user(row) if row else None
 
-    async def asave_user(self, user: UserAccount) -> None:
+    async def arecord_login_failure(
+        self, user_id: uuid.UUID, expected_password_hash: str, now: datetime
+    ) -> None:
         async with self.sessions() as session:
-            row = await session.get(User, user.id)
-            if row is None:
-                return
-            row.failed_login_attempts = user.failed_login_attempts
-            row.locked_until = user.locked_until
-            row.last_login_at = user.last_login_at
-            row.is_active = user.is_active
-            row.must_change_password = user.must_change_password
-            row.password_hash = user.password_hash
-            row.role = user.role
-            row.username = user.username
-            row.email = user.email
-            await session.commit()
+            async with session.begin():
+                row = await session.scalar(
+                    select(User)
+                    .where(User.id == user_id, User.password_hash == expected_password_hash)
+                    .with_for_update()
+                )
+                if row is None:
+                    return
+                row.failed_login_attempts += 1
+                if row.failed_login_attempts >= 5:
+                    row.locked_until = now + timedelta(minutes=15)
+
+    async def arecord_login_success(
+        self, user_id: uuid.UUID, expected_password_hash: str, now: datetime
+    ) -> UserAccount | None:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(User)
+                    .where(
+                        User.id == user_id,
+                        User.password_hash == expected_password_hash,
+                        User.is_active.is_(True),
+                        or_(User.locked_until.is_(None), User.locked_until <= now),
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    return None
+                row.failed_login_attempts = 0
+                row.locked_until = None
+                row.last_login_at = now
+                await session.flush()
+                return self._user(row)
+
+    async def aupdate_user_password(
+        self,
+        user_id: uuid.UUID,
+        password_hash: str,
+        *,
+        must_change_password: bool,
+        reset_login_failures: bool = False,
+        expected_password_hash: str | None = None,
+    ) -> UserAccount | None:
+        async with self.sessions() as session:
+            async with session.begin():
+                statement = select(User).where(User.id == user_id)
+                if expected_password_hash is not None:
+                    statement = statement.where(User.password_hash == expected_password_hash)
+                row = await session.scalar(statement.with_for_update())
+                if row is None:
+                    return None
+                row.password_hash = password_hash
+                row.must_change_password = must_change_password
+                if reset_login_failures:
+                    row.failed_login_attempts = 0
+                    row.locked_until = None
+                await session.flush()
+                return self._user(row)
+
+    async def aupdate_user_profile(
+        self, user_id: uuid.UUID, changes: dict[str, str | bool]
+    ) -> tuple[UserAccount | None, bool]:
+        allowed = {"username", "email", "role", "is_active"}
+        if set(changes) - allowed:
+            raise ValueError("Unsupported user profile field")
+        async with self.sessions() as session:
+            async with session.begin():
+                active_admins: list[User] = []
+                if {"role", "is_active"} & changes.keys():
+                    if session.bind is not None and session.bind.dialect.name == "postgresql":
+                        await session.execute(
+                            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                            {"lock_key": 0x43544D41444D494E},
+                        )
+                    active_admins = list(
+                        (
+                            await session.scalars(
+                                select(User)
+                                .where(User.is_active.is_(True), User.role == "ADMIN")
+                                .order_by(User.id)
+                                .with_for_update()
+                            )
+                        ).all()
+                    )
+                row = await session.scalar(select(User).where(User.id == user_id).with_for_update())
+                if row is None:
+                    return None, False
+                removes_admin = (
+                    row.is_active
+                    and row.role == "ADMIN"
+                    and (changes.get("is_active", True) is False or changes.get("role") == "USER")
+                )
+                if removes_admin and len(active_admins) <= 1:
+                    return None, True
+                for field_name, value in changes.items():
+                    setattr(row, field_name, value)
+                await session.flush()
+                return self._user(row), False
 
     async def acreate_connection(
         self,
@@ -280,9 +1632,11 @@ class DatabaseStore:
 
     async def alist_connections(self, user_id: uuid.UUID | None = None) -> list[ConnectionRecord]:
         async with self.sessions() as session:
-            statement = select(StorageConnection).where(
-                StorageConnection.deleted_at.is_(None)
-            ).order_by(StorageConnection.name)
+            statement = (
+                select(StorageConnection)
+                .where(StorageConnection.deleted_at.is_(None))
+                .order_by(StorageConnection.name)
+            )
             if user_id is not None:
                 granted = select(UserConnectionGrant.connection_id).where(
                     UserConnectionGrant.user_id == user_id
@@ -345,7 +1699,10 @@ class DatabaseStore:
                 row.last_tested_at = connection.last_tested_at
                 row.last_test_status = connection.last_test_status
                 row.is_global = connection.is_global
+                if bytes(row.encrypted_credentials) != connection.encrypted_credentials:
+                    row.credential_version += 1
                 row.encrypted_credentials = connection.encrypted_credentials
+                connection.credential_version = row.credential_version
 
     async def _next_public_id(self, session: AsyncSession) -> str:
         year = datetime.now(UTC).year
@@ -369,12 +1726,1724 @@ class DatabaseStore:
         destination_connection_id: uuid.UUID,
         source_paths: list[str],
         destination_path: str,
-        conflict_policy: str = "OVERWRITE_IF_DIFFERENT",
+        conflict_policy: str = "KEEP_BOTH",
         send_email_notification: bool = False,
+        scheduled_at: datetime | None = None,
+        schedule_timezone: str = "UTC",
+        execution_mode: str = "AUTO",
+        depends_on_transfer_id: uuid.UUID | None = None,
+        idempotency_key: uuid.UUID | None = None,
+        idempotency_request_hash: str | None = None,
+        audit_event: dict[str, Any] | None = None,
+        source_item_ids: list[str | None] | None = None,
+        source_parent_ids: list[str | None] | None = None,
+        source_file_error_policy: str = "STOP",
     ) -> TransferRecord:
+        source_file_error_policy = normalize_source_file_error_policy(source_file_error_policy)
+        if (idempotency_key is None) != (idempotency_request_hash is None):
+            raise ValueError("Idempotency key and request hash must be supplied together")
         async with self.sessions() as session:
             connection_ids = sorted({source_connection_id, destination_connection_id})
+            try:
+                async with session.begin():
+                    if idempotency_key is not None:
+                        existing = await session.scalar(
+                            select(TransferJob).where(
+                                TransferJob.requested_by == requested_by,
+                                TransferJob.idempotency_key == idempotency_key,
+                            )
+                        )
+                        if existing is not None:
+                            if existing.idempotency_request_hash != idempotency_request_hash:
+                                raise IdempotencyConflictError(
+                                    "Idempotency key was already used for different input"
+                                )
+                            replay = self._transfer(existing)
+                            replay.idempotent_replay = True
+                            return replay
+
+                    connections = (
+                        await session.scalars(
+                            select(StorageConnection)
+                            .where(StorageConnection.id.in_(connection_ids))
+                            .order_by(StorageConnection.id)
+                            .with_for_update()
+                        )
+                    ).all()
+                    by_id = {connection.id: connection for connection in connections}
+                    for connection_id in connection_ids:
+                        connection = by_id.get(connection_id)
+                        if connection is None or connection.deleted_at is not None:
+                            raise ConnectionUnavailableError("not_found")
+                        if connection.status != "ACTIVE":
+                            raise ConnectionUnavailableError("inactive")
+                    row = TransferJob(
+                        id=uuid.uuid4(),
+                        public_id=await self._next_public_id(session),
+                        requested_by=requested_by,
+                        idempotency_key=idempotency_key,
+                        idempotency_request_hash=idempotency_request_hash,
+                        source_connection_id=source_connection_id,
+                        destination_connection_id=destination_connection_id,
+                        source_paths=source_paths,
+                        source_item_ids=source_item_ids,
+                        source_parent_ids=source_parent_ids,
+                        destination_path=destination_path,
+                        operation="COPY",
+                        conflict_policy=conflict_policy,
+                        send_email_notification=send_email_notification,
+                        status=(
+                            "SCHEDULED"
+                            if scheduled_at is not None and scheduled_at > datetime.now(UTC)
+                            else "QUEUED"
+                        ),
+                        scheduled_at=scheduled_at,
+                        schedule_timezone=schedule_timezone,
+                        execution_mode=execution_mode,
+                        depends_on_transfer_id=depends_on_transfer_id,
+                        source_file_error_policy=source_file_error_policy,
+                        wait_reason=(
+                            "WAITING_UNTIL"
+                            if scheduled_at is not None and scheduled_at > datetime.now(UTC)
+                            else None
+                        ),
+                        source_credential_version=by_id[source_connection_id].credential_version,
+                        destination_credential_version=by_id[
+                            destination_connection_id
+                        ].credential_version,
+                        created_at=datetime.now(UTC),
+                    )
+                    session.add(row)
+                    await self._record_transfer_state_span(
+                        session,
+                        row,
+                        status=row.status,
+                        wait_reason=row.wait_reason,
+                        now=row.created_at,
+                    )
+                    evaluation_row: TransferEvaluation | None = None
+                    if scheduled_at is not None and scheduled_at > datetime.now(UTC):
+                        is_smb_source = by_id[source_connection_id].provider_type == "SMB"
+                        evaluation_row = TransferEvaluation(
+                            id=uuid.uuid4(),
+                            transfer_job_id=row.id,
+                            status="PENDING",
+                            generation=1,
+                            sequence=0,
+                            count_complete=False,
+                            max_files=(
+                                self.settings.smb_transfer_max_files
+                                if is_smb_source
+                                else self.settings.transfer_max_files
+                            ),
+                            source_credential_version=by_id[
+                                source_connection_id
+                            ].credential_version,
+                            destination_credential_version=by_id[
+                                destination_connection_id
+                            ].credential_version,
+                            attempt_count=0,
+                        )
+                        row.evaluation = evaluation_row
+                        session.add(evaluation_row)
+                    await session.flush()
+                    if audit_event is not None:
+                        event_metadata = dict(audit_event.get("metadata") or {})
+                        event_metadata.setdefault("public_id", row.public_id)
+                        session.add(
+                            AuditEvent(
+                                actor_user_id=requested_by,
+                                action="TRANSFER_CREATED",
+                                resource_type="transfer",
+                                resource_id=str(row.id),
+                                result="SUCCESS",
+                                event_metadata=sanitize_data(event_metadata),
+                                ip_address=audit_event.get("ip_address"),
+                                user_agent=(
+                                    str(audit_event["user_agent"])[:255]
+                                    if audit_event.get("user_agent")
+                                    else None
+                                ),
+                            )
+                        )
+            except IntegrityError:
+                if idempotency_key is None:
+                    raise
+                await session.rollback()
+                recovered = await self.aget_transfer_by_idempotency(
+                    requested_by, idempotency_key, idempotency_request_hash or ""
+                )
+                if recovered is None:
+                    raise
+                recovered.idempotent_replay = True
+                return recovered
+            await session.refresh(row)
+            transfer = self._transfer(row)
+            if evaluation_row is not None:
+                transfer.evaluation = EvaluationRecord.from_row(evaluation_row)
+            return transfer
+
+    async def arequest_transfer_evaluation(
+        self, transfer_id: uuid.UUID, now: datetime
+    ) -> EvaluationRecord:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
             async with session.begin():
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if (
+                    transfer is None
+                    or transfer.status not in {"SCHEDULED", "QUEUED"}
+                    or transfer.dispatch_token is not None
+                    or transfer.execution_started_at is not None
+                    or transfer.cancel_requested_at is not None
+                ):
+                    raise EvaluationConflictError(
+                        "Solo se puede reevaluar una transferencia pendiente de ejecución."
+                    )
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == transfer_id)
+                    .with_for_update()
+                )
+                if evaluation is None:
+                    raise EvaluationConflictError(
+                        "Esta transferencia no tiene una evaluación anticipada para repetir."
+                    )
+                if evaluation.status in {"PENDING", "EVALUATING", "WAITING_PARENT"}:
+                    return EvaluationRecord.from_row(evaluation)
+
+                restart_evaluation(evaluation, now=now)
+                parent_wait = None
+                if transfer.depends_on_transfer_id is not None:
+                    parent = await session.get(TransferJob, transfer.depends_on_transfer_id)
+                    parent_omitted_count = int(
+                        await session.scalar(
+                            select(func.count()).where(
+                                TransferManifestItem.transfer_job_id
+                                == transfer.depends_on_transfer_id,
+                                TransferManifestItem.is_dir.is_(False),
+                                TransferManifestItem.omission_kind.is_not(None),
+                            )
+                        )
+                        or 0
+                    )
+                    parent_wait = dependency_wait_reason(
+                        parent.status if parent is not None else "FAILED",
+                        parent_omitted_count=parent_omitted_count,
+                        parent_attempt_count=parent.attempt_count if parent is not None else 1,
+                        accepted_parent_omissions_attempt=(
+                            transfer.accepted_parent_omissions_attempt
+                        ),
+                    )
+                if parent_wait is not None:
+                    evaluation.status = "WAITING_PARENT"
+                    evaluation.sequence = 1
+                    evaluation.safe_error_code = dependency_error_code(parent_wait)
+                    evaluation.safe_message = dependency_wait_message(parent_wait)
+                    transfer.wait_reason = parent_wait
+                else:
+                    transfer.wait_reason = "WAITING_EVALUATION"
+                return EvaluationRecord.from_row(evaluation)
+
+    async def aget_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
+        async with self.sessions() as session:
+            row = await session.get(TransferJob, transfer_id)
+            return self._transfer(row) if row else None
+
+    async def alist_transfer_evaluations(
+        self, transfer_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, EvaluationRecord]:
+        if not transfer_ids:
+            return {}
+        async with self.sessions() as session:
+            rows = await session.scalars(
+                select(TransferEvaluation).where(
+                    TransferEvaluation.transfer_job_id.in_(transfer_ids)
+                )
+            )
+            return {row.transfer_job_id: EvaluationRecord.from_row(row) for row in rows}
+
+    @staticmethod
+    def _evaluation_claim_matches(
+        evaluation: TransferEvaluation,
+        transfer: TransferJob | None,
+        claim: EvaluationClaim,
+    ) -> bool:
+        return bool(
+            transfer is not None
+            and evaluation.status == "EVALUATING"
+            and evaluation.generation == claim.generation
+            and evaluation.claim_token == claim.claim_token
+            and transfer.status in {"SCHEDULED", "QUEUED"}
+            and transfer.dispatch_token is None
+            and transfer.execution_started_at is None
+            and transfer.cancel_requested_at is None
+        )
+
+    async def aclaim_due_evaluations(
+        self,
+        now: datetime,
+        *,
+        limit: int = 1,
+    ) -> list[EvaluationClaim]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        now = now.astimezone(UTC)
+        stale_before = now - timedelta(seconds=_EVALUATION_LEASE_SECONDS)
+        claims: list[EvaluationClaim] = []
+        parent = aliased(TransferJob)
+        parent_succeeded = exists(
+            select(parent.id).where(
+                parent.id == TransferJob.depends_on_transfer_id,
+                parent.status.in_({"COMPLETED", "COMPLETED_WITH_WARNINGS"}),
+            )
+        )
+        async with self.sessions() as session:
+            async with session.begin():
+                rows = list(
+                    await session.scalars(
+                        select(TransferEvaluation)
+                        .join(
+                            TransferJob,
+                            TransferJob.id == TransferEvaluation.transfer_job_id,
+                        )
+                        .where(
+                            or_(
+                                and_(
+                                    TransferEvaluation.status == "PENDING",
+                                    or_(
+                                        TransferEvaluation.retry_at.is_(None),
+                                        TransferEvaluation.retry_at <= now,
+                                    ),
+                                ),
+                                and_(
+                                    TransferEvaluation.status == "EVALUATING",
+                                    or_(
+                                        TransferEvaluation.heartbeat_at.is_(None),
+                                        TransferEvaluation.heartbeat_at <= stale_before,
+                                    ),
+                                ),
+                                and_(
+                                    TransferEvaluation.status == "WAITING_PARENT",
+                                    parent_succeeded,
+                                ),
+                            )
+                        )
+                        .order_by(TransferEvaluation.updated_at, TransferEvaluation.id)
+                        .limit(min(limit, 100))
+                        .with_for_update(skip_locked=True)
+                    )
+                )
+                parent_ids = (
+                    set(
+                        await session.scalars(
+                            select(TransferJob.depends_on_transfer_id).where(
+                                TransferJob.id.in_([item.transfer_job_id for item in rows]),
+                                TransferJob.depends_on_transfer_id.is_not(None),
+                            )
+                        )
+                    )
+                    if rows
+                    else set()
+                )
+                omitted_by_parent = (
+                    {
+                        transfer_id: int(count)
+                        for transfer_id, count in (
+                            await session.execute(
+                                select(
+                                    TransferManifestItem.transfer_job_id,
+                                    func.count(),
+                                )
+                                .where(
+                                    TransferManifestItem.transfer_job_id.in_(parent_ids),
+                                    TransferManifestItem.is_dir.is_(False),
+                                    TransferManifestItem.omission_kind.is_not(None),
+                                )
+                                .group_by(TransferManifestItem.transfer_job_id)
+                            )
+                        ).all()
+                    }
+                    if parent_ids
+                    else {}
+                )
+                for evaluation in rows:
+                    transfer = await session.scalar(
+                        select(TransferJob)
+                        .where(TransferJob.id == evaluation.transfer_job_id)
+                        .with_for_update()
+                    )
+                    if (
+                        transfer is None
+                        or transfer.status not in {"SCHEDULED", "QUEUED"}
+                        or transfer.dispatch_token is not None
+                        or transfer.execution_started_at is not None
+                        or transfer.cancel_requested_at is not None
+                    ):
+                        evaluation.claim_token = None
+                        evaluation.heartbeat_at = None
+                        continue
+
+                    if transfer.depends_on_transfer_id is not None:
+                        parent_transfer = await session.scalar(
+                            select(TransferJob)
+                            .where(TransferJob.id == transfer.depends_on_transfer_id)
+                            .with_for_update()
+                        )
+                        parent_wait = dependency_wait_reason(
+                            parent_transfer.status if parent_transfer is not None else "FAILED",
+                            parent_omitted_count=omitted_by_parent.get(
+                                transfer.depends_on_transfer_id, 0
+                            ),
+                            parent_attempt_count=(
+                                parent_transfer.attempt_count if parent_transfer is not None else 1
+                            ),
+                            accepted_parent_omissions_attempt=(
+                                transfer.accepted_parent_omissions_attempt
+                            ),
+                        )
+                        if parent_wait is not None:
+                            safe_error_code = dependency_error_code(parent_wait)
+                            safe_message = dependency_wait_message(parent_wait)
+                            if evaluation.status != "WAITING_PARENT":
+                                restart_evaluation(evaluation, now=now)
+                                evaluation.status = "WAITING_PARENT"
+                                evaluation.safe_error_code = safe_error_code
+                                evaluation.safe_message = safe_message
+                                evaluation.sequence = 1
+                            elif (
+                                evaluation.safe_error_code != safe_error_code
+                                or evaluation.safe_message != safe_message
+                                or transfer.wait_reason != parent_wait
+                            ):
+                                evaluation.safe_error_code = safe_error_code
+                                evaluation.safe_message = safe_message
+                                evaluation.sequence += 1
+                                evaluation.updated_at = now
+                            transfer.wait_reason = parent_wait
+                            continue
+                        if evaluation.status == "WAITING_PARENT":
+                            restart_evaluation(evaluation, now=now)
+                            transfer.wait_reason = "WAITING_EVALUATION"
+                    elif evaluation.status == "WAITING_PARENT":
+                        restart_evaluation(evaluation, now=now)
+                        transfer.wait_reason = "WAITING_EVALUATION"
+
+                    owner = await session.get(User, transfer.requested_by)
+                    if owner is None or not owner.is_active:
+                        transfer.wait_reason = "WAITING_USER_ACTIVE"
+                        continue
+                    source = await session.get(StorageConnection, transfer.source_connection_id)
+                    destination = await session.get(
+                        StorageConnection, transfer.destination_connection_id
+                    )
+                    if (
+                        source is None
+                        or destination is None
+                        or source.deleted_at is not None
+                        or destination.deleted_at is not None
+                        or source.status != "ACTIVE"
+                        or destination.status != "ACTIVE"
+                    ):
+                        transfer.wait_reason = "WAITING_CONNECTION_ACTIVE"
+                        continue
+                    if (
+                        source.credential_version != transfer.source_credential_version
+                        or destination.credential_version != transfer.destination_credential_version
+                        or (
+                            evaluation.source_credential_version is not None
+                            and evaluation.source_credential_version != source.credential_version
+                        )
+                        or (
+                            evaluation.destination_credential_version is not None
+                            and evaluation.destination_credential_version
+                            != destination.credential_version
+                        )
+                    ):
+                        evaluation.status = "BLOCKED"
+                        evaluation.safe_error_code = "BLOCKED_CONNECTION_CHANGED"
+                        evaluation.safe_message = (
+                            "Una conexión o sus credenciales cambiaron. "
+                            "Solicita una nueva evaluación."
+                        )
+                        evaluation.completed_at = now
+                        evaluation.retry_at = None
+                        evaluation.claim_token = None
+                        evaluation.heartbeat_at = None
+                        evaluation.sequence += 1
+                        evaluation.updated_at = now
+                        transfer.wait_reason = "BLOCKED_CONNECTION_CHANGED"
+                        continue
+                    if owner.role != "ADMIN":
+                        granted = set(
+                            (
+                                await session.scalars(
+                                    select(UserConnectionGrant.connection_id).where(
+                                        UserConnectionGrant.user_id == owner.id,
+                                        UserConnectionGrant.connection_id.in_(
+                                            [source.id, destination.id]
+                                        ),
+                                    )
+                                )
+                            ).all()
+                        )
+                        if any(
+                            not connection.is_global and connection.id not in granted
+                            for connection in (source, destination)
+                        ):
+                            transfer.wait_reason = "WAITING_CONNECTION_ACCESS"
+                            continue
+
+                    maximum_files = (
+                        self.settings.smb_transfer_max_files
+                        if source.provider_type == "SMB"
+                        else self.settings.transfer_max_files
+                    )
+                    if evaluation.max_files != maximum_files:
+                        restart_evaluation(
+                            evaluation,
+                            now=now,
+                            max_files=maximum_files,
+                        )
+                        transfer.wait_reason = "WAITING_EVALUATION"
+                        continue
+
+                    if evaluation.status == "EVALUATING" and session.bind is not None:
+                        if session.bind.dialect.name == "postgresql":
+                            connection = await session.connection()
+                            lock_key = self._transfer_lock_key(transfer.id)
+                            lock_available = bool(
+                                await connection.scalar(
+                                    text("SELECT pg_try_advisory_lock(:lock_key)"),
+                                    {"lock_key": lock_key},
+                                )
+                            )
+                            if not lock_available:
+                                continue
+                            await connection.execute(
+                                text("SELECT pg_advisory_unlock(:lock_key)"),
+                                {"lock_key": lock_key},
+                            )
+
+                    if evaluation.attempt_count >= 3:
+                        evaluation.status = "ERROR"
+                        evaluation.safe_error_code = "EVALUATION_ATTEMPTS_EXHAUSTED"
+                        evaluation.safe_message = (
+                            "No se pudo completar la evaluación tras tres intentos."
+                        )
+                        evaluation.completed_at = now
+                        evaluation.retry_at = None
+                        evaluation.claim_token = None
+                        evaluation.heartbeat_at = None
+                        evaluation.sequence += 1
+                        evaluation.updated_at = now
+                        transfer.wait_reason = "BLOCKED_EVALUATION"
+                        continue
+
+                    claim_token = uuid.uuid4()
+                    evaluation.status = "EVALUATING"
+                    evaluation.claim_token = claim_token
+                    evaluation.attempt_count += 1
+                    evaluation.started_at = evaluation.started_at or now
+                    evaluation.updated_at = now
+                    evaluation.heartbeat_at = now
+                    evaluation.retry_at = None
+                    evaluation.sequence += 1
+                    transfer.wait_reason = "WAITING_EVALUATION"
+                    claims.append(
+                        EvaluationClaim(
+                            transfer_id=transfer.id,
+                            generation=evaluation.generation,
+                            claim_token=claim_token,
+                        )
+                    )
+        return claims
+
+    async def aheartbeat_evaluation(self, claim: EvaluationClaim, now: datetime) -> bool:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == claim.transfer_id)
+                    .with_for_update()
+                )
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == claim.transfer_id).with_for_update()
+                )
+                if (
+                    evaluation is None
+                    or transfer is None
+                    or not self._evaluation_claim_matches(evaluation, transfer, claim)
+                ):
+                    return False
+                evaluation.heartbeat_at = now
+                return True
+
+    async def asave_evaluation_progress(
+        self, claim: EvaluationClaim, progress: InventoryProgress, now: datetime
+    ) -> bool:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == claim.transfer_id)
+                    .with_for_update()
+                )
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == claim.transfer_id).with_for_update()
+                )
+                if evaluation is None or not self._evaluation_claim_matches(
+                    evaluation, transfer, claim
+                ):
+                    return False
+                if (
+                    evaluation.files_found == progress.files_found
+                    and evaluation.count_complete == progress.count_complete
+                ):
+                    return True
+                evaluation.files_found = progress.files_found
+                evaluation.count_complete = progress.count_complete
+                evaluation.sequence += 1
+                evaluation.updated_at = now
+                return True
+
+    async def afinish_evaluation(
+        self,
+        claim: EvaluationClaim,
+        *,
+        status: str,
+        progress: InventoryProgress,
+        error_code: str | None,
+        message: str | None,
+        now: datetime,
+        retry_at: datetime | None = None,
+        wait_reason: str | None = None,
+    ) -> bool:
+        if status not in {"PENDING", "APPROVED", "BLOCKED", "ERROR", "WAITING_PARENT"}:
+            raise ValueError("Invalid evaluation completion status")
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == claim.transfer_id)
+                    .with_for_update()
+                )
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == claim.transfer_id).with_for_update()
+                )
+                if (
+                    evaluation is None
+                    or transfer is None
+                    or not self._evaluation_claim_matches(evaluation, transfer, claim)
+                ):
+                    return False
+                evaluation.status = status
+                evaluation.files_found = progress.files_found
+                evaluation.count_complete = progress.count_complete
+                evaluation.safe_error_code = error_code
+                evaluation.safe_message = message
+                evaluation.retry_at = retry_at.astimezone(UTC) if retry_at is not None else None
+                evaluation.completed_at = (
+                    now if status in {"APPROVED", "BLOCKED", "ERROR"} else None
+                )
+                evaluation.claim_token = None
+                evaluation.heartbeat_at = None
+                evaluation.sequence += 1
+                evaluation.updated_at = now
+                if status == "APPROVED":
+                    scheduled_at = transfer.scheduled_at
+                    if scheduled_at is not None and scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=UTC)
+                    transfer.wait_reason = (
+                        "WAITING_UNTIL" if scheduled_at is not None and scheduled_at > now else None
+                    )
+                elif status in {"BLOCKED", "ERROR"}:
+                    transfer.wait_reason = "BLOCKED_EVALUATION"
+                elif status == "WAITING_PARENT":
+                    transfer.wait_reason = wait_reason or "WAITING_PARENT"
+                else:
+                    transfer.wait_reason = "WAITING_EVALUATION"
+                return True
+
+    async def aget_transfer_by_idempotency(
+        self,
+        requested_by: uuid.UUID,
+        idempotency_key: uuid.UUID,
+        request_hash: str,
+    ) -> TransferRecord | None:
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(TransferJob).where(
+                    TransferJob.requested_by == requested_by,
+                    TransferJob.idempotency_key == idempotency_key,
+                )
+            )
+            if row is None:
+                return None
+            if row.idempotency_request_hash != request_hash:
+                raise IdempotencyConflictError(
+                    "Idempotency key was already used for different input"
+                )
+            record = self._transfer(row)
+            record.idempotent_replay = True
+            return record
+
+    async def ais_transfer_cancel_requested(self, transfer_id: uuid.UUID) -> bool:
+        async with self.sessions() as session:
+            requested_at = await session.scalar(
+                select(TransferJob.cancel_requested_at).where(TransferJob.id == transfer_id)
+            )
+            return requested_at is not None
+
+    async def adispatch_due_transfers(
+        self,
+        now: datetime,
+        *,
+        max_concurrent: int,
+        max_nextcloud_concurrent: int = 1,
+    ) -> DispatchBatch:
+        """Reserve eligible transfers transactionally before sending them to Celery."""
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be positive")
+        if max_nextcloud_concurrent < 1:
+            raise ValueError("max_nextcloud_concurrent must be positive")
+        active_statuses = {"VALIDATING", "RUNNING", "RETRYING", "PAUSING", "CANCELLING"}
+        changed_ids: set[uuid.UUID] = set()
+        admitted_ids: list[uuid.UUID] = []
+        now = now.astimezone(UTC)
+
+        async with self.sessions() as session:
+            async with session.begin():
+                if session.bind is not None and session.bind.dialect.name == "postgresql":
+                    await session.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": 0x43544D5343484544},
+                    )
+
+                stale_dispatches = await session.scalars(
+                    select(TransferJob).where(
+                        TransferJob.status.in_({"QUEUED", "SCHEDULED"}),
+                        TransferJob.dispatch_token.is_not(None),
+                        TransferJob.execution_started_at.is_(None),
+                        TransferJob.dispatch_claimed_at < now - timedelta(seconds=120),
+                    )
+                )
+                for stale in stale_dispatches:
+                    stale.dispatch_token = None
+                    stale.dispatch_claimed_at = None
+                    changed_ids.add(stale.id)
+
+                stale_running = list(
+                    await session.scalars(
+                        select(TransferJob).where(
+                            TransferJob.status.in_({"QUEUED", *active_statuses}),
+                            TransferJob.execution_started_at.is_not(None),
+                            TransferJob.execution_heartbeat_at < now - timedelta(seconds=60),
+                        )
+                    )
+                )
+                for stale in stale_running:
+                    worker_alive = False
+                    if session.bind is not None and session.bind.dialect.name == "postgresql":
+                        lock_key = self._transfer_lock_key(stale.id)
+                        connection = await session.connection()
+                        lock_available = bool(
+                            await connection.scalar(
+                                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                                {"lock_key": lock_key},
+                            )
+                        )
+                        if lock_available:
+                            await connection.execute(
+                                text("SELECT pg_advisory_unlock(:lock_key)"),
+                                {"lock_key": lock_key},
+                            )
+                        else:
+                            worker_alive = True
+                    if worker_alive:
+                        continue
+                    stale.status = "FAILED"
+                    stale.completed_at = now
+                    stale.error_count += 1
+                    stale.current_item = None
+                    stale.wait_reason = None
+                    stale.dispatch_token = None
+                    stale.dispatch_claimed_at = None
+                    stale.execution_started_at = None
+                    stale.execution_heartbeat_at = None
+                    await self._ensure_notification_outbox(session, stale)
+                    session.add(
+                        TransferEvent(
+                            transfer_job_id=stale.id,
+                            level="ERROR",
+                            event_type="WORKER_INTERRUPTED",
+                            message=(
+                                "La ejecución se interrumpió; revisa el destino "
+                                "antes de reintentar."
+                            ),
+                            technical_details={"reason": "STALE_WORKER_HEARTBEAT"},
+                            provider_error_code="WORKER_INTERRUPTED",
+                            correlation_id=stale.id,
+                        )
+                    )
+                    changed_ids.add(stale.id)
+
+                candidates = list(
+                    await session.scalars(
+                        select(TransferJob)
+                        .where(
+                            TransferJob.status.in_({"SCHEDULED", "QUEUED"}),
+                            TransferJob.dispatch_token.is_(None),
+                            or_(
+                                TransferJob.scheduled_at.is_(None),
+                                TransferJob.scheduled_at <= now,
+                            ),
+                        )
+                        .order_by(
+                            func.coalesce(TransferJob.scheduled_at, TransferJob.created_at),
+                            TransferJob.created_at,
+                            TransferJob.id,
+                        )
+                        .with_for_update()
+                    )
+                )
+                parent_ids = {
+                    transfer.depends_on_transfer_id
+                    for transfer in candidates
+                    if transfer.depends_on_transfer_id is not None
+                }
+                omitted_by_parent = (
+                    {
+                        transfer_id: int(count)
+                        for transfer_id, count in (
+                            await session.execute(
+                                select(
+                                    TransferManifestItem.transfer_job_id,
+                                    func.count(),
+                                )
+                                .where(
+                                    TransferManifestItem.transfer_job_id.in_(parent_ids),
+                                    TransferManifestItem.is_dir.is_(False),
+                                    TransferManifestItem.omission_kind.is_not(None),
+                                )
+                                .group_by(TransferManifestItem.transfer_job_id)
+                            )
+                        ).all()
+                    }
+                    if parent_ids
+                    else {}
+                )
+                running = list(
+                    await session.scalars(
+                        select(TransferJob).where(
+                            or_(
+                                and_(
+                                    TransferJob.dispatch_token.is_not(None),
+                                    TransferJob.status.in_(ACTIVE_TRANSFER_STATUSES),
+                                ),
+                                TransferJob.status.in_(active_statuses),
+                            )
+                        )
+                    )
+                )
+                connection_ids = {
+                    connection_id
+                    for transfer in [*candidates, *running]
+                    for connection_id in (
+                        transfer.source_connection_id,
+                        transfer.destination_connection_id,
+                    )
+                }
+                connection_rows = (
+                    list(
+                        await session.scalars(
+                            select(StorageConnection).where(
+                                StorageConnection.id.in_(connection_ids)
+                            )
+                        )
+                    )
+                    if connection_ids
+                    else []
+                )
+                connections = {connection.id: connection for connection in connection_rows}
+
+                active = [
+                    TransferReservation(
+                        transfer_id=transfer.id,
+                        source_connection_id=transfer.source_connection_id,
+                        destination_connection_id=transfer.destination_connection_id,
+                        execution_mode=transfer.execution_mode,
+                        uses_staging=self._transfer_uses_staging(transfer, connections),
+                        uses_nextcloud=self._transfer_uses_nextcloud(transfer, connections),
+                    )
+                    for transfer in running
+                ]
+                exclusive_barrier = False
+                reason: str | None = None
+
+                for transfer in candidates:
+                    scheduled_at = transfer.scheduled_at
+                    if scheduled_at is not None and scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=UTC)
+                    if scheduled_at is not None and scheduled_at > now:
+                        if transfer.wait_reason != "WAITING_UNTIL":
+                            transfer.wait_reason = "WAITING_UNTIL"
+                            changed_ids.add(transfer.id)
+                        if transfer.status != "SCHEDULED":
+                            transfer.status = "SCHEDULED"
+                            changed_ids.add(transfer.id)
+                        continue
+
+                    if transfer.status == "SCHEDULED":
+                        transfer.status = "QUEUED"
+                        changed_ids.add(transfer.id)
+
+                    if transfer.depends_on_transfer_id is not None:
+                        parent = await session.get(TransferJob, transfer.depends_on_transfer_id)
+                        parent_wait = dependency_wait_reason(
+                            parent.status if parent else "FAILED",
+                            parent_omitted_count=omitted_by_parent.get(
+                                transfer.depends_on_transfer_id, 0
+                            ),
+                            parent_attempt_count=parent.attempt_count if parent else 1,
+                            accepted_parent_omissions_attempt=(
+                                transfer.accepted_parent_omissions_attempt
+                            ),
+                        )
+                        if parent_wait is not None:
+                            evaluation = transfer.evaluation
+                            if evaluation is not None and evaluation.status != "WAITING_PARENT":
+                                restart_evaluation(evaluation, now=now)
+                                evaluation.status = "WAITING_PARENT"
+                                evaluation.safe_error_code = dependency_error_code(parent_wait)
+                                evaluation.safe_message = dependency_wait_message(parent_wait)
+                                evaluation.sequence = 1
+                            elif evaluation is not None and (
+                                evaluation.safe_error_code != dependency_error_code(parent_wait)
+                                or evaluation.safe_message != dependency_wait_message(parent_wait)
+                            ):
+                                evaluation.safe_error_code = dependency_error_code(parent_wait)
+                                evaluation.safe_message = dependency_wait_message(parent_wait)
+                                evaluation.sequence += 1
+                                evaluation.updated_at = now
+                            if transfer.wait_reason != parent_wait:
+                                transfer.wait_reason = parent_wait
+                                changed_ids.add(transfer.id)
+                            if evaluation is not None:
+                                changed_ids.add(transfer.id)
+                            continue
+                        if (
+                            transfer.evaluation is not None
+                            and transfer.evaluation.status == "WAITING_PARENT"
+                        ):
+                            restart_evaluation(transfer.evaluation, now=now)
+                            transfer.wait_reason = "WAITING_EVALUATION"
+                            changed_ids.add(transfer.id)
+                    elif (
+                        transfer.evaluation is not None
+                        and transfer.evaluation.status == "WAITING_PARENT"
+                    ):
+                        restart_evaluation(transfer.evaluation, now=now)
+                        transfer.wait_reason = "WAITING_EVALUATION"
+                        changed_ids.add(transfer.id)
+
+                    owner = await session.get(User, transfer.requested_by)
+                    if owner is None or not owner.is_active:
+                        reason = "WAITING_USER_ACTIVE"
+                        if transfer.wait_reason != reason:
+                            transfer.wait_reason = reason
+                            changed_ids.add(transfer.id)
+                        continue
+
+                    source = connections.get(transfer.source_connection_id)
+                    destination = connections.get(transfer.destination_connection_id)
+                    if (
+                        source is None
+                        or destination is None
+                        or source.deleted_at is not None
+                        or destination.deleted_at is not None
+                        or source.status != "ACTIVE"
+                        or destination.status != "ACTIVE"
+                    ):
+                        reason = "WAITING_CONNECTION_ACTIVE"
+                        if transfer.wait_reason != reason:
+                            transfer.wait_reason = reason
+                            changed_ids.add(transfer.id)
+                        continue
+                    if (
+                        source.credential_version != transfer.source_credential_version
+                        or destination.credential_version != transfer.destination_credential_version
+                    ):
+                        reason = "BLOCKED_CONNECTION_CHANGED"
+                        if transfer.wait_reason != reason:
+                            transfer.wait_reason = reason
+                            changed_ids.add(transfer.id)
+                        continue
+                    if owner.role != "ADMIN":
+                        grants = set(
+                            (
+                                await session.scalars(
+                                    select(UserConnectionGrant.connection_id).where(
+                                        UserConnectionGrant.user_id == owner.id,
+                                        UserConnectionGrant.connection_id.in_(
+                                            [source.id, destination.id]
+                                        ),
+                                    )
+                                )
+                            ).all()
+                        )
+                        if any(
+                            not connection.is_global and connection.id not in grants
+                            for connection in (source, destination)
+                        ):
+                            reason = "WAITING_CONNECTION_ACCESS"
+                            if transfer.wait_reason != reason:
+                                transfer.wait_reason = reason
+                                changed_ids.add(transfer.id)
+                            continue
+
+                    evaluation = transfer.evaluation
+                    if evaluation is not None:
+                        maximum_files = (
+                            self.settings.smb_transfer_max_files
+                            if source.provider_type == "SMB"
+                            else self.settings.transfer_max_files
+                        )
+                        if evaluation.max_files != maximum_files:
+                            restart_evaluation(
+                                evaluation,
+                                now=now,
+                                max_files=maximum_files,
+                            )
+                            transfer.wait_reason = "WAITING_EVALUATION"
+                            changed_ids.add(transfer.id)
+                            continue
+                        evaluation_wait = evaluation_wait_reason(
+                            EvaluationRecord.from_row(evaluation)
+                        )
+                        if evaluation_wait is not None:
+                            if transfer.wait_reason != evaluation_wait:
+                                transfer.wait_reason = evaluation_wait
+                                changed_ids.add(transfer.id)
+                            continue
+
+                    if exclusive_barrier:
+                        reason = "WAITING_EXCLUSIVE"
+                    else:
+                        reason = admission_wait_reason(
+                            source_connection_id=transfer.source_connection_id,
+                            destination_connection_id=transfer.destination_connection_id,
+                            execution_mode=transfer.execution_mode,
+                            uses_staging=self._transfer_uses_staging(transfer, connections),
+                            uses_nextcloud=self._transfer_uses_nextcloud(transfer, connections),
+                            active=active,
+                            max_concurrent=max_concurrent,
+                            max_nextcloud_concurrent=max_nextcloud_concurrent,
+                        )
+
+                    if reason is not None:
+                        if transfer.wait_reason != reason:
+                            transfer.wait_reason = reason
+                            changed_ids.add(transfer.id)
+                        if transfer.execution_mode == "EXCLUSIVE":
+                            exclusive_barrier = True
+                        continue
+
+                    transfer.dispatch_token = uuid.uuid4()
+                    transfer.dispatch_claimed_at = now
+                    transfer.execution_started_at = None
+                    transfer.execution_heartbeat_at = None
+                    transfer.wait_reason = None
+                    changed_ids.add(transfer.id)
+                    admitted_ids.append(transfer.id)
+                    active.append(
+                        TransferReservation(
+                            transfer_id=transfer.id,
+                            source_connection_id=transfer.source_connection_id,
+                            destination_connection_id=transfer.destination_connection_id,
+                            execution_mode=transfer.execution_mode,
+                            uses_staging=self._transfer_uses_staging(transfer, connections),
+                            uses_nextcloud=self._transfer_uses_nextcloud(transfer, connections),
+                        )
+                    )
+                    if transfer.execution_mode == "EXCLUSIVE":
+                        exclusive_barrier = True
+
+                rows = (
+                    list(
+                        await session.scalars(
+                            select(TransferJob).where(
+                                TransferJob.id.in_(changed_ids | set(admitted_ids))
+                            )
+                        )
+                    )
+                    if changed_ids or admitted_ids
+                    else []
+                )
+                rows_by_id = {row.id: row for row in rows}
+                for row in rows:
+                    await self._record_transfer_state_span(
+                        session,
+                        row,
+                        status=row.status,
+                        wait_reason=row.wait_reason,
+                        now=now,
+                    )
+                admitted = [self._transfer(rows_by_id[item_id]) for item_id in admitted_ids]
+                changed = [
+                    self._transfer(rows_by_id[item_id])
+                    for item_id in changed_ids
+                    if item_id in rows_by_id
+                ]
+
+        return DispatchBatch(admitted=admitted, changed=changed)
+
+    @staticmethod
+    def _transfer_uses_staging(
+        transfer: TransferJob, connections: dict[uuid.UUID, StorageConnection]
+    ) -> bool:
+        source = connections.get(transfer.source_connection_id)
+        destination = connections.get(transfer.destination_connection_id)
+        if source is None or destination is None:
+            return False
+        return transfer_requires_staging(
+            source.provider_type,
+            destination.provider_type,
+            source.adapter_type,
+            destination.adapter_type,
+            transfer.conflict_policy,
+        )
+
+    @staticmethod
+    def _transfer_uses_nextcloud(
+        transfer: TransferJob, connections: dict[uuid.UUID, StorageConnection]
+    ) -> bool:
+        return any(
+            (connection := connections.get(connection_id)) is not None
+            and connection.provider_type == "NEXTCLOUD"
+            for connection_id in (
+                transfer.source_connection_id,
+                transfer.destination_connection_id,
+            )
+        )
+
+    async def arelease_transfer_dispatch(
+        self, transfer_id: uuid.UUID, dispatch_token: uuid.UUID
+    ) -> None:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.dispatch_token == dispatch_token,
+                        TransferJob.execution_started_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                if row is not None:
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+
+    async def aupdate_transfer_schedule(
+        self,
+        transfer_id: uuid.UUID,
+        *,
+        scheduled_at: datetime | None,
+        schedule_timezone: str,
+        execution_mode: str,
+        depends_on_transfer_id: uuid.UUID | None,
+    ) -> TransferRecord | None:
+        now = datetime.now(UTC)
+        if scheduled_at is not None:
+            scheduled_at = (
+                scheduled_at.replace(tzinfo=UTC)
+                if scheduled_at.tzinfo is None
+                else scheduled_at.astimezone(UTC)
+            )
+        async with self.sessions() as session:
+            async with session.begin():
+                if session.bind is not None and session.bind.dialect.name == "postgresql":
+                    await session.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": 0x43544D5343484544},
+                    )
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.status.in_({"SCHEDULED", "QUEUED"}),
+                        TransferJob.dispatch_token.is_(None),
+                        TransferJob.execution_started_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    return None
+                dependency_changed = row.depends_on_transfer_id != depends_on_transfer_id
+                if depends_on_transfer_id == transfer_id:
+                    raise ValueError("Una transferencia no puede depender de sí misma.")
+                seen: set[uuid.UUID] = set()
+                ancestor_id = depends_on_transfer_id
+                while ancestor_id is not None:
+                    if ancestor_id == transfer_id or ancestor_id in seen:
+                        raise ValueError("La dependencia crearía un ciclo.")
+                    seen.add(ancestor_id)
+                    ancestor = await session.get(TransferJob, ancestor_id)
+                    if ancestor is None:
+                        raise ValueError("La transferencia padre no existe.")
+                    ancestor_id = ancestor.depends_on_transfer_id
+                row.scheduled_at = scheduled_at
+                row.schedule_timezone = schedule_timezone
+                row.execution_mode = execution_mode
+                row.depends_on_transfer_id = depends_on_transfer_id
+                if dependency_changed:
+                    row.accepted_parent_omissions_attempt = None
+                due_later = scheduled_at is not None and scheduled_at > now
+                row.status = "SCHEDULED" if due_later else "QUEUED"
+                row.wait_reason = "WAITING_UNTIL" if due_later else None
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == transfer_id)
+                    .with_for_update()
+                )
+                evaluation_created = False
+                if evaluation is None and scheduled_at is not None:
+                    source = await session.get(StorageConnection, row.source_connection_id)
+                    maximum_files = (
+                        self.settings.smb_transfer_max_files
+                        if source is not None and source.provider_type == "SMB"
+                        else self.settings.transfer_max_files
+                    )
+                    evaluation = TransferEvaluation(
+                        id=uuid.uuid4(),
+                        transfer_job_id=row.id,
+                        status="PENDING",
+                        generation=1,
+                        sequence=0,
+                        count_complete=False,
+                        max_files=maximum_files,
+                        source_credential_version=row.source_credential_version,
+                        destination_credential_version=row.destination_credential_version,
+                        attempt_count=0,
+                        updated_at=now,
+                    )
+                    session.add(evaluation)
+                    evaluation_created = True
+                if evaluation is not None:
+                    row.evaluation = evaluation
+
+                if dependency_changed and evaluation is not None:
+                    if not evaluation_created:
+                        restart_evaluation(evaluation, now=now)
+                    parent_wait = None
+                    if depends_on_transfer_id is not None:
+                        parent = await session.get(TransferJob, depends_on_transfer_id)
+                        parent_omitted_count = int(
+                            await session.scalar(
+                                select(func.count()).where(
+                                    TransferManifestItem.transfer_job_id == depends_on_transfer_id,
+                                    TransferManifestItem.is_dir.is_(False),
+                                    TransferManifestItem.omission_kind.is_not(None),
+                                )
+                            )
+                            or 0
+                        )
+                        parent_wait = dependency_wait_reason(
+                            parent.status if parent is not None else "FAILED",
+                            parent_omitted_count=parent_omitted_count,
+                            parent_attempt_count=parent.attempt_count if parent is not None else 1,
+                            accepted_parent_omissions_attempt=(
+                                row.accepted_parent_omissions_attempt
+                            ),
+                        )
+                    if parent_wait is not None:
+                        evaluation.status = "WAITING_PARENT"
+                        evaluation.sequence = 1
+                        evaluation.safe_error_code = dependency_error_code(parent_wait)
+                        evaluation.safe_message = dependency_wait_message(parent_wait)
+                        row.wait_reason = parent_wait
+                    elif evaluation_created:
+                        row.wait_reason = "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
+                    else:
+                        row.wait_reason = "WAITING_UNTIL" if due_later else "WAITING_EVALUATION"
+                record = self._transfer(row, evaluation_override=evaluation)
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=row.status,
+                    wait_reason=row.wait_reason,
+                    now=datetime.now(UTC),
+                )
+                await session.flush()
+                return record
+
+    async def acancel_transfer(
+        self, transfer_id: uuid.UUID, now: datetime
+    ) -> tuple[TransferRecord | None, bool]:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if row is None or row.status in {
+                    "COMPLETED",
+                    "COMPLETED_WITH_WARNINGS",
+                    "FAILED",
+                    "CANCELLED",
+                }:
+                    return None, False
+                row.cancel_requested_at = now
+                if (
+                    row.status in {"QUEUED", "SCHEDULED", "PAUSED"}
+                    and row.execution_started_at is None
+                ):
+                    row.status = "CANCELLED"
+                    row.pause_requested_at = None
+                    row.paused_at = None
+                    row.completed_at = now
+                    row.wait_reason = None
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+                    row.execution_heartbeat_at = None
+                    await self._ensure_notification_outbox(session, row)
+                    needs_worker_signal = False
+                else:
+                    row.status = "CANCELLING"
+                    needs_worker_signal = True
+                await self._record_transfer_state_span(
+                    session, row, status=row.status, wait_reason=row.wait_reason, now=now
+                )
+                row.state_version += 1
+                await session.flush()
+                return self._transfer(row), needs_worker_signal
+
+    async def apause_transfer(
+        self, transfer_id: uuid.UUID, now: datetime
+    ) -> tuple[TransferRecord | None, bool]:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if row is None or row.status in _TERMINAL_TRANSFER_STATUSES:
+                    return None, False
+                if row.status in {"PAUSING", "PAUSED"}:
+                    return self._transfer(row), row.status == "PAUSING"
+                if row.status == "CANCELLING" or row.cancel_requested_at is not None:
+                    return None, False
+                if row.status in {"QUEUED", "SCHEDULED"} and row.execution_started_at is None:
+                    row.status = "PAUSED"
+                    row.paused_at = now
+                    row.pause_requested_at = None
+                    row.current_item = None
+                    row.current_speed_bps = None
+                    row.wait_reason = None
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+                    row.execution_heartbeat_at = None
+                    needs_worker = False
+                elif row.status in {"VALIDATING", "RUNNING", "RETRYING"} or (
+                    row.status == "QUEUED" and row.execution_started_at is not None
+                ):
+                    source = await session.get(StorageConnection, row.source_connection_id)
+                    destination = await session.get(
+                        StorageConnection, row.destination_connection_id
+                    )
+                    supports_boundary = bool(
+                        row.conflict_policy == "KEEP_BOTH"
+                        or (source is not None and source.provider_type == "SMB")
+                        or (
+                            source is not None
+                            and destination is not None
+                            and source.provider_type == destination.provider_type == "MOCK"
+                        )
+                    )
+                    if not supports_boundary:
+                        return None, False
+                    row.status = "PAUSING"
+                    row.pause_requested_at = now
+                    needs_worker = True
+                else:
+                    return None, False
+                await self._record_transfer_state_span(
+                    session, row, status=row.status, wait_reason=row.wait_reason, now=now
+                )
+                row.state_version += 1
+                await session.flush()
+                return self._transfer(row), needs_worker
+
+    async def acheck_transfer_execution_control(
+        self,
+        transfer_id: uuid.UUID,
+        dispatch_token: uuid.UUID | None,
+        next_item_path: str,
+    ) -> str:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if row is None or (
+                    dispatch_token is not None and row.dispatch_token != dispatch_token
+                ):
+                    return "lost"
+                if row.cancel_requested_at is not None or row.status == "CANCELLING":
+                    return "cancel"
+                if row.pause_requested_at is not None or row.status == "PAUSING":
+                    return "pause"
+                if row.status not in {"VALIDATING", "RUNNING", "RETRYING"}:
+                    return "lost"
+                row.current_item = next_item_path
+                return "continue"
+
+    async def acomplete_transfer_pause(
+        self,
+        transfer_id: uuid.UUID,
+        dispatch_token: uuid.UUID | None,
+        now: datetime,
+    ) -> TransferRecord | None:
+        now = now.astimezone(UTC)
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if row is None or (
+                    dispatch_token is not None and row.dispatch_token != dispatch_token
+                ):
+                    return None
+                if row.status == "CANCELLING" and row.cancel_requested_at is not None:
+                    row.status = "CANCELLED"
+                    row.completed_at = now
+                    row.cancel_requested_at = None
+                    row.paused_at = None
+                    await self._ensure_notification_outbox(session, row)
+                elif row.status == "PAUSING" and row.cancel_requested_at is None:
+                    row.status = "PAUSED"
+                    row.paused_at = now
+                else:
+                    return None
+                row.pause_requested_at = None
+                row.current_item = None
+                row.current_speed_bps = None
+                row.estimated_remaining_seconds = None
+                row.dispatch_token = None
+                row.dispatch_claimed_at = None
+                row.execution_started_at = None
+                row.execution_heartbeat_at = None
+                row.wait_reason = None
+                row.state_version += 1
+                await self._record_transfer_state_span(
+                    session, row, status=row.status, wait_reason=row.wait_reason, now=now
+                )
+                await session.flush()
+                return self._transfer(row)
+
+    async def aresume_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.status.in_({"FAILED", "CANCELLED", "PAUSED"}),
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    return None
+                if row.status == "PAUSED":
+                    scheduled_at = row.scheduled_at
+                    if scheduled_at is not None and scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=UTC)
+                    now = datetime.now(UTC)
+                    row.status = (
+                        "SCHEDULED" if scheduled_at is not None and scheduled_at > now else "QUEUED"
+                    )
+                    row.pause_requested_at = None
+                    row.paused_at = None
+                    row.completed_at = None
+                    row.current_item = None
+                    row.current_speed_bps = None
+                    row.estimated_remaining_seconds = None
+                    row.wait_reason = "WAITING_UNTIL" if row.status == "SCHEDULED" else None
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+                    row.execution_started_at = None
+                    row.execution_heartbeat_at = None
+                    row.cancel_requested_at = None
+                    row.state_version += 1
+                    await self._record_transfer_state_span(
+                        session,
+                        row,
+                        status=row.status,
+                        wait_reason=row.wait_reason,
+                        now=now,
+                    )
+                    await session.flush()
+                    return self._transfer(row)
+                row.status = "QUEUED"
+                row.attempt_count += 1
+                row.completed_at = None
+                row.current_item = None
+                row.current_speed_bps = None
+                row.estimated_remaining_seconds = None
+                row.wait_reason = None
+                row.dispatch_token = None
+                row.dispatch_claimed_at = None
+                row.execution_started_at = None
+                row.execution_heartbeat_at = None
+                row.cancel_requested_at = None
+                row.state_version += 1
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=row.status,
+                    wait_reason=row.wait_reason,
+                    now=datetime.now(UTC),
+                )
+                await session.flush()
+                return self._transfer(row)
+
+    async def aaccept_parent_omissions(
+        self,
+        child_id: uuid.UUID,
+        *,
+        actor_id: uuid.UUID,
+        expected_parent_attempt: int,
+        request_id: uuid.UUID,
+    ) -> TransferRecord:
+        request_hash = parent_omissions_request_hash(
+            child_id=child_id,
+            expected_parent_attempt=expected_parent_attempt,
+        )
+        async with self.sessions() as session:
+            async with session.begin():
+                child = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == child_id).with_for_update()
+                )
+                if child is None:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                actor = await session.get(User, actor_id)
+                if actor is None or not actor.is_active:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                if actor.role != "ADMIN" and child.requested_by != actor_id:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                if child.depends_on_transfer_id is None:
+                    raise TransferRecoveryConflictError("Child transfer has no parent")
+                parent = await session.scalar(
+                    select(TransferJob)
+                    .where(TransferJob.id == child.depends_on_transfer_id)
+                    .with_for_update()
+                )
+                if parent is None or (actor.role != "ADMIN" and parent.requested_by != actor_id):
+                    raise TransferRecoveryNotFoundError("Parent transfer not found")
+                prior_audits = (
+                    await session.scalars(
+                        select(AuditEvent).where(
+                            AuditEvent.resource_type == "transfer",
+                            AuditEvent.resource_id == str(child_id),
+                            AuditEvent.action.in_(
+                                (
+                                    "TRANSFER_FILE_OMITTED",
+                                    "TRANSFER_OMITTED_FILES_RETRIED",
+                                    "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                                )
+                            ),
+                        )
+                    )
+                ).all()
+                for prior in prior_audits:
+                    metadata = prior.event_metadata or {}
+                    if metadata.get("request_id") != str(request_id):
+                        continue
+                    if prior.actor_user_id != actor_id:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used by another actor"
+                        )
+                    if metadata.get("request_hash") != request_hash:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used for a different acceptance"
+                        )
+                    replay = self._transfer(child)
+                    replay.idempotent_replay = True
+                    return replay
+
+                if child.status not in {"SCHEDULED", "QUEUED"}:
+                    raise TransferRecoveryConflictError("Child transfer is not pending")
+                if (
+                    child.dispatch_token is not None
+                    or child.dispatch_claimed_at is not None
+                    or child.execution_started_at is not None
+                    or child.execution_heartbeat_at is not None
+                    or child.cancel_requested_at is not None
+                ):
+                    raise TransferRecoveryConflictError("Child transfer execution is still active")
+                if expected_parent_attempt != parent.attempt_count:
+                    raise TransferRecoveryConflictError("Parent transfer attempt changed")
+                if parent.status not in {"COMPLETED", "COMPLETED_WITH_WARNINGS"}:
+                    raise TransferRecoveryConflictError(
+                        "Only a successful terminal parent can be accepted"
+                    )
+                omitted_count = int(
+                    await session.scalar(
+                        select(func.count()).where(
+                            TransferManifestItem.transfer_job_id == parent.id,
+                            TransferManifestItem.is_dir.is_(False),
+                            TransferManifestItem.omission_kind.is_not(None),
+                        )
+                    )
+                    or 0
+                )
+                if omitted_count < 1:
+                    raise TransferRecoveryConflictError("Parent has no explicit omissions")
+
+                now = datetime.now(UTC)
+                child.accepted_parent_omissions_attempt = expected_parent_attempt
+                evaluation = await session.scalar(
+                    select(TransferEvaluation)
+                    .where(TransferEvaluation.transfer_job_id == child_id)
+                    .with_for_update()
+                )
+                if evaluation is not None:
+                    if evaluation.status == "WAITING_PARENT":
+                        restart_evaluation(evaluation, now=now)
+                    child.wait_reason = "WAITING_EVALUATION"
+                else:
+                    child.wait_reason = (
+                        "WAITING_UNTIL"
+                        if child.scheduled_at is not None and child.scheduled_at > now
+                        else None
+                    )
+                await self._record_transfer_state_span(
+                    session,
+                    child,
+                    status=child.status,
+                    wait_reason=child.wait_reason,
+                    now=now,
+                )
+                metadata = {
+                    "child_public_id": child.public_id,
+                    "parent_public_id": parent.public_id,
+                    "request_id": str(request_id),
+                    "request_hash": request_hash,
+                    "accepted_parent_omissions_attempt": expected_parent_attempt,
+                    "omitted_count": omitted_count,
+                }
+                session.add(
+                    AuditEvent(
+                        actor_user_id=actor_id,
+                        action="TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                        resource_type="transfer",
+                        resource_id=str(child_id),
+                        result="SUCCESS",
+                        event_metadata=sanitize_data(metadata),
+                        correlation_id=request_id,
+                    )
+                )
+                session.add(
+                    TransferEvent(
+                        transfer_job_id=child_id,
+                        level="WARNING",
+                        event_type="TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                        message=(
+                            "Se aceptaron las omisiones del intento vigente "
+                            "de la transferencia padre."
+                        ),
+                        technical_details={
+                            "parent_transfer_id": str(parent.id),
+                            "parent_attempt": expected_parent_attempt,
+                            "omitted_count": omitted_count,
+                        },
+                        correlation_id=child_id,
+                    )
+                )
+                await session.flush()
+                return self._transfer(child)
+
+    async def aretry_omitted_transfer_items(
+        self,
+        transfer_id: uuid.UUID,
+        *,
+        item_ids: list[uuid.UUID],
+        actor_id: uuid.UUID,
+        expected_attempt: int,
+        request_id: uuid.UUID,
+    ) -> TransferRecord:
+        if not 1 <= len(item_ids) <= 100 or len(item_ids) != len(set(item_ids)):
+            raise TransferRecoveryConflictError("Select between 1 and 100 unique omitted files")
+        request_hash = retry_omissions_request_hash(
+            transfer_id=transfer_id,
+            expected_attempt=expected_attempt,
+            item_ids=item_ids,
+        )
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if row is None:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                actor = await session.get(User, actor_id)
+                if actor is None or not actor.is_active:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                if actor.role != "ADMIN" and row.requested_by != actor_id:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+
+                prior_audits = (
+                    await session.scalars(
+                        select(AuditEvent).where(
+                            AuditEvent.resource_type == "transfer",
+                            AuditEvent.resource_id == str(transfer_id),
+                            AuditEvent.action.in_(
+                                (
+                                    "TRANSFER_FILE_OMITTED",
+                                    "TRANSFER_OMITTED_FILES_RETRIED",
+                                    "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                                )
+                            ),
+                        )
+                    )
+                ).all()
+                for prior in prior_audits:
+                    metadata = prior.event_metadata or {}
+                    if metadata.get("request_id") != str(request_id):
+                        continue
+                    if prior.actor_user_id != actor_id:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used by another actor"
+                        )
+                    if metadata.get("request_hash") != request_hash:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used for a different retry"
+                        )
+                    replay = self._transfer(row)
+                    replay.idempotent_replay = True
+                    return replay
+
+                if expected_attempt != row.attempt_count:
+                    raise TransferRecoveryConflictError("Transfer attempt changed")
+                if row.status not in {"FAILED", "CANCELLED", "COMPLETED_WITH_WARNINGS"}:
+                    raise TransferRecoveryConflictError(
+                        "Transfer is not in a retryable terminal state"
+                    )
+                if (
+                    row.dispatch_token is not None
+                    or row.dispatch_claimed_at is not None
+                    or row.execution_started_at is not None
+                    or row.execution_heartbeat_at is not None
+                ):
+                    raise TransferRecoveryConflictError("Transfer execution is still active")
+
+                connection_ids = sorted({row.source_connection_id, row.destination_connection_id})
                 connections = (
                     await session.scalars(
                         select(StorageConnection)
@@ -384,64 +3453,1621 @@ class DatabaseStore:
                     )
                 ).all()
                 by_id = {connection.id: connection for connection in connections}
-                for connection_id in connection_ids:
-                    connection = by_id.get(connection_id)
-                    if connection is None or connection.deleted_at is not None:
-                        raise ConnectionUnavailableError("not_found")
-                    if connection.status != "ACTIVE":
-                        raise ConnectionUnavailableError("inactive")
-                row = TransferJob(
-                    id=uuid.uuid4(),
-                    public_id=await self._next_public_id(session),
-                    requested_by=requested_by,
-                    source_connection_id=source_connection_id,
-                    destination_connection_id=destination_connection_id,
-                    source_paths=source_paths,
-                    destination_path=destination_path,
-                    operation="COPY",
-                    conflict_policy=conflict_policy,
-                    send_email_notification=send_email_notification,
-                    status="QUEUED",
+                source = by_id.get(row.source_connection_id)
+                destination = by_id.get(row.destination_connection_id)
+                if (
+                    source is None
+                    or destination is None
+                    or source.deleted_at is not None
+                    or destination.deleted_at is not None
+                ):
+                    raise TransferRecoveryConflictError("A transfer connection is unavailable")
+                if source.status != "ACTIVE" or destination.status != "ACTIVE":
+                    raise TransferRecoveryConflictError("A transfer connection is inactive")
+                if (
+                    source.credential_version != row.source_credential_version
+                    or destination.credential_version != row.destination_credential_version
+                ):
+                    raise TransferRecoveryConflictError("Transfer credentials changed")
+                if actor.role != "ADMIN":
+                    for connection in (source, destination):
+                        if (
+                            not connection.is_global
+                            and await session.get(UserConnectionGrant, (actor_id, connection.id))
+                            is None
+                        ):
+                            raise TransferRecoveryNotFoundError("Transfer not found")
+
+                selected = list(
+                    await session.scalars(
+                        select(TransferManifestItem)
+                        .where(
+                            TransferManifestItem.transfer_job_id == transfer_id,
+                            TransferManifestItem.id.in_(item_ids),
+                        )
+                        .order_by(TransferManifestItem.id)
+                        .with_for_update()
+                    )
                 )
-                session.add(row)
+                if len(selected) != len(item_ids):
+                    raise TransferRecoveryNotFoundError("Manifest item not found")
+                if any(
+                    item.is_dir
+                    or item.status != "SKIPPED"
+                    or item.omission_kind is None
+                    or item.omitted_at is None
+                    or item.copy_started
+                    for item in selected
+                ):
+                    raise TransferRecoveryConflictError(
+                        "Every selected file must be an explicit omission"
+                    )
+
+                old_attempt = row.attempt_count
+                prior_omissions = [
+                    {
+                        "manifest_item_id": str(item.id),
+                        "omission_kind": item.omission_kind,
+                        "omitted_at": item.omitted_at.isoformat() if item.omitted_at else None,
+                    }
+                    for item in selected
+                ]
+                for item in selected:
+                    item.status = "PENDING"
+                    item.error_code = None
+                    item.verified_by = None
+                    item.omission_kind = None
+                    item.omitted_at = None
+                    item.omitted_by = None
+                    item.last_failure_stage = None
+                    item.last_failure_attempt = None
+
+                row.status = "QUEUED"
+                row.attempt_count += 1
+                row.files_completed = max(0, row.files_completed - len(selected))
+                row.warning_count = max(0, row.warning_count - len(selected))
+                row.completed_at = None
+                row.started_at = None
+                row.current_item = None
+                row.current_speed_bps = None
+                row.estimated_remaining_seconds = None
+                row.wait_reason = None
+                row.dispatch_token = None
+                row.dispatch_claimed_at = None
+                row.execution_started_at = None
+                row.execution_heartbeat_at = None
+                row.cancel_requested_at = None
+                row.source_file_error_policy = "STOP"
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=row.status,
+                    wait_reason=row.wait_reason,
+                    now=datetime.now(UTC),
+                )
+
+                count_rows = (
+                    await session.execute(
+                        select(TransferManifestItem.status, func.count())
+                        .where(TransferManifestItem.transfer_job_id == transfer_id)
+                        .group_by(TransferManifestItem.status)
+                    )
+                ).all()
+                counts = {status: int(count) for status, count in count_rows}
+                counts["pending"] = counts.get("PENDING", 0)
+                counts["copied"] = counts.get("COPIED", 0)
+                counts["failed"] = counts.get("FAILED", 0)
+                counts["skipped"] = counts.get("SKIPPED", 0)
+                row.progress_percent = smb_manifest_progress_percent(
+                    bytes_transferred=row.bytes_transferred,
+                    bytes_total=row.bytes_total or 0,
+                    files_total=row.files_total or 0,
+                    counts=counts,
+                )
+                metadata = {
+                    "public_id": row.public_id,
+                    "request_id": str(request_id),
+                    "request_hash": request_hash,
+                    "previous_attempt": old_attempt,
+                    "attempt_count": row.attempt_count,
+                    "retried_count": len(selected),
+                    "items": prior_omissions,
+                }
+                session.add(
+                    AuditEvent(
+                        actor_user_id=actor_id,
+                        action="TRANSFER_OMITTED_FILES_RETRIED",
+                        resource_type="transfer",
+                        resource_id=str(transfer_id),
+                        result="SUCCESS",
+                        event_metadata=sanitize_data(metadata),
+                        correlation_id=request_id,
+                    )
+                )
+                session.add(
+                    TransferEvent(
+                        transfer_job_id=transfer_id,
+                        level="WARNING",
+                        event_type="TRANSFER_OMITTED_FILES_RETRIED",
+                        message="Se reintentan los archivos omitidos seleccionados.",
+                        technical_details=sanitize_data(
+                            {
+                                "previous_attempt": old_attempt,
+                                "attempt_count": row.attempt_count,
+                                "retried_count": len(selected),
+                                "manifest_item_ids": [str(item.id) for item in selected],
+                            }
+                        ),
+                        correlation_id=request_id,
+                    )
+                )
                 await session.flush()
-            await session.refresh(row)
-            return self._transfer(row)
+                return self._transfer(row)
 
-    async def aget_transfer(self, transfer_id: uuid.UUID) -> TransferRecord | None:
+    async def askip_transfer_item_and_resume(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        actor_id: uuid.UUID,
+        expected_attempt: int,
+        request_id: uuid.UUID,
+        source_file_error_policy: str | None = None,
+    ) -> TransferRecord:
+        request_hash = recovery_request_hash(
+            item_id=item_id,
+            expected_attempt=expected_attempt,
+            source_file_error_policy=source_file_error_policy,
+        )
         async with self.sessions() as session:
-            row = await session.get(TransferJob, transfer_id)
-            return self._transfer(row) if row else None
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if row is None:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
 
-    async def alist_transfers(self, requested_by: uuid.UUID | None = None) -> list[TransferRecord]:
+                actor = await session.get(User, actor_id)
+                if actor is None or not actor.is_active:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+                if actor.role != "ADMIN" and row.requested_by != actor_id:
+                    raise TransferRecoveryNotFoundError("Transfer not found")
+
+                prior_audits = (
+                    await session.scalars(
+                        select(AuditEvent).where(
+                            AuditEvent.resource_type == "transfer",
+                            AuditEvent.resource_id == str(transfer_id),
+                            AuditEvent.action.in_(
+                                (
+                                    "TRANSFER_FILE_OMITTED",
+                                    "TRANSFER_OMITTED_FILES_RETRIED",
+                                    "TRANSFER_PARENT_OMISSIONS_ACCEPTED",
+                                )
+                            ),
+                        )
+                    )
+                ).all()
+                for prior in prior_audits:
+                    metadata = prior.event_metadata or {}
+                    if metadata.get("request_id") != str(request_id):
+                        continue
+                    if prior.actor_user_id != actor_id:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used by another actor"
+                        )
+                    if metadata.get("request_hash") != request_hash:
+                        raise TransferRecoveryConflictError(
+                            "Request id was already used for a different recovery action"
+                        )
+                    replay = self._transfer(row)
+                    replay.idempotent_replay = True
+                    return replay
+
+                if expected_attempt != row.attempt_count:
+                    raise TransferRecoveryConflictError("Transfer attempt changed")
+                if row.status != "FAILED":
+                    raise TransferRecoveryConflictError("Transfer is not failed")
+                if (
+                    row.dispatch_token is not None
+                    or row.dispatch_claimed_at is not None
+                    or row.execution_started_at is not None
+                    or row.execution_heartbeat_at is not None
+                ):
+                    raise TransferRecoveryConflictError("Transfer execution is still active")
+
+                connection_ids = sorted({row.source_connection_id, row.destination_connection_id})
+                connections = (
+                    await session.scalars(
+                        select(StorageConnection)
+                        .where(StorageConnection.id.in_(connection_ids))
+                        .order_by(StorageConnection.id)
+                        .with_for_update()
+                    )
+                ).all()
+                by_id = {connection.id: connection for connection in connections}
+                source = by_id.get(row.source_connection_id)
+                destination = by_id.get(row.destination_connection_id)
+                if (
+                    source is None
+                    or destination is None
+                    or source.deleted_at is not None
+                    or destination.deleted_at is not None
+                ):
+                    raise TransferRecoveryConflictError("A transfer connection is unavailable")
+                if source.status != "ACTIVE" or destination.status != "ACTIVE":
+                    raise TransferRecoveryConflictError("A transfer connection is inactive")
+                if (
+                    source.credential_version != row.source_credential_version
+                    or destination.credential_version != row.destination_credential_version
+                ):
+                    raise TransferRecoveryConflictError("Transfer credentials changed")
+                if actor.role != "ADMIN":
+                    for connection in (source, destination):
+                        if (
+                            not connection.is_global
+                            and await session.get(UserConnectionGrant, (actor_id, connection.id))
+                            is None
+                        ):
+                            raise TransferRecoveryNotFoundError("Transfer not found")
+
+                item = await session.scalar(
+                    select(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.id == item_id,
+                    )
+                    .with_for_update()
+                )
+                if item is None:
+                    raise TransferRecoveryNotFoundError("Manifest item not found")
+                if source_file_error_policy is not None:
+                    policy = normalize_source_file_error_policy(source_file_error_policy)
+                    if policy != "STOP":
+                        raise TransferRecoveryConflictError(
+                            "Automatic source omission is not enabled"
+                        )
+
+                event_rows = (
+                    await session.scalars(
+                        select(TransferEvent)
+                        .where(
+                            TransferEvent.transfer_job_id == transfer_id,
+                            TransferEvent.event_type == "FAILURE_DIAGNOSTIC",
+                        )
+                        .order_by(TransferEvent.created_at)
+                    )
+                ).all()
+                events = [
+                    {
+                        "event_type": event.event_type,
+                        "technical_details": event.technical_details,
+                        "provider_error_code": event.provider_error_code,
+                        "created_at": event.created_at,
+                    }
+                    for event in event_rows
+                ]
+                basename = PurePosixPath(item.source_path).name
+                basename_matches = int(
+                    await session.scalar(
+                        select(func.count(TransferManifestItem.id)).where(
+                            TransferManifestItem.transfer_job_id == transfer_id,
+                            TransferManifestItem.is_dir.is_(False),
+                            or_(
+                                TransferManifestItem.source_path == basename,
+                                TransferManifestItem.source_path.endswith(
+                                    f"/{basename}", autoescape=True
+                                ),
+                            ),
+                        )
+                    )
+                    or 0
+                )
+                transfer = self._transfer(row)
+                transfer.source_provider_type = source.provider_type
+                failure_stage, failure_attempt, failure_retryable = resolve_failure_evidence(
+                    transfer,
+                    self._manifest_item(item),
+                    events,
+                    basename_matches=basename_matches,
+                )
+                manifest_item = self._manifest_item(item)
+                if not can_skip_manifest_item(
+                    transfer,
+                    manifest_item,
+                    failure_stage=failure_stage,
+                    failure_attempt=failure_attempt,
+                    failure_retryable=failure_retryable,
+                ):
+                    raise TransferRecoveryConflictError(
+                        skip_unavailable_reason(
+                            transfer,
+                            manifest_item,
+                            failure_stage=failure_stage,
+                            failure_attempt=failure_attempt,
+                            failure_retryable=failure_retryable,
+                        )
+                        or "Transfer item cannot be omitted"
+                    )
+
+                now = datetime.now(UTC)
+                previous_attempt = row.attempt_count
+                item.status = "SKIPPED"
+                item.omission_kind = OmissionKind.USER_ACCEPTED_SOURCE_FAILURE.value
+                item.omitted_at = now
+                item.omitted_by = actor_id
+                item.last_failure_stage = failure_stage
+                item.last_failure_attempt = failure_attempt
+                row.error_count = max(0, row.error_count - 1)
+                row.status = "QUEUED"
+                row.attempt_count += 1
+                row.completed_at = None
+                row.started_at = None
+                row.current_item = None
+                row.current_speed_bps = None
+                row.estimated_remaining_seconds = None
+                row.wait_reason = None
+                row.dispatch_token = None
+                row.dispatch_claimed_at = None
+                row.execution_started_at = None
+                row.execution_heartbeat_at = None
+                row.cancel_requested_at = None
+                if source_file_error_policy is not None:
+                    row.source_file_error_policy = normalize_source_file_error_policy(
+                        source_file_error_policy
+                    )
+                await self._record_transfer_state_span(
+                    session, row, status=row.status, wait_reason=row.wait_reason, now=now
+                )
+
+                metadata = {
+                    "public_id": row.public_id,
+                    "request_id": str(request_id),
+                    "request_hash": request_hash,
+                    "manifest_item_id": str(item.id),
+                    "omission_kind": item.omission_kind,
+                    "failure_attempt": failure_attempt,
+                    "attempt_count": previous_attempt,
+                }
+                session.add(
+                    AuditEvent(
+                        actor_user_id=actor_id,
+                        action="TRANSFER_FILE_OMITTED",
+                        resource_type="transfer",
+                        resource_id=str(transfer_id),
+                        result="SUCCESS",
+                        event_metadata=sanitize_data(metadata),
+                        correlation_id=request_id,
+                    )
+                )
+                session.add(
+                    AuditEvent(
+                        actor_user_id=actor_id,
+                        action="TRANSFER_RESUMED",
+                        resource_type="transfer",
+                        resource_id=str(transfer_id),
+                        result="SUCCESS",
+                        event_metadata=sanitize_data(
+                            {
+                                "public_id": row.public_id,
+                                "request_id": str(request_id),
+                                "request_hash": request_hash,
+                                "attempt_count": row.attempt_count,
+                            }
+                        ),
+                        correlation_id=request_id,
+                    )
+                )
+                session.add_all(
+                    [
+                        TransferEvent(
+                            transfer_job_id=transfer_id,
+                            level="WARNING",
+                            event_type="TRANSFER_FILE_OMITTED",
+                            message="Se omitió un archivo del origen por decisión del usuario.",
+                            technical_details=sanitize_data(
+                                {
+                                    "manifest_item_id": str(item.id),
+                                    "omission_kind": item.omission_kind,
+                                    "failure_attempt": failure_attempt,
+                                    "attempt_count": previous_attempt,
+                                }
+                            ),
+                            provider_error_code=item.error_code,
+                            item_path=item.source_path,
+                            correlation_id=request_id,
+                        ),
+                        TransferEvent(
+                            transfer_job_id=transfer_id,
+                            level="INFO",
+                            event_type="TRANSFER_RESUMED",
+                            message="La transferencia continuará con los archivos restantes.",
+                            technical_details={"attempt_count": row.attempt_count},
+                            correlation_id=request_id,
+                        ),
+                    ]
+                )
+                await session.flush()
+                return self._transfer(row)
+
+    async def astart_transfer_dispatch(
+        self, transfer_id: uuid.UUID, dispatch_token: uuid.UUID, now: datetime
+    ) -> bool:
         async with self.sessions() as session:
-            statement = select(TransferJob).order_by(TransferJob.created_at.desc())
-            if requested_by is not None:
-                statement = statement.where(TransferJob.requested_by == requested_by)
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.dispatch_token == dispatch_token,
+                        TransferJob.status.in_({"QUEUED", "CANCELLING"}),
+                        TransferJob.execution_started_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    return False
+                if row.status != "CANCELLING":
+                    if row.depends_on_transfer_id is not None:
+                        parent = await session.scalar(
+                            select(TransferJob)
+                            .where(TransferJob.id == row.depends_on_transfer_id)
+                            .with_for_update()
+                        )
+                        parent_omitted_count = int(
+                            await session.scalar(
+                                select(func.count()).where(
+                                    TransferManifestItem.transfer_job_id
+                                    == row.depends_on_transfer_id,
+                                    TransferManifestItem.is_dir.is_(False),
+                                    TransferManifestItem.omission_kind.is_not(None),
+                                )
+                            )
+                            or 0
+                        )
+                        parent_wait = dependency_wait_reason(
+                            parent.status if parent is not None else "FAILED",
+                            parent_omitted_count=parent_omitted_count,
+                            parent_attempt_count=parent.attempt_count if parent is not None else 1,
+                            accepted_parent_omissions_attempt=(
+                                row.accepted_parent_omissions_attempt
+                            ),
+                        )
+                        if parent_wait is not None:
+                            row.status = "QUEUED"
+                            row.wait_reason = parent_wait
+                            row.dispatch_token = None
+                            row.dispatch_claimed_at = None
+                            evaluation = await session.scalar(
+                                select(TransferEvaluation)
+                                .where(TransferEvaluation.transfer_job_id == row.id)
+                                .with_for_update()
+                            )
+                            if evaluation is not None:
+                                evaluation.status = "WAITING_PARENT"
+                                evaluation.safe_error_code = dependency_error_code(parent_wait)
+                                evaluation.safe_message = dependency_wait_message(parent_wait)
+                                evaluation.claim_token = None
+                                evaluation.heartbeat_at = None
+                                evaluation.sequence += 1
+                                evaluation.updated_at = now.astimezone(UTC)
+                            await self._record_transfer_state_span(
+                                session,
+                                row,
+                                status=row.status,
+                                wait_reason=row.wait_reason,
+                                now=now.astimezone(UTC),
+                            )
+                            return False
+
+                    owner = await session.get(User, row.requested_by)
+                    source = await session.get(StorageConnection, row.source_connection_id)
+                    destination = await session.get(
+                        StorageConnection, row.destination_connection_id
+                    )
+                    wait_reason: str | None = None
+                    if owner is None or not owner.is_active:
+                        wait_reason = "WAITING_USER_ACTIVE"
+                    elif (
+                        source is None
+                        or destination is None
+                        or source.deleted_at is not None
+                        or destination.deleted_at is not None
+                        or source.status != "ACTIVE"
+                        or destination.status != "ACTIVE"
+                    ):
+                        wait_reason = "WAITING_CONNECTION_ACTIVE"
+                    elif (
+                        source.credential_version != row.source_credential_version
+                        or destination.credential_version != row.destination_credential_version
+                    ):
+                        wait_reason = "BLOCKED_CONNECTION_CHANGED"
+                    elif owner.role != "ADMIN":
+                        for connection in (source, destination):
+                            if (
+                                not connection.is_global
+                                and await session.get(
+                                    UserConnectionGrant, (owner.id, connection.id)
+                                )
+                                is None
+                            ):
+                                wait_reason = "WAITING_CONNECTION_ACCESS"
+                                break
+                    if wait_reason is not None:
+                        row.status = "QUEUED"
+                        row.wait_reason = wait_reason
+                        row.dispatch_token = None
+                        row.dispatch_claimed_at = None
+                        await self._record_transfer_state_span(
+                            session,
+                            row,
+                            status=row.status,
+                            wait_reason=row.wait_reason,
+                            now=now.astimezone(UTC),
+                        )
+                        return False
+                row.execution_started_at = now.astimezone(UTC)
+                row.execution_heartbeat_at = now.astimezone(UTC)
+                return True
+
+    async def aheartbeat_transfer_dispatch(
+        self, transfer_id: uuid.UUID, dispatch_token: uuid.UUID, now: datetime
+    ) -> bool:
+        async with self.sessions() as session:
+            updated_id = await session.scalar(
+                update(TransferJob)
+                .where(
+                    TransferJob.id == transfer_id,
+                    TransferJob.dispatch_token == dispatch_token,
+                    TransferJob.execution_started_at.is_not(None),
+                )
+                .values(execution_heartbeat_at=now.astimezone(UTC))
+                .returning(TransferJob.id)
+            )
+            await session.commit()
+            return updated_id is not None
+
+    async def afinish_transfer_dispatch(
+        self, transfer_id: uuid.UUID, dispatch_token: uuid.UUID
+    ) -> None:
+        terminal_statuses = {
+            "COMPLETED",
+            "COMPLETED_WITH_WARNINGS",
+            "FAILED",
+            "CANCELLED",
+        }
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.dispatch_token == dispatch_token,
+                    )
+                    .with_for_update()
+                )
+                if row is not None and row.status in terminal_statuses:
+                    row.dispatch_token = None
+                    row.dispatch_claimed_at = None
+                    row.execution_started_at = None
+                    row.execution_heartbeat_at = None
+
+    async def afail_transfer_dispatch(
+        self,
+        transfer_id: uuid.UUID,
+        dispatch_token: uuid.UUID,
+        *,
+        event_type: str,
+        message: str,
+    ) -> None:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob)
+                    .where(
+                        TransferJob.id == transfer_id,
+                        TransferJob.dispatch_token == dispatch_token,
+                    )
+                    .with_for_update()
+                )
+                if row is None or row.status in {
+                    "COMPLETED",
+                    "COMPLETED_WITH_WARNINGS",
+                    "FAILED",
+                    "CANCELLED",
+                }:
+                    return
+                row.status = "FAILED"
+                row.completed_at = datetime.now(UTC)
+                row.error_count += 1
+                row.current_item = None
+                row.wait_reason = None
+                row.dispatch_token = None
+                row.dispatch_claimed_at = None
+                row.execution_started_at = None
+                row.execution_heartbeat_at = None
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=row.status,
+                    wait_reason=row.wait_reason,
+                    now=datetime.now(UTC),
+                )
+                await self._ensure_notification_outbox(session, row)
+                session.add(
+                    TransferEvent(
+                        transfer_job_id=row.id,
+                        level="ERROR",
+                        event_type=event_type,
+                        message=message,
+                        technical_details={"reason": event_type},
+                        provider_error_code=event_type,
+                        correlation_id=row.id,
+                    )
+                )
+
+    async def alist_transfers(
+        self,
+        requested_by: uuid.UUID | None = None,
+        pending_only: bool = False,
+        background_only: bool = False,
+        exclude_background: bool = False,
+    ) -> list[TransferRecord]:
+        criteria = self._transfer_list_filters(
+            requested_by, pending_only, background_only, exclude_background
+        )
+        async with self.sessions() as session:
+            statement = (
+                select(TransferJob)
+                .where(*criteria)
+                .order_by(TransferJob.created_at.desc(), TransferJob.id.desc())
+            )
             rows = (await session.scalars(statement)).all()
             return [self._transfer(row) for row in rows]
 
-    async def asave_transfer(self, transfer: TransferRecord) -> None:
+    async def alist_active_transfer_ids(self) -> set[uuid.UUID]:
         async with self.sessions() as session:
-            row = await session.get(TransferJob, transfer.id)
+            rows = await session.scalars(
+                select(TransferJob.id).where(TransferJob.status.in_(ACTIVE_TRANSFER_STATUSES))
+            )
+            return set(rows.all())
+
+    @staticmethod
+    def _transfer_list_filters(
+        requested_by: uuid.UUID | None,
+        pending_only: bool,
+        background_only: bool,
+        exclude_background: bool,
+    ) -> list[Any]:
+        criteria: list[Any] = []
+        if requested_by is not None:
+            criteria.append(TransferJob.requested_by == requested_by)
+        if pending_only:
+            criteria.append(TransferJob.status.in_({"SCHEDULED", "QUEUED"}))
+        programmed = or_(
+            TransferJob.scheduled_at.is_not(None),
+            TransferJob.wait_reason.is_not(None),
+            TransferJob.execution_mode == "EXCLUSIVE",
+            TransferJob.depends_on_transfer_id.is_not(None),
+        )
+        background = or_(
+            TransferJob.status.in_({"PAUSING", "PAUSED"}),
+            and_(programmed, TransferJob.status.in_(ACTIVE_TRANSFER_STATUSES)),
+        )
+        if background_only:
+            criteria.append(background)
+        if exclude_background:
+            criteria.append(~background)
+        return criteria
+
+    async def alist_transfer_page(
+        self,
+        requested_by: uuid.UUID | None,
+        *,
+        offset: int,
+        limit: int,
+        pending_only: bool = False,
+        background_only: bool = False,
+        exclude_background: bool = False,
+    ) -> tuple[list[TransferRecord], int]:
+        criteria = self._transfer_list_filters(
+            requested_by, pending_only, background_only, exclude_background
+        )
+        async with self.sessions() as session:
+            total = int(
+                await session.scalar(select(func.count(TransferJob.id)).where(*criteria)) or 0
+            )
+            statement = (
+                select(TransferJob)
+                .where(*criteria)
+                .order_by(TransferJob.created_at.desc(), TransferJob.id.desc())
+                .offset(max(0, offset))
+                .limit(max(1, min(limit, 200)))
+            )
+            rows = (await session.scalars(statement)).all()
+            return [self._transfer(row) for row in rows], total
+
+    async def alist_transfer_pause_capabilities(
+        self, transfer_ids: Iterable[uuid.UUID]
+    ) -> dict[uuid.UUID, tuple[bool, str | None]]:
+        ids = list(set(transfer_ids))
+        if not ids:
+            return {}
+        source = aliased(StorageConnection)
+        destination = aliased(StorageConnection)
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TransferJob.id,
+                        TransferJob.status,
+                        TransferJob.execution_started_at,
+                        TransferJob.conflict_policy,
+                        source.provider_type,
+                        destination.provider_type,
+                    )
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(TransferJob.id.in_(ids))
+                )
+            ).all()
+        result: dict[uuid.UUID, tuple[bool, str | None]] = {}
+        for transfer_id, status, execution_started_at, conflict_policy, src, dst in rows:
+            unstarted = status in {"QUEUED", "SCHEDULED"} and execution_started_at is None
+            supported = bool(
+                unstarted
+                or conflict_policy == "KEEP_BOTH"
+                or src == "SMB"
+                or (src == "MOCK" and dst == "MOCK")
+            )
+            reason = (
+                "LEGACY_BULK_EXECUTION"
+                if not supported
+                and (
+                    status in {"VALIDATING", "RUNNING", "RETRYING"}
+                    or execution_started_at is not None
+                )
+                else None
+            )
+            result[transfer_id] = supported, reason
+        return result
+
+    async def alist_transfer_incidents(
+        self,
+        requested_by: uuid.UUID | None,
+        *,
+        kind: str,
+        before_at: datetime | None = None,
+        before_id: uuid.UUID | None = None,
+        limit: int = 20,
+    ) -> list[TransferIncidentRecord]:
+        if kind not in {"failed", "omitted"}:
+            raise ValueError("Invalid transfer incident kind")
+        source = aliased(StorageConnection)
+        destination = aliased(StorageConnection)
+        incident_at = (
+            TransferManifestItem.updated_at if kind == "failed" else TransferManifestItem.omitted_at
+        )
+        incident_filter = (
+            TransferManifestItem.status == "FAILED"
+            if kind == "failed"
+            else and_(
+                TransferManifestItem.status == "SKIPPED",
+                TransferManifestItem.omission_kind.is_not(None),
+                TransferManifestItem.omitted_at.is_not(None),
+            )
+        )
+        criteria: list[Any] = [TransferManifestItem.is_dir.is_(False), incident_filter]
+        if requested_by is not None:
+            criteria.append(TransferJob.requested_by == requested_by)
+        if before_at is not None and before_id is not None:
+            criteria.append(
+                or_(
+                    incident_at < before_at,
+                    and_(incident_at == before_at, TransferManifestItem.id < before_id),
+                )
+            )
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TransferJob,
+                        TransferManifestItem,
+                        source,
+                        destination,
+                        incident_at.label("incident_at"),
+                    )
+                    .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                    .join(source, source.id == TransferJob.source_connection_id)
+                    .join(destination, destination.id == TransferJob.destination_connection_id)
+                    .where(*criteria)
+                    .order_by(incident_at.desc(), TransferManifestItem.id.desc())
+                    .limit(max(1, min(limit, 101)))
+                )
+            ).all()
+            return [
+                TransferIncidentRecord(
+                    transfer=self._transfer(transfer),
+                    item=self._manifest_item(item),
+                    incident_at=cast(datetime, occurred_at),
+                    source_connection=self._connection(source_row),
+                    destination_connection=self._connection(destination_row),
+                )
+                for transfer, item, source_row, destination_row, occurred_at in rows
+            ]
+
+    async def acount_transfer_incidents(self, requested_by: uuid.UUID | None) -> dict[str, int]:
+        async with self.sessions() as session:
+            criteria: list[Any] = [TransferManifestItem.is_dir.is_(False)]
+            if requested_by is not None:
+                criteria.append(TransferJob.requested_by == requested_by)
+            rows = (
+                await session.execute(
+                    select(TransferManifestItem.status, func.count())
+                    .join(TransferJob, TransferJob.id == TransferManifestItem.transfer_job_id)
+                    .where(
+                        *criteria,
+                        or_(
+                            TransferManifestItem.status == "FAILED",
+                            and_(
+                                TransferManifestItem.status == "SKIPPED",
+                                TransferManifestItem.omission_kind.is_not(None),
+                                TransferManifestItem.omitted_at.is_not(None),
+                            ),
+                        ),
+                    )
+                    .group_by(TransferManifestItem.status)
+                )
+            ).all()
+        counts = {"FAILED": 0, "SKIPPED": 0}
+        counts.update({str(row_status): int(count) for row_status, count in rows})
+        return {"failed": counts["FAILED"], "omitted": counts["SKIPPED"]}
+
+    async def alist_transfer_failure_diagnostics(
+        self, transfer_ids: set[uuid.UUID]
+    ) -> dict[uuid.UUID, list[dict[str, Any]]]:
+        if not transfer_ids:
+            return {}
+        async with self.sessions() as session:
+            events = (
+                await session.scalars(
+                    select(TransferEvent)
+                    .where(
+                        TransferEvent.transfer_job_id.in_(transfer_ids),
+                        TransferEvent.event_type == "FAILURE_DIAGNOSTIC",
+                    )
+                    .order_by(TransferEvent.created_at)
+                )
+            ).all()
+        result: dict[uuid.UUID, list[dict[str, Any]]] = {
+            transfer_id: [] for transfer_id in transfer_ids
+        }
+        for event in events:
+            result[event.transfer_job_id].append(
+                {
+                    "event_type": event.event_type,
+                    "technical_details": event.technical_details,
+                    "provider_error_code": event.provider_error_code,
+                    "created_at": event.created_at,
+                }
+            )
+        return result
+
+    async def acount_transfer_manifest_basename_matches_bulk(
+        self, candidates: list[tuple[uuid.UUID, str]]
+    ) -> dict[tuple[uuid.UUID, str], int]:
+        if not candidates:
+            return {}
+        criteria = [
+            and_(
+                TransferManifestItem.transfer_job_id == transfer_id,
+                or_(
+                    TransferManifestItem.source_path == basename,
+                    TransferManifestItem.source_path.endswith(f"/{basename}", autoescape=True),
+                ),
+            )
+            for transfer_id, basename in set(candidates)
+        ]
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TransferManifestItem.transfer_job_id, TransferManifestItem.source_path
+                    ).where(
+                        TransferManifestItem.is_dir.is_(False),
+                        or_(*criteria),
+                    )
+                )
+            ).all()
+        counts = {candidate: 0 for candidate in candidates}
+        for transfer_id, source_path in rows:
+            basename = PurePosixPath(source_path).name
+            key = (transfer_id, basename)
+            if key in counts:
+                counts[key] += 1
+        return counts
+
+    async def alist_accessible_connection_ids(
+        self, user_id: uuid.UUID, connection_ids: set[uuid.UUID]
+    ) -> set[uuid.UUID]:
+        if not connection_ids:
+            return set()
+        async with self.sessions() as session:
+            granted_ids = select(UserConnectionGrant.connection_id).where(
+                UserConnectionGrant.user_id == user_id
+            )
+            rows = await session.scalars(
+                select(StorageConnection.id).where(
+                    StorageConnection.id.in_(connection_ids),
+                    StorageConnection.deleted_at.is_(None),
+                    or_(
+                        StorageConnection.is_global.is_(True),
+                        StorageConnection.id.in_(granted_ids),
+                    ),
+                )
+            )
+            return set(rows.all())
+
+    async def asave_transfer(
+        self,
+        transfer: TransferRecord,
+        *,
+        expected_dispatch_token: uuid.UUID | None = None,
+    ) -> bool:
+        async with self.sessions() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer.id).with_for_update()
+                )
+                if row is None or row.status in _TERMINAL_TRANSFER_STATUSES:
+                    return False
+                if (
+                    expected_dispatch_token is not None
+                    and row.dispatch_token != expected_dispatch_token
+                ):
+                    return False
+                if transfer.attempt_count < row.attempt_count:
+                    return False
+                preserve_status = False
+                if row.status == "PAUSING" and transfer.status not in {
+                    "PAUSING",
+                    "FAILED",
+                    "CANCELLED",
+                    "COMPLETED",
+                    "COMPLETED_WITH_WARNINGS",
+                }:
+                    preserve_status = True
+                elif row.status == "PAUSED" and transfer.status not in {
+                    "PAUSED",
+                    "QUEUED",
+                    "SCHEDULED",
+                }:
+                    return False
+                elif (
+                    row.status == "CANCELLING"
+                    and transfer.status != "CANCELLING"
+                    and transfer.status not in _TERMINAL_TRANSFER_STATUSES
+                ):
+                    preserve_status = True
+                if not preserve_status and _TRANSFER_STATUS_RANK.get(
+                    transfer.status, -1
+                ) < _TRANSFER_STATUS_RANK.get(row.status, -1):
+                    return False
+                next_status = row.status if preserve_status else transfer.status
+                next_wait_reason = row.wait_reason if preserve_status else transfer.wait_reason
+                await self._record_transfer_state_span(
+                    session,
+                    row,
+                    status=next_status,
+                    wait_reason=next_wait_reason,
+                    now=datetime.now(UTC),
+                )
+                if not preserve_status:
+                    row.status = transfer.status
+                row.wait_reason = next_wait_reason
+                row.progress_percent = transfer.progress_percent
+                row.files_total = transfer.files_total
+                row.files_completed = transfer.files_completed
+                row.bytes_total = transfer.bytes_total
+                row.bytes_transferred = transfer.bytes_transferred
+                row.current_item = transfer.current_item
+                row.average_speed_bps = transfer.average_speed_bps
+                row.current_speed_bps = transfer.current_speed_bps
+                row.estimated_remaining_seconds = transfer.estimated_remaining_seconds
+                row.attempt_count = transfer.attempt_count
+                row.error_count = transfer.error_count
+                row.warning_count = transfer.warning_count
+                if transfer.started_at is not None:
+                    row.started_at = transfer.started_at
+                if transfer.completed_at is not None:
+                    row.completed_at = transfer.completed_at
+                if row.status in _TERMINAL_TRANSFER_STATUSES:
+                    row.pause_requested_at = None
+                    row.paused_at = None
+                    row.cancel_requested_at = None
+                row.state_version += 1
+                transfer.status = row.status
+                transfer.pause_requested_at = row.pause_requested_at
+                transfer.paused_at = row.paused_at
+                transfer.state_version = row.state_version
+                await self._ensure_notification_outbox(session, row)
+                return True
+
+    async def _record_transfer_state_span(
+        self,
+        session: AsyncSession,
+        transfer: TransferJob,
+        *,
+        status: str,
+        wait_reason: str | None,
+        now: datetime,
+    ) -> None:
+        current = await session.scalar(
+            select(TransferMetricSpan)
+            .where(
+                TransferMetricSpan.transfer_job_id == transfer.id,
+                TransferMetricSpan.span_type == "STATE",
+                TransferMetricSpan.outcome == "OPEN",
+            )
+            .order_by(TransferMetricSpan.started_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        if current is not None and current.code == status and current.wait_reason == wait_reason:
+            return
+        if current is not None:
+            current.completed_at = now
+            started_at = current.started_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
+            completed_at = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+            current.duration_ms = max(0, int((completed_at - started_at).total_seconds() * 1000))
+            current.outcome = "SUCCESS"
+        terminal = status in _TERMINAL_TRANSFER_STATUSES
+        session.add(
+            TransferMetricSpan(
+                id=uuid.uuid4(),
+                transfer_job_id=transfer.id,
+                attempt_count=transfer.attempt_count,
+                dispatch_token=transfer.dispatch_token,
+                span_type="STATE",
+                code=status,
+                wait_reason=wait_reason,
+                started_at=now,
+                completed_at=now if terminal else None,
+                duration_ms=None,
+                outcome="SUCCESS" if terminal else "OPEN",
+            )
+        )
+
+    async def astart_transfer_metric_span(
+        self,
+        transfer_id: uuid.UUID,
+        *,
+        dispatch_token: uuid.UUID | None,
+        attempt_count: int,
+        span_type: str,
+        code: str,
+        manifest_item_id: uuid.UUID | None = None,
+        connection_id: uuid.UUID | None = None,
+        provider_type: str | None = None,
+        connection_role: str | None = None,
+        started_at: datetime | None = None,
+    ) -> uuid.UUID | None:
+        async with self.sessions() as session:
+            async with session.begin():
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                if (
+                    transfer is None
+                    or transfer.status in _TERMINAL_TRANSFER_STATUSES
+                    or transfer.attempt_count != attempt_count
+                    or transfer.dispatch_token != dispatch_token
+                ):
+                    return None
+                span_id = uuid.uuid4()
+                session.add(
+                    TransferMetricSpan(
+                        id=span_id,
+                        transfer_job_id=transfer_id,
+                        manifest_item_id=manifest_item_id,
+                        dispatch_token=dispatch_token,
+                        attempt_count=attempt_count,
+                        span_type=span_type,
+                        code=code,
+                        provider_type=provider_type,
+                        connection_role=connection_role,
+                        connection_id=connection_id,
+                        started_at=started_at or datetime.now(UTC),
+                        outcome="OPEN",
+                    )
+                )
+                return span_id
+
+    async def afinish_transfer_metric_span(
+        self,
+        span_id: uuid.UUID,
+        *,
+        dispatch_token: uuid.UUID | None,
+        completed_at: datetime,
+        duration_ms: int,
+        outcome: str,
+        bytes_count: int | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        if outcome not in {"SUCCESS", "FAILED", "INTERRUPTED"}:
+            raise ValueError("Invalid metric outcome")
+        async with self.sessions() as session:
+            async with session.begin():
+                span = await session.scalar(
+                    select(TransferMetricSpan)
+                    .where(TransferMetricSpan.id == span_id)
+                    .with_for_update()
+                )
+                transfer = (
+                    await session.get(TransferJob, span.transfer_job_id)
+                    if span is not None
+                    else None
+                )
+                if (
+                    span is None
+                    or transfer is None
+                    or span.outcome != "OPEN"
+                    or span.dispatch_token != dispatch_token
+                    or transfer.dispatch_token != dispatch_token
+                    or transfer.attempt_count != span.attempt_count
+                ):
+                    return False
+                span.completed_at = completed_at
+                span.duration_ms = max(0, duration_ms)
+                span.outcome = outcome
+                span.bytes_count = max(0, bytes_count) if bytes_count is not None else None
+                span.error_code = (
+                    error_code
+                    if error_code
+                    and len(error_code) <= 64
+                    and error_code.replace("_", "").isalnum()
+                    else None
+                )
+                return True
+
+    async def aadd_transfer_manifest_items(
+        self, transfer_id: uuid.UUID, entries: list[dict[str, Any]]
+    ) -> int:
+        if not entries:
+            return 0
+        async with self.sessions() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else "postgresql"
+            insert = pg_insert if dialect == "postgresql" else sqlite_insert
+            inserted = 0
+            async with session.begin():
+                for start in range(0, len(entries), 200):
+                    values = []
+                    for entry in entries[start : start + 200]:
+                        source_path = str(entry["source_path"])
+                        source_object_id = entry.get("source_object_id")
+                        identity = (
+                            f"{transfer_id}:object:{source_object_id}"
+                            if isinstance(source_object_id, str) and source_object_id
+                            else f"{transfer_id}:path:{source_path}"
+                        )
+                        is_dir = bool(entry.get("is_dir", False))
+                        values.append(
+                            {
+                                "id": uuid.uuid4(),
+                                "transfer_job_id": transfer_id,
+                                "source_path": source_path,
+                                "source_object_id": (
+                                    source_object_id if isinstance(source_object_id, str) else None
+                                ),
+                                "destination_path": str(entry["destination_path"]),
+                                "requested_destination_path": str(
+                                    entry.get(
+                                        "requested_destination_path", entry["destination_path"]
+                                    )
+                                ),
+                                "rename_reason": (
+                                    str(entry["rename_reason"])
+                                    if entry.get("rename_reason")
+                                    else None
+                                ),
+                                "source_path_digest": hashlib.sha256(identity.encode()).hexdigest(),
+                                "is_dir": is_dir,
+                                "size_bytes": entry.get("size_bytes"),
+                                "modified_at": entry.get("modified_at"),
+                                "scan_complete": False,
+                                "status": "DIRECTORY" if is_dir else "PENDING",
+                                "copy_started": False,
+                                "destination_existed_before": False,
+                            }
+                        )
+                    statement = insert(TransferManifestItem).values(values)
+                    result = await session.execute(
+                        statement.on_conflict_do_nothing(
+                            index_elements=[
+                                TransferManifestItem.transfer_job_id,
+                                TransferManifestItem.source_path_digest,
+                            ]
+                        ).returning(TransferManifestItem.id)
+                    )
+                    inserted += len(result.scalars().all())
+                transfer = await session.get(TransferJob, transfer_id)
+                if transfer is None:
+                    raise ValueError("Transfer not found")
+                transfer.files_total = int(
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(TransferManifestItem)
+                        .where(
+                            TransferManifestItem.transfer_job_id == transfer_id,
+                            TransferManifestItem.is_dir.is_(False),
+                        )
+                    )
+                    or 0
+                )
+                transfer.bytes_total = int(
+                    await session.scalar(
+                        select(func.coalesce(func.sum(TransferManifestItem.size_bytes), 0)).where(
+                            TransferManifestItem.transfer_job_id == transfer_id,
+                            TransferManifestItem.is_dir.is_(False),
+                        )
+                    )
+                    or 0
+                )
+            return inserted
+
+    async def alist_pending_scan_directories(
+        self, transfer_id: uuid.UUID, limit: int = 200
+    ) -> list[TransferManifestItemRecord]:
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.is_dir.is_(True),
+                        TransferManifestItem.scan_complete.is_(False),
+                    )
+                    .order_by(TransferManifestItem.id)
+                    .limit(max(1, min(limit, 1000)))
+                )
+            ).all()
+            return [self._manifest_item(row) for row in rows]
+
+    async def amark_transfer_directory_scanned(
+        self, transfer_id: uuid.UUID, item_id: uuid.UUID
+    ) -> None:
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(TransferManifestItem).where(
+                    TransferManifestItem.transfer_job_id == transfer_id,
+                    TransferManifestItem.id == item_id,
+                    TransferManifestItem.is_dir.is_(True),
+                )
+            )
             if row is None:
-                return
-            row.status = transfer.status
-            row.progress_percent = transfer.progress_percent
-            row.files_total = transfer.files_total
-            row.files_completed = transfer.files_completed
-            row.bytes_total = transfer.bytes_total
-            row.bytes_transferred = transfer.bytes_transferred
-            row.current_item = transfer.current_item
-            row.average_speed_bps = transfer.average_speed_bps
-            row.current_speed_bps = transfer.current_speed_bps
-            row.estimated_remaining_seconds = transfer.estimated_remaining_seconds
-            row.attempt_count = transfer.attempt_count
-            row.error_count = transfer.error_count
-            row.warning_count = transfer.warning_count
-            row.started_at = transfer.started_at
-            row.completed_at = transfer.completed_at
+                raise ValueError("Manifest directory not found")
+            row.scan_complete = True
             await session.commit()
+
+    async def amark_transfer_manifest_item_started(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        destination_existed_before: bool,
+    ) -> None:
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(TransferManifestItem)
+                .where(
+                    TransferManifestItem.transfer_job_id == transfer_id,
+                    TransferManifestItem.id == item_id,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ValueError("Manifest file not found")
+            if not row.copy_started:
+                row.copy_started = True
+                row.destination_existed_before = destination_existed_before
+            await session.commit()
+
+    async def aupdate_transfer_manifest_item_size(
+        self, transfer_id: uuid.UUID, item_id: uuid.UUID, *, size_bytes: int
+    ) -> None:
+        if size_bytes < 0:
+            raise ValueError("Manifest file size cannot be negative")
+        async with self.sessions() as session:
+            async with session.begin():
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                item = await session.scalar(
+                    select(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.id == item_id,
+                        TransferManifestItem.is_dir.is_(False),
+                    )
+                    .with_for_update()
+                )
+                if transfer is None or item is None or item.copy_started:
+                    raise ValueError("Manifest file size cannot be updated")
+                if item.size_bytes is not None and item.size_bytes != size_bytes:
+                    raise ValueError("Manifest file size is already fixed")
+                if item.size_bytes is None:
+                    item.size_bytes = size_bytes
+                    transfer.bytes_total = int(transfer.bytes_total or 0) + size_bytes
+
+    async def aupdate_transfer_manifest_destination(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        destination_path: str,
+        requested_destination_path: str,
+        rename_reason: str | None,
+    ) -> None:
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(TransferManifestItem)
+                .where(
+                    TransferManifestItem.transfer_job_id == transfer_id,
+                    TransferManifestItem.id == item_id,
+                    TransferManifestItem.is_dir.is_(False),
+                )
+                .with_for_update()
+            )
+            if row is None or row.copy_started:
+                raise ValueError("Manifest destination can only change before a copy starts")
+            row.destination_path = destination_path
+            row.requested_destination_path = requested_destination_path
+            row.rename_reason = rename_reason
+            await session.commit()
+
+    async def alist_transfer_manifest_items(
+        self,
+        transfer_id: uuid.UUID,
+        statuses: set[str] | None = None,
+        after_id: uuid.UUID | None = None,
+        limit: int = 200,
+        include_directories: bool = False,
+    ) -> list[TransferManifestItemRecord]:
+        async with self.sessions() as session:
+            statement = select(TransferManifestItem).where(
+                TransferManifestItem.transfer_job_id == transfer_id,
+            )
+            if not include_directories:
+                statement = statement.where(TransferManifestItem.is_dir.is_(False))
+            if statuses:
+                statement = statement.where(TransferManifestItem.status.in_(statuses))
+            if after_id is not None:
+                statement = statement.where(TransferManifestItem.id > after_id)
+            rows = (
+                await session.scalars(
+                    statement.order_by(TransferManifestItem.id).limit(max(1, min(limit, 1000)))
+                )
+            ).all()
+            return [self._manifest_item(row) for row in rows]
+
+    async def acount_transfer_manifest_basename_matches(
+        self, transfer_id: uuid.UUID, basename: str
+    ) -> int:
+        async with self.sessions() as session:
+            return int(
+                await session.scalar(
+                    select(func.count(TransferManifestItem.id)).where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.is_dir.is_(False),
+                        or_(
+                            TransferManifestItem.source_path == basename,
+                            TransferManifestItem.source_path.endswith(
+                                f"/{basename}", autoescape=True
+                            ),
+                        ),
+                    )
+                )
+                or 0
+            )
+
+    async def aupdate_transfer_manifest_item(
+        self,
+        transfer_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        status: str,
+        verified_by: str | None = None,
+        error_code: str | None = None,
+        failure_stage: str | None = None,
+        failure_attempt: int | None = None,
+    ) -> None:
+        if status not in {"COPIED", "SKIPPED", "FAILED", "PENDING"}:
+            raise ValueError("Invalid manifest result")
+        async with self.sessions() as session:
+            async with session.begin():
+                transfer = await session.scalar(
+                    select(TransferJob).where(TransferJob.id == transfer_id).with_for_update()
+                )
+                item = await session.scalar(
+                    select(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.id == item_id,
+                        TransferManifestItem.is_dir.is_(False),
+                    )
+                    .with_for_update()
+                )
+                if transfer is None or item is None:
+                    raise ValueError("Manifest file not found")
+                old_status = item.status
+                if (
+                    old_status == status
+                    and item.verified_by == verified_by
+                    and item.error_code == error_code
+                    and (status != "FAILED" or item.last_failure_stage == failure_stage)
+                    and (status != "FAILED" or item.last_failure_attempt == failure_attempt)
+                ):
+                    return
+                terminal = {"COPIED", "SKIPPED", "FAILED"}
+                if old_status not in terminal and status in terminal:
+                    transfer.files_completed += 1
+                elif old_status in terminal and status not in terminal:
+                    transfer.files_completed = max(0, transfer.files_completed - 1)
+                was_copied = old_status == "COPIED"
+                becomes_copied = status == "COPIED"
+                if was_copied != becomes_copied:
+                    transfer.bytes_transferred = max(
+                        0,
+                        transfer.bytes_transferred
+                        + ((item.size_bytes or 0) if becomes_copied else -(item.size_bytes or 0)),
+                    )
+                if old_status == "FAILED":
+                    transfer.error_count = max(0, transfer.error_count - 1)
+                if old_status in {"FAILED", "SKIPPED"}:
+                    transfer.warning_count = max(0, transfer.warning_count - 1)
+                if status == "FAILED":
+                    transfer.error_count += 1
+                if status in {"FAILED", "SKIPPED"}:
+                    transfer.warning_count += 1
+                item.status = status
+                item.verified_by = verified_by
+                item.error_code = error_code
+                if status == "COPIED":
+                    item.copied_at = item.copied_at or datetime.now(UTC)
+                if status == "FAILED":
+                    item.last_failure_stage = failure_stage
+                    item.last_failure_attempt = failure_attempt
+                elif status in {"COPIED", "PENDING"}:
+                    item.last_failure_stage = None
+                    item.last_failure_attempt = None
+                # For SMB manifests, warning_count tracks failed and skipped file outcomes.
+                transfer.progress_percent = smb_manifest_progress_percent(
+                    bytes_transferred=transfer.bytes_transferred,
+                    bytes_total=transfer.bytes_total or 0,
+                    files_total=transfer.files_total or 0,
+                    counts={
+                        "copied": max(0, transfer.files_completed - transfer.warning_count),
+                        "failed": transfer.error_count,
+                        "skipped": max(0, transfer.warning_count - transfer.error_count),
+                        "pending": max(0, (transfer.files_total or 0) - transfer.files_completed),
+                    },
+                )
+
+    async def aget_transfer_manifest_counts(self, transfer_id: uuid.UUID) -> dict[str, int]:
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(TransferManifestItem.status, func.count())
+                    .where(TransferManifestItem.transfer_job_id == transfer_id)
+                    .group_by(TransferManifestItem.status)
+                )
+            ).all()
+            counts = {status: int(count) for status, count in rows}
+            pending_directories = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(TransferManifestItem)
+                    .where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.is_dir.is_(True),
+                        TransferManifestItem.scan_complete.is_(False),
+                    )
+                )
+                or 0
+            )
+            omission_totals = (
+                await session.execute(
+                    select(
+                        func.count(),
+                        func.coalesce(
+                            func.sum(func.coalesce(TransferManifestItem.size_bytes, 0)), 0
+                        ),
+                    ).where(
+                        TransferManifestItem.transfer_job_id == transfer_id,
+                        TransferManifestItem.omission_kind.is_not(None),
+                    )
+                )
+            ).one()
+            return {
+                "total": sum(counts.values()),
+                "pending": counts.get("PENDING", 0) + pending_directories,
+                "copied": counts.get("COPIED", 0),
+                "skipped": counts.get("SKIPPED", 0),
+                "failed": counts.get("FAILED", 0),
+                "omitted": int(omission_totals[0]),
+                "omitted_bytes": int(omission_totals[1]),
+            }
+
+    async def alist_transfer_manifest_summaries(
+        self, transfer_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, dict[str, int]]:
+        summaries = {
+            transfer_id: {
+                "copied": 0,
+                "failed": 0,
+                "skipped": 0,
+                "pending": 0,
+                "renamed": 0,
+                "omitted": 0,
+                "omitted_bytes": 0,
+            }
+            for transfer_id in transfer_ids
+        }
+        if not transfer_ids:
+            return summaries
+
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TransferManifestItem.transfer_job_id,
+                        func.sum(case((TransferManifestItem.status == "COPIED", 1), else_=0)).label(
+                            "copied"
+                        ),
+                        func.sum(case((TransferManifestItem.status == "FAILED", 1), else_=0)).label(
+                            "failed"
+                        ),
+                        func.sum(
+                            case((TransferManifestItem.status == "SKIPPED", 1), else_=0)
+                        ).label("skipped"),
+                        func.sum(
+                            case((TransferManifestItem.status == "PENDING", 1), else_=0)
+                        ).label("pending"),
+                        func.sum(
+                            case((TransferManifestItem.rename_reason.is_not(None), 1), else_=0)
+                        ).label("renamed"),
+                        func.sum(
+                            case((TransferManifestItem.omission_kind.is_not(None), 1), else_=0)
+                        ).label("omitted"),
+                        func.sum(
+                            case(
+                                (
+                                    TransferManifestItem.omission_kind.is_not(None),
+                                    TransferManifestItem.size_bytes,
+                                ),
+                                else_=0,
+                            )
+                        ).label("omitted_bytes"),
+                    )
+                    .where(
+                        TransferManifestItem.transfer_job_id.in_(transfer_ids),
+                    )
+                    .group_by(TransferManifestItem.transfer_job_id)
+                )
+            ).all()
+        for transfer_id, copied, failed, skipped, pending, renamed, omitted, omitted_bytes in rows:
+            summaries[transfer_id] = {
+                "copied": int(copied or 0),
+                "failed": int(failed or 0),
+                "skipped": int(skipped or 0),
+                "pending": int(pending or 0),
+                "renamed": int(renamed or 0),
+                "omitted": int(omitted or 0),
+                "omitted_bytes": int(omitted_bytes or 0),
+            }
+        return summaries
 
     async def aadd_transfer_event(
         self,

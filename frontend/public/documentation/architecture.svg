@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ctm-architecture-title ctm-architecture-desc" id="architecture-root">
+        <title id="ctm-architecture-title">Arquitectura de Cloud Transfer Manager</title>
+        <desc id="ctm-architecture-desc">El navegador entra por Nginx y React a la API FastAPI. PostgreSQL conserva el estado; Redis distribuye trabajos y eventos de progreso desde los workers hacia la API, que los transmite por SSE. Los workers copian archivos a proveedores cloud y SMB.</desc>
+        <defs>
+      <style>#architecture-root { color: #18283f; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      #architecture-root .diagram-container { width: 100%; overflow-x: auto; }
+      #architecture-root .diagram-container { overflow-x: visible; }</style>
+          <marker id="architecture-ctm-architecture-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#42546c"/>
+          </marker>
+          <marker id="architecture-ctm-architecture-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#0b746d"/>
+          </marker>
+        </defs>
+
+        <rect width="960" height="600" fill="#f4f7fb"/>
+
+        <text x="32" y="36" fill="#2864dc" font-size="8" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.14em">CLOUD TRANSFER MANAGER / ARQUITECTURA ACTUAL</text>
+        <text x="32" y="72" fill="#18283f" font-size="28" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">Arquitectura de Cloud Transfer Manager</text>
+        <text x="32" y="96" fill="#42546c" font-size="11" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">Docker Compose · React · FastAPI · Celery · Rclone y MEGAcmd</text>
+
+        <!-- Trust and deployment zones -->
+        <rect x="24" y="124" width="160" height="420" rx="8" fill="#18283f" stroke="#d5e0ef" stroke-width="1" stroke-dasharray="4,3" fill-opacity="0.02"/>
+        <rect x="200" y="124" width="572" height="420" rx="8" fill="#18283f" stroke="#d5e0ef" stroke-width="1" stroke-dasharray="4,3" fill-opacity="0.02"/>
+        <rect x="792" y="124" width="144" height="420" rx="8" fill="#18283f" stroke="#d5e0ef" stroke-width="1" stroke-dasharray="4,3" fill-opacity="0.02"/>
+
+        <rect x="32" y="132" width="64" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="40" y="144" fill="#52637a" font-size="8" font-weight="500" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.14em">CLIENTE</text>
+        <rect x="208" y="132" width="112" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="216" y="144" fill="#52637a" font-size="8" font-weight="500" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.14em">DOCKER COMPOSE</text>
+        <rect x="800" y="132" width="104" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="808" y="144" fill="#52637a" font-size="8" font-weight="500" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.14em">PROVEEDORES</text>
+
+        <!-- Connections are painted before nodes. -->
+        <path d="M 172,328 H 220" fill="none" stroke="#0b746d" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow-link)"/>
+        <path d="M 364,304 H 384 Q 392,304 392,296 V 216 Q 392,208 400,208 H 420" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow)"/>
+        <path d="M 364,328 H 420" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow)"/>
+        <path d="M 492,372 V 420" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow)"/>
+        <path d="M 564,304 H 620" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow)"/>
+        <path d="M 620,348 H 564" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow)"/>
+        <path d="M 644,372 V 420" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow)"/>
+        <path d="M 724,420 V 372" fill="none" stroke="#42546c" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow)"/>
+        <path d="M 548,284 V 268 Q 548,260 556,260 H 852 Q 860,260 860,268 V 284" fill="none" stroke="#0b746d" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow-link)"/>
+        <path d="M 748,448 H 762 Q 770,448 770,440 V 376 Q 770,368 778,368 H 792" fill="none" stroke="#0b746d" stroke-width="1.2" marker-end="url(#architecture-ctm-architecture-arrow-link)"/>
+
+        <!-- Opaque labels keep each connection readable. -->
+        <rect x="184" y="302" width="32" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="200" y="314" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.06em">HTTPS</text>
+        <rect x="400" y="252" width="20" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="404" y="264" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.06em">UI</text>
+        <rect x="376" y="302" width="32" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="392" y="314" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle" letter-spacing="0.06em">API</text>
+        <rect x="500" y="388" width="28" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="504" y="400" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.06em">SQL</text>
+        <rect x="572" y="280" width="40" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="576" y="292" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.06em">JOBS</text>
+        <rect x="572" y="328" width="28" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="576" y="340" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.06em">SSE</text>
+        <rect x="652" y="384" width="36" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="656" y="396" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.06em">COLA</text>
+        <rect x="688" y="384" width="28" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="692" y="396" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.06em">SSE</text>
+        <rect x="648" y="236" width="64" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="652" y="248" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.06em">LIST/OAUTH</text>
+        <rect x="778" y="400" width="32" height="16" rx="2" fill="#f4f7fb"/>
+        <text x="782" y="412" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" letter-spacing="0.06em">COPY</text>
+
+        <!-- Client and service nodes -->
+        <g aria-label="Navegador">
+          <rect x="36" y="288" width="136" height="80" rx="6" fill="#e8edf4" stroke="#52637a" stroke-width="1"/>
+          <text x="104" y="320" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">Navegador</text>
+          <text x="104" y="344" fill="#42546c" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">HTTPS 443 / 8443</text>
+        </g>
+        <g aria-label="Nginx reverse proxy">
+          <rect x="220" y="288" width="144" height="80" rx="6" fill="#ffffff" stroke="#d5e0ef" stroke-width="1"/>
+          <text x="292" y="320" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">Reverse proxy</text>
+          <text x="292" y="344" fill="#42546c" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">host 8080 / 8443</text>
+        </g>
+        <g aria-label="Frontend React y Material UI">
+          <rect x="420" y="168" width="144" height="80" rx="6" fill="#ffffff" stroke="#d5e0ef" stroke-width="1"/>
+          <text x="492" y="200" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">Interfaz web</text>
+          <text x="492" y="224" fill="#42546c" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">React · MUI</text>
+        </g>
+        <g aria-label="API FastAPI">
+          <rect x="420" y="284" width="144" height="88" rx="6" fill="#edf3ff" stroke="#2864dc" stroke-width="1.2"/>
+          <text x="492" y="318" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">API y dominio</text>
+          <text x="492" y="342" fill="#42546c" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">FastAPI · Alembic</text>
+        </g>
+        <g aria-label="Workers Celery con Rclone y MEGAcmd">
+          <rect x="620" y="420" width="128" height="88" rx="6" fill="#ffffff" stroke="#d5e0ef" stroke-width="1"/>
+          <text x="684" y="450" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">Workers</text>
+          <text x="684" y="472" fill="#42546c" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">Rclone · MEGAcmd</text>
+          <text x="684" y="488" fill="#52637a" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">Celery · control · beat</text>
+        </g>
+        <g aria-label="Base de datos PostgreSQL">
+          <rect x="420" y="420" width="144" height="80" rx="6" fill="#18283f" stroke="#42546c" stroke-width="1" fill-opacity="0.05"/>
+          <text x="492" y="452" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">PostgreSQL</text>
+          <text x="492" y="476" fill="#42546c" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">estado · auditoría</text>
+        </g>
+        <g aria-label="Redis para colas y eventos SSE">
+          <rect x="620" y="284" width="128" height="88" rx="6" fill="#18283f" stroke="#42546c" stroke-width="1" fill-opacity="0.05"/>
+          <text x="684" y="318" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">Redis</text>
+          <text x="684" y="342" fill="#42546c" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">broker · pub/sub</text>
+        </g>
+        <g aria-label="MEGA, Google Drive, Seafile y SMB NAS">
+          <rect x="792" y="284" width="136" height="104" rx="6" fill="#18283f" stroke="#18283f" stroke-width="1" fill-opacity="0.03" stroke-opacity="0.30"/>
+          <text x="860" y="324" fill="#18283f" font-size="12" font-weight="600" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">Proveedores</text>
+          <text x="860" y="348" fill="#42546c" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">MEGA · Drive</text>
+          <text x="860" y="364" fill="#42546c" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">Seafile · SMB/NAS</text>
+        </g>
+
+        <line x1="32" y1="560" x2="928" y2="560" stroke="#e3eaf3" stroke-width="1"/>
+        <text x="32" y="580" fill="#52637a" font-size="9" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">Solo Nginx publica puertos · los workers envían progreso a Redis y la API lo transmite por SSE.</text>
+      </svg>

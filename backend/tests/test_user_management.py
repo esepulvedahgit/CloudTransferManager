@@ -76,6 +76,21 @@ async def test_admin_can_create_list_and_deactivate_user_revoking_session():
 
 
 @pytest.mark.asyncio
+async def test_admin_cannot_demote_the_last_active_admin():
+    client, _store, admin = await authenticated_client()
+
+    response = await client.patch(
+        f"/api/v1/users/{admin.id}",
+        json={"role": "USER"},
+        headers={"X-CSRF-Token": client.cookies["ctm_csrf"]},
+    )
+
+    assert response.status_code == 409
+    assert admin.role == "ADMIN"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_non_admin_cannot_manage_users_and_user_can_change_own_password():
     client, store, user = await authenticated_client("USER")
     csrf = client.cookies["ctm_csrf"]

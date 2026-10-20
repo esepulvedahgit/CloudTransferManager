@@ -1,7 +1,20 @@
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   reverse-proxy:
     image: nginx:1.27-alpine
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${PROXY_CPU_LIMIT:-0.50}"
+          memory: "${PROXY_MEMORY_LIMIT:-128M}"
+          pids: 64
     ports:
       - "0.0.0.0:${HTTP_PORT:-8080}:80"
       - "0.0.0.0:${HTTPS_PORT:-8443}:443"
@@ -22,10 +35,17 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${FRONTEND_CPU_LIMIT:-0.50}"
+          memory: "${FRONTEND_MEMORY_LIMIT:-192M}"
+          pids: 64
     expose:
-      - "80"
+      - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
       interval: 20s
       timeout: 3s
       retries: 3
@@ -37,6 +57,13 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${BACKEND_CPU_LIMIT:-1.00}"
+          memory: "${BACKEND_MEMORY_LIMIT:-768M}"
+          pids: 256
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --loop asyncio --no-access-log"]
     env_file:
       - .env
@@ -47,6 +74,9 @@ services:
       SMTP_PASSWORD_FILE: /run/ctm-secrets/smtp_password
       MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
       TRANSFER_STAGING_PATH: ${TRANSFER_STAGING_PATH:-/var/lib/cloud-transfer/staging}
+      SMB_ALLOWED_TARGETS: ${SMB_ALLOWED_TARGETS:-}
+      SMB_INTERACTIVE_TIMEOUT_SECONDS: ${SMB_INTERACTIVE_TIMEOUT_SECONDS:-30}
+      SMB_TRANSFER_MAX_FILES: ${SMB_TRANSFER_MAX_FILES:-100000}
     secrets:
       - app_secret_key
       - postgres_password
@@ -54,8 +84,6 @@ services:
       - smtp_password
     expose:
       - "8000"
-    volumes:
-      - application_logs:/var/log/cloud-transfer
     tmpfs:
       - /run/ctm-secrets:mode=0700,size=1m
       - /var/lib/cloud-transfer/tmp:mode=0700,size=64m
@@ -79,6 +107,15 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${WORKER_CPU_LIMIT:-2.00}"
+          memory: "${WORKER_MEMORY_LIMIT:-1536M}"
+          pids: 512
+    healthcheck:
+      disable: true
     command:
       [
         "celery",
@@ -86,7 +123,7 @@ services:
         "app.worker.celery_app",
         "worker",
         "--loglevel=INFO",
-        "--concurrency=${TRANSFER_MAX_CONCURRENT:-2}",
+        "--concurrency=${TRANSFER_MAX_CONCURRENT:-1}",
         "--queues=transfers",
       ]
     env_file:
@@ -94,15 +131,14 @@ services:
     environment:
       POSTGRES_PASSWORD_FILE: /run/ctm-secrets/postgres_password
       MASTER_ENCRYPTION_KEY_FILE: /run/ctm-secrets/master_key
-      SMTP_PASSWORD_FILE: /run/ctm-secrets/smtp_password
       MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
       TRANSFER_STAGING_PATH: ${TRANSFER_STAGING_PATH:-/var/lib/cloud-transfer/staging}
+      SMB_ALLOWED_TARGETS: ${SMB_ALLOWED_TARGETS:-}
+      SMB_INTERACTIVE_TIMEOUT_SECONDS: ${SMB_INTERACTIVE_TIMEOUT_SECONDS:-30}
+      SMB_TRANSFER_MAX_FILES: ${SMB_TRANSFER_MAX_FILES:-100000}
     secrets:
       - postgres_password
       - master_key
-      - smtp_password
-    volumes:
-      - application_logs:/var/log/cloud-transfer
     tmpfs:
       - /run/ctm-secrets:mode=0700,size=1m
       - /var/lib/cloud-transfer/tmp:mode=0700,size=64m
@@ -115,9 +151,180 @@ services:
       - ctm_internal
       - provider_egress
 
+  control-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${CONTROL_WORKER_CPU_LIMIT:-0.50}"
+          memory: "${CONTROL_WORKER_MEMORY_LIMIT:-384M}"
+          pids: 128
+    healthcheck:
+      disable: true
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+        "--queues=control",
+      ]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/ctm-secrets/postgres_password
+    secrets:
+      - postgres_password
+    tmpfs:
+      - /run/ctm-secrets:mode=0700,size=1m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+
+  evaluation-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${EVALUATION_WORKER_CPU_LIMIT:-1.00}"
+          memory: "${EVALUATION_WORKER_MEMORY_LIMIT:-768M}"
+          pids: 256
+    healthcheck:
+      disable: true
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+        "--queues=evaluations",
+      ]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/ctm-secrets/postgres_password
+      MASTER_ENCRYPTION_KEY_FILE: /run/ctm-secrets/master_key
+      MEGACMD_BINARY_DIR: ${MEGACMD_BINARY_DIR:-/usr/bin}
+      SMB_ALLOWED_TARGETS: ${SMB_ALLOWED_TARGETS:-}
+      SMB_INTERACTIVE_TIMEOUT_SECONDS: ${SMB_INTERACTIVE_TIMEOUT_SECONDS:-30}
+      SMB_TRANSFER_MAX_FILES: ${SMB_TRANSFER_MAX_FILES:-100000}
+    secrets:
+      - postgres_password
+      - master_key
+    tmpfs:
+      - /run/ctm-secrets:mode=0700,size=1m
+      - /var/lib/cloud-transfer/tmp:mode=0700,size=64m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+      - provider_egress
+
+  notification-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${NOTIFICATION_WORKER_CPU_LIMIT:-0.50}"
+          memory: "${NOTIFICATION_WORKER_MEMORY_LIMIT:-384M}"
+          pids: 128
+    healthcheck:
+      disable: true
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+        "--queues=notifications",
+      ]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/ctm-secrets/postgres_password
+      MASTER_ENCRYPTION_KEY_FILE: /run/ctm-secrets/master_key
+      SMTP_PASSWORD_FILE: /run/ctm-secrets/smtp_password
+    secrets:
+      - postgres_password
+      - master_key
+      - smtp_password
+    tmpfs:
+      - /run/ctm-secrets:mode=0700,size=1m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+      - provider_egress
+
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${BEAT_CPU_LIMIT:-0.50}"
+          memory: "${BEAT_MEMORY_LIMIT:-256M}"
+          pids: 128
+    healthcheck:
+      disable: true
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "beat",
+        "--loglevel=INFO",
+        "--pidfile=/tmp/celerybeat.pid",
+      ]
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - ctm_internal
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${POSTGRES_CPU_LIMIT:-1.50}"
+          memory: "${POSTGRES_MEMORY_LIMIT:-1536M}"
+          pids: 256
     environment:
       POSTGRES_DB: cloud_transfer
       POSTGRES_USER: cloud_transfer
@@ -134,10 +341,89 @@ services:
     networks:
       - ctm_internal
 
+  backup:
+    profiles: ["backup"]
+    build:
+      context: .
+      dockerfile: ops/backup/Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${BACKUP_CPU_LIMIT:-1.00}"
+          memory: "${BACKUP_MEMORY_LIMIT:-3G}"
+          pids: 128
+    command: ["python3", "-m", "app.backup", "daemon"]
+    environment:
+      BACKUP_ENABLED: "${BACKUP_ENABLED:-false}"
+      BACKUP_S3_ENDPOINT: "${BACKUP_S3_ENDPOINT:-}"
+      BACKUP_S3_REGION: "${BACKUP_S3_REGION:-}"
+      BACKUP_S3_BUCKET: "${BACKUP_S3_BUCKET:-}"
+      BACKUP_S3_PREFIX: "${BACKUP_S3_PREFIX:-cloud-transfer-manager}"
+      BACKUP_INTERVAL_SECONDS: "${BACKUP_INTERVAL_SECONDS:-600}"
+      BACKUP_MAX_AGE_SECONDS: "${BACKUP_MAX_AGE_SECONDS:-900}"
+      BACKUP_STATE_DIR: /var/lib/ctm-backups
+      BACKUP_WORK_DIR: /run/ctm-backup-work
+      BACKUP_SECRET_DIR: /run/ctm-secrets
+      CTM_BACKUP_SOURCE_SECRETS_DIR: /run/secrets
+      BACKUP_ENV_FILE: /run/ctm-secrets/app.env
+      BACKUP_DB_HOST: postgres
+      BACKUP_DB_PORT: "5432"
+      BACKUP_DB_NAME: cloud_transfer
+      BACKUP_DB_USER: cloud_transfer
+      BACKUP_DB_PASSWORD_FILE: /run/ctm-secrets/postgres_password
+      BACKUP_ENCRYPTION_KEY_FILE: /run/ctm-secrets/backup_encryption_key
+    volumes:
+      - ./.env:/run/ctm-config-source/app.env:ro
+      - ./restore:/restore
+      - backup_state:/var/lib/ctm-backups
+    secrets:
+      - app_secret_key
+      - master_key
+      - postgres_password
+      - smtp_password
+      - backup_encryption_key
+      - mega_s4_access_key
+      - mega_s4_secret_key
+    tmpfs:
+      - /run/ctm-secrets:rw,noexec,nosuid,size=1m,mode=0700
+      - /run/ctm-backup-work:rw,noexec,nosuid,size=${BACKUP_TMPFS_SIZE:-2G},mode=0700
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-m", "app.backup", "health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15m
+    networks:
+      - ctm_internal
+      - provider_egress
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+        "--maxmemory",
+        "${REDIS_MAXMEMORY:-256mb}",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${REDIS_CPU_LIMIT:-0.50}"
+          memory: "${REDIS_MEMORY_LIMIT:-384M}"
+          pids: 128
     volumes:
       - redis_data:/data
     healthcheck:
@@ -151,7 +437,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  application_logs:
+  backup_state:
 
 networks:
   ctm_internal:
@@ -171,3 +457,9 @@ secrets:
     file: ./secrets/master_key
   smtp_password:
     file: ./secrets/smtp_password
+  backup_encryption_key:
+    file: ./secrets/backup_encryption_key
+  mega_s4_access_key:
+    file: ./secrets/mega_s4_access_key
+  mega_s4_secret_key:
+    file: ./secrets/mega_s4_secret_key

@@ -1,13 +1,10 @@
 import smtplib
 import ssl
-import uuid
 from email.message import EmailMessage
-from pathlib import Path
 from typing import Any
 
+from app.services.smtp_config import SMTPServerConfig
 from app.settings import Settings
-
-_NOTIFIABLE = {"COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "CANCELLED"}
 
 
 def format_bytes(value: int) -> str:
@@ -35,6 +32,8 @@ def render_transfer_email(
         f"Origen: {source_name}\n"
         f"Destino: {destination_name}\n"
         f"Datos transferidos: {format_bytes(transfer.bytes_transferred)}\n"
+        f"Archivos omitidos: {getattr(transfer, 'omitted', 0)}\n"
+        f"Tamaño omitido: {format_bytes(getattr(transfer, 'omitted_bytes', 0))}\n"
     )
     if transfer.created_at and transfer.completed_at:
         elapsed = max(0, int((transfer.completed_at - transfer.created_at).total_seconds()))
@@ -44,46 +43,30 @@ def render_transfer_email(
     return subject, body
 
 
-async def enqueue_transfer_notification(store: Any, transfer_id: uuid.UUID, task: Any) -> bool:
-    transfer = await store.aget_transfer(transfer_id)
-    if (
-        transfer is None
-        or not transfer.send_email_notification
-        or transfer.status not in _NOTIFIABLE
-    ):
-        return False
-    task.delay(str(transfer_id))
-    return True
-
-
 def send_transfer_email(
     settings: Settings,
+    smtp: SMTPServerConfig,
     recipient: str,
     transfer: Any,
     source_name: str,
     destination_name: str,
 ) -> None:
-    if not settings.smtp_host or not settings.smtp_from_address:
+    if not smtp.host or not smtp.from_address:
         raise ValueError("SMTP settings are incomplete")
     subject, body = render_transfer_email(
         transfer, source_name, destination_name, settings.app_base_url
     )
     message = EmailMessage()
     message["Subject"] = subject
-    message["From"] = settings.smtp_from_address
+    message["From"] = smtp.from_address
     message["To"] = recipient
     message.set_content(body)
     try:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as client:
-            if settings.smtp_use_tls:
+        with smtplib.SMTP(smtp.host, smtp.port, timeout=20) as client:
+            if smtp.use_tls:
                 client.starttls(context=ssl.create_default_context())
-            if settings.smtp_username:
-                password = (
-                    Path(settings.smtp_password_file).read_text(encoding="utf-8").strip()
-                    if settings.smtp_password_file
-                    else ""
-                )
-                client.login(settings.smtp_username, password)
+            if smtp.username:
+                client.login(smtp.username, smtp.password)
             client.send_message(message)
     except (OSError, smtplib.SMTPException):
         raise NotificationDeliveryError("No fue posible entregar la notificación SMTP") from None
