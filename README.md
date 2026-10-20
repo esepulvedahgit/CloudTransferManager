@@ -2,6 +2,19 @@
   <img src="frontend/public/brand/cloud-transfer-manager.svg" alt="Logo de Cloud Transfer Manager" width="112">
 </p>
 
+<p align="center">
+  <a href="https://www.python.org/"><img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat&amp;logo=python&amp;logoColor=white"></a>
+  <a href="https://fastapi.tiangolo.com/"><img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-009688?style=flat&amp;logo=fastapi&amp;logoColor=white"></a>
+  <a href="https://www.postgresql.org/"><img alt="PostgreSQL 16" src="https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat&amp;logo=postgresql&amp;logoColor=white"></a>
+  <a href="https://react.dev/"><img alt="React" src="https://img.shields.io/badge/React-61DAFB?style=flat&amp;logo=react&amp;logoColor=20232A"></a>
+  <a href="https://www.typescriptlang.org/"><img alt="TypeScript 5" src="https://img.shields.io/badge/TypeScript-5-3178C6?style=flat&amp;logo=typescript&amp;logoColor=white"></a>
+  <a href="https://redis.io/"><img alt="Redis 7" src="https://img.shields.io/badge/Redis-7-DC382D?style=flat&amp;logo=redis&amp;logoColor=white"></a>
+  <a href="https://docs.celeryq.dev/"><img alt="Celery 5" src="https://img.shields.io/badge/Celery-5-37814A?style=flat"></a>
+  <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?style=flat&amp;logo=docker&amp;logoColor=white"></a>
+  <a href="https://rclone.org/"><img alt="Rclone" src="https://img.shields.io/badge/Rclone-1677C8?style=flat"></a>
+  <a href="https://mega.io/cmd"><img alt="MEGAcmd" src="https://img.shields.io/badge/MEGAcmd-D9272E?style=flat"></a>
+</p>
+
 <h1 align="center">Cloud Transfer Manager</h1>
 
 <p align="center"><strong>Versión 1.0</strong></p>
