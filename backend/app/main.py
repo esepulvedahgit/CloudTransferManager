@@ -329,7 +329,7 @@ def create_app(settings: Settings | None = None, store: Any | None = None) -> Fa
     if config.app_env.lower() == "production" and not configured_secret:
         raise RuntimeError("APP_SECRET_KEY must be configured in production")
     session_secret = configured_secret or secrets.token_urlsafe(48)
-    app = FastAPI(title="Cloud Transfer Manager", version="0.1.0")
+    app = FastAPI(title="Cloud Transfer Manager", version="1.0.0")
 
     @app.exception_handler(RequestValidationError)
     async def handle_request_validation_error(

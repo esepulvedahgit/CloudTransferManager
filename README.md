@@ -1,4 +1,10 @@
-# Cloud Transfer Manager
+<p align="center">
+  <img src="frontend/public/brand/cloud-transfer-manager.svg" alt="Logo de Cloud Transfer Manager" width="112">
+</p>
+
+<h1 align="center">Cloud Transfer Manager</h1>
+
+<p align="center"><strong>Versión 1.0</strong></p>
 
 Cloud Transfer Manager (CTM) es una aplicación web privada para explorar y copiar archivos entre servicios cloud y recursos SMB/NAS accesibles desde una red privada. La interfaz usa React y Material UI; una API FastAPI coordina PostgreSQL, Redis y workers Celery. Rclone y MEGAcmd se ejecutan como procesos internos controlados. Solo se admite la operación de copia (`COPY`).
 
@@ -11,7 +17,7 @@ El estado por módulo, las extensiones agregadas desde el alcance inicial y las 
 | Área | Implementación disponible |
 |---|---|
 | Usuarios | Roles `ADMIN` y `USER`, sesiones con cookies `HttpOnly`, contraseñas con Argon2id, cambio inicial de contraseña y alta del primer administrador mediante CLI. |
-| Proveedores | MEGA con MEGAcmd; Google Drive con OAuth y Rclone; Seafile mediante Rclone o API por conexión; Nextcloud mediante WebDAV/Rclone tras habilitarlo por despliegue; recursos privados SMB para explorar y migrar archivos. El proveedor mock sirve para desarrollo. |
+| Proveedores | MEGA con MEGAcmd; Google Drive con OAuth y Rclone; Seafile mediante Rclone o API por conexión; Nextcloud por WebDAV/Rclone; recursos privados SMB para explorar y migrar archivos. El proveedor mock sirve para desarrollo. |
 | Acceso a conexiones | Conexiones globales o privadas asignadas por usuario. Las credenciales y tokens se cifran en el backend y la API no los devuelve al frontend. |
 | Transferencias | Copias inmediatas y programadas de una sola ejecución; modos `AUTO` y `EXCLUSIVE`, dependencias opcionales, reintentos, cancelación y reanudación donde el adaptador lo permite. |
 | Seguimiento | Progreso por SSE, estados en segundo plano, historial y resultado por archivo para transferencias SMB. |
@@ -43,20 +49,23 @@ Configuración y evidencia de la instalación local: [CloudLab](docs/deployment-
 - Espacio suficiente en el almacenamiento de Docker para las bases de datos, logs y el staging temporal de transferencias.
 - Conectividad desde el host Docker hacia los proveedores configurados. Para SMB, prepara también la ruta, DNS y reglas de firewall hacia el NAS.
 
-### Preparar el entorno
+### Primera instalación
 
-Desde la raíz del repositorio, copia `.env.example` y edita `APP_BASE_URL` antes de iniciar Compose. Para acceso local directo con los puertos predeterminados, usa `https://localhost:8443`:
+Ejecuta los comandos desde la raíz del repositorio. Primero crea `.env` y define `APP_BASE_URL` con la URL HTTPS exacta que usarán los usuarios. Para probar en el mismo host con los puertos predeterminados, usa `https://localhost:8443`:
 
 ```bash
 cp .env.example .env
-# Edita APP_BASE_URL=https://localhost:8443 en .env antes de continuar.
+# Edita APP_BASE_URL y los puertos en .env antes de continuar.
 bash scripts/setup-local-secrets.sh
+docker compose config --quiet
 docker compose up -d --build
 ```
 
-El script genera `secrets/app_secret_key`, `secrets/postgres_password`, `secrets/master_key` y `secrets/smtp_password`, y crea un certificado autofirmado en `certs/` si no existe ya el par TLS. Protege `secrets/` y `certs/` como material sensible. El script se detiene si ya encuentra cualquiera de esos secretos: no los borres ni los regeneres para “arreglar” un despliegue existente. Si sustituyes el certificado, instala juntos `fullchain.pem` y `privkey.pem`. En producción instala los secretos y el certificado confiable mediante el procedimiento de tu organización; no uses el certificado autofirmado.
+Para desarrollo local, `setup-local-secrets.sh` genera los cuatro archivos Docker Secret y un certificado autofirmado para `localhost` si no hay un par TLS en `certs/`. Para una instalación de producción, instala antes de arrancar un certificado confiable como `certs/fullchain.pem` y `certs/privkey.pem`, cuyo SAN coincida con el host de `APP_BASE_URL`; también puedes provisionar los cuatro archivos de `secrets/` con el sistema de secretos de tu organización y omitir el script. El servicio requiere `app_secret_key`, `postgres_password`, `master_key` y `smtp_password`; `master_key` debe contener 32 bytes. Si instalas el certificado antes de ejecutar el script para generar los secretos, copia ambos archivos, no solo uno.
 
-La clave `master_key` es necesaria para descifrar las credenciales guardadas en PostgreSQL. Respalda la base de datos junto con esa clave y guárdala fuera del host con acceso restringido. Perder o reemplazar la clave maestra sin migrar las credenciales deja esas credenciales inutilizables. No publiques secretos en `.env`, commits, logs o tickets.
+El script protege `secrets/` y `certs/` y se detiene si ya encuentra cualquiera de los cuatro secretos; no los borres ni los regeneres para “arreglar” un despliegue existente. No publiques secretos en `.env`, commits, logs o tickets. Tras iniciar, Compose ejecuta las migraciones de PostgreSQL desde `backend`; espera a que los servicios estén saludables antes de crear el administrador y entrar a la interfaz.
+
+La clave `master_key` es necesaria para descifrar las credenciales guardadas en PostgreSQL. Respalda la base de datos junto con esa clave y guárdala fuera del host con acceso restringido. Perder o reemplazar la clave maestra sin migrar las credenciales deja esas credenciales inutilizables.
 
 ### URL, puertos y TLS
 
@@ -89,8 +98,6 @@ Edita `.env` antes de iniciar Compose. Los valores iniciales están en `.env.exa
 | `TRANSFER_STAGING_RESERVE_BYTES` / `TRANSFER_STAGING_MARGIN_PERCENT` | `1073741824` / `20` | Reserva libre y margen usados en la comprobación de espacio del staging. |
 | `SMB_ALLOWED_TARGETS` | vacío | Lista separada por comas de hosts exactos autorizados. Vacío significa que SMB queda denegado. |
 | `SMB_INTERACTIVE_TIMEOUT_SECONDS` | `30` | Tiempo máximo para probar o explorar SMB; no limita cuánto tarda una copia grande. |
-| `NEXTCLOUD_ENABLED` | `false` | Habilita Nextcloud; permanece oculto e inaccesible hasta activarlo explícitamente. |
-| `NEXTCLOUD_ALLOWED_ORIGINS` | vacío | Orígenes HTTPS exactos permitidos, separados por comas; vacío deniega conexiones y oculta la opción. |
 | `NEXTCLOUD_MAX_CONCURRENT` | `1` | Máximo de trabajos activos que usan Nextcloud; se aplica junto al límite global. |
 | `NEXTCLOUD_BANDWIDTH_LIMIT` / `NEXTCLOUD_CHUNK_SIZE` / `NEXTCLOUD_JOB_TIMEOUT_SECONDS` | `8M` / `10Mi` / `43200` | Perfil conservador de subida y timeout total de 12 h. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USE_TLS`, `SMTP_FROM_ADDRESS` | vacío, `587`, `true`, vacío | Completa la configuración si esta instalación enviará correo; también se administra desde la sección SMTP de Administración. |
@@ -127,7 +134,7 @@ Solo `reverse-proxy` publica puertos. `ctm_internal` es una red Docker interna p
 
 La imagen de backend/worker contiene Rclone y MEGAcmd. Rclone se invoca sin shell y solo con `lsjson`, `copy`, `about` y `size`; no se expone la API RC. Las operaciones destructivas (`delete`, `purge`, `sync`, `move`, `moveto`, `rmdir`, `dedupe`, entre otras) están fuera del flujo de aplicación. Las migraciones de base de datos se ejecutan al iniciar `backend`. Si el healthcheck `/health/ready` falla, revisa PostgreSQL, Redis, los binarios del motor, los consumidores de ambas colas Celery y la señal periódica de Beat antes de habilitar tráfico.
 
-Compose limita memoria y CPU de los nueve servicios habituales. Sus valores iniciales reservan hasta unos 5,4 GiB de memoria y 7,5 CPU; el perfil opcional `backup` agrega hasta 3 GiB y 1 CPU. Ajústalos con las variables `*_MEMORY_LIMIT` y `*_CPU_LIMIT` de `.env` según la capacidad del host. El worker de transferencias recibe el mayor presupuesto por MEGAcmd y las copias con staging. Los logs JSON de cada contenedor rotan a 20 MiB por archivo y conservan cinco archivos. Redis usa `REDIS_MAXMEMORY=256mb` bajo un límite de 384 MiB y `noeviction`: al llenarse, rechaza nuevas escrituras para preservar mensajes existentes, mientras PostgreSQL conserva las intenciones y el dispatcher vuelve a intentar trabajos pendientes.
+Compose ejecuta diez servicios habituales (sin contar el respaldo opcional). Sus límites superiores predeterminados suman hasta unos 6,2 GiB de memoria y 8,5 CPU; no son reservas y el consumo real suele ser menor. El perfil opcional `backup` agrega hasta 3 GiB y 1 CPU. Dimensiona el host para estos límites, el sistema operativo y la carga esperada; ajusta los valores mediante las variables `*_MEMORY_LIMIT` y `*_CPU_LIMIT` de `.env`. El worker de transferencias recibe el mayor presupuesto por MEGAcmd y las copias con staging. Los logs JSON de cada contenedor rotan a 20 MiB por archivo y conservan cinco archivos. Redis usa `REDIS_MAXMEMORY=256mb` bajo un límite de 384 MiB y `noeviction`: al llenarse, rechaza nuevas escrituras para preservar mensajes existentes, mientras PostgreSQL conserva las intenciones y el dispatcher vuelve a intentar trabajos pendientes.
 
 ### SMB/NAS
 
@@ -143,7 +150,7 @@ Consulta [la guía de conexión y migración SMB](docs/integrations/smb-nas-setu
 
 ### Nextcloud
 
-Nextcloud queda desactivado por defecto. Para habilitarlo, establece `NEXTCLOUD_ENABLED=true` y agrega al menos un origen HTTPS válido a `NEXTCLOUD_ALLOWED_ORIGINS`; la opción aparecerá entonces para los administradores. La conexión usa la URL WebDAV del usuario y una contraseña de aplicación. Aplica el cambio recreando backend y workers. Consulta la [guía de compatibilidad y configuración Nextcloud](docs/integrations/nextcloud-compatibility.md) antes de probarlo con datos reales.
+Nextcloud está disponible para los administradores sin una bandera de activación. Registra una URL HTTPS, un usuario y una contraseña de aplicación. Las variables `NEXTCLOUD_MAX_CONCURRENT`, `NEXTCLOUD_BANDWIDTH_LIMIT`, `NEXTCLOUD_CHUNK_SIZE` y `NEXTCLOUD_JOB_TIMEOUT_SECONDS` ajustan el uso durante las copias; sus valores predeterminados están en `.env.example`. Consulta la [guía de compatibilidad y configuración Nextcloud](docs/integrations/nextcloud-compatibility.md) antes de probarlo con datos reales.
 
 ### Temporales, secretos y datos persistentes
 
@@ -161,7 +168,7 @@ Nextcloud queda desactivado por defecto. Para habilitarlo, establece `NEXTCLOUD_
 | `./restore` | Archivos descifrados de una restauración solicitada explícitamente. | Montaje persistente del host; contiene la base de datos y secretos en claro hasta borrarlos. Restringe el acceso y limpia el directorio después del ensayo o recuperación. |
 | Logs de Docker | Salida estándar de los servicios. | Driver `json-file` con rotación de 20 MiB × 5 archivos por contenedor. |
 
-Por defecto, el staging se mantiene en el disco de Docker, no en RAM. Antes de transferir, el worker exige espacio libre para el archivo más grande más `max(TRANSFER_STAGING_RESERVE_BYTES, tamaño × TRANSFER_STAGING_MARGIN_PERCENT)`. Los valores por defecto son una reserva de 1 GiB y margen de 20%. Un tamaño desconocido o espacio insuficiente detiene el trabajo antes de copiar. Dimensiona el filesystem de Docker, revisa su cuota y monitoriza el uso durante migraciones grandes. Si cambias `TRANSFER_STAGING_PATH`, usa una ruta absoluta, dedicada y respaldada por disco; si montas un directorio del host, aplícale permisos para UID `10001` tanto en backend como en worker. No lo cambies a `/tmp`, `/run` ni a un `tmpfs` pequeño.
+Por defecto, el staging se mantiene en el disco de Docker, no en RAM. Antes de transferir, el worker exige espacio libre para el archivo más grande más `max(TRANSFER_STAGING_RESERVE_BYTES, tamaño × TRANSFER_STAGING_MARGIN_PERCENT)`. Los valores por defecto son una reserva de 1 GiB y margen de 20%. Un tamaño desconocido o espacio insuficiente detiene el trabajo antes de copiar. Si falta espacio, el informe de la transferencia fallida muestra un aviso de staging en disco; libera espacio en el filesystem de Docker y reanuda el trabajo. Dimensiona ese filesystem, revisa su cuota y monitoriza el uso durante migraciones grandes. Si cambias `TRANSFER_STAGING_PATH`, usa una ruta absoluta, dedicada y respaldada por disco; si montas un directorio del host, aplícale permisos para UID `10001` tanto en backend como en worker. No lo cambies a `/tmp`, `/run` ni a un `tmpfs` pequeño.
 
 Los flujos SMB, MEGA y Seafile API usan un cupo de staging compartido; no asumas que cada worker concurrente dispone de un directorio separado con capacidad ilimitada. `TRANSFER_MAX_CONCURRENT` debe coincidir con la concurrencia del worker `transfers` en Compose. El valor inicial es `1`. Las copias directas que no requieren staging pueden tener otro patrón de concurrencia según el planificador.
 
@@ -169,7 +176,18 @@ Los volúmenes sobreviven a la recreación normal de servicios. `docker compose 
 
 ### Crear el administrador inicial y verificar
 
-No hay usuarios ni contraseñas predeterminados. Crea el primer administrador; el CLI solicita la contraseña de forma interactiva si no se entrega por argumento:
+Espera a que `backend`, `frontend`, PostgreSQL y Redis estén saludables. Comprueba el estado y, para el certificado autofirmado de desarrollo local, consulta readiness así:
+
+```bash
+docker compose ps
+docker compose logs --tail=100 backend worker control-worker notification-worker beat
+curl --fail --show-error --noproxy '*' --cacert certs/fullchain.pem \
+  https://localhost:8443/health/ready
+```
+
+En producción, consulta `https://<host-configurado>/health/ready` usando el certificado confiable instalado. La interfaz está en la raíz de esa misma URL (`APP_BASE_URL`).
+
+No hay usuarios ni contraseñas predeterminados. Cuando el backend esté listo, crea el primer administrador; el CLI solicita la contraseña de forma interactiva si no se entrega por argumento:
 
 ```bash
 docker compose exec backend python -m app.cli create-admin \
@@ -177,13 +195,6 @@ docker compose exec backend python -m app.cli create-admin \
 ```
 
 El administrador deberá cambiar la contraseña inicial al entrar. Luego puede configurar conexiones y usuarios desde **Administración**. Google Drive requiere completar OAuth; las demás conexiones deben superar su prueba antes de quedar activas.
-
-Comprueba los servicios y sus logs:
-
-```bash
-docker compose ps
-docker compose logs --tail=100 backend worker control-worker notification-worker beat
-```
 
 `/health/live` comprueba que el API responde. `/health/ready` comprueba dependencias, consumidores activos de las colas `transfers` y `control`, y un heartbeat de Beat actualizado en los últimos 60 segundos. `/health/notifications` señala por separado si hay un consumidor de correo; su falla no retira del balanceador la API de transferencias. La cola `notifications` tiene un worker aislado; los pendientes y fallos se inspeccionan en `/api/v1/notifications/outbox` como ADMIN. El frontend, la API, PostgreSQL y Redis no tienen puertos publicados para acceder desde el host; usa el proxy o comandos `docker compose exec` para diagnósticos internos.
 
@@ -212,6 +223,7 @@ npm run build
 
 ## Documentación relacionada
 
+- [Historial de cambios](CHANGELOG.md)
 - [Contrato de API](docs/api/openapi-contracts.md)
 - [Especificación de infraestructura Docker](docs/specs/07-infrastructure-docker-spec.md)
 - [Especificación del motor de transferencias](docs/specs/04-transfers-engine-spec.md)
