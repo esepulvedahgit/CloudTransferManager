@@ -16,5 +16,9 @@ RUN mkdir -p /var/lib/ctm-backups \
     && chmod 0755 /usr/local/bin/ctm-backup-entrypoint
 
 ENV PYTHONPATH=/opt/ctm
+# The entrypoint briefly needs root to copy file-backed Docker Secrets into tmpfs,
+# then it drops to the postgres user with gosu before starting the backup process.
+#trivy:ignore:DS-0002
+USER root
 ENTRYPOINT ["/usr/local/bin/ctm-backup-entrypoint"]
 CMD ["python3", "-m", "app.backup", "daemon"]

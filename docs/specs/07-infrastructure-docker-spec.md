@@ -63,7 +63,7 @@ El servicio `evaluation-worker` consume la cola Celery `evaluations` con concurr
 
 ## 3. Configuración de Secretos (Docker Secrets)
 
-Para evitar almacenar credenciales sensibles en variables de entorno, Compose monta los secretos como archivos en `/run/secrets/`. El entrypoint del backend y worker, iniciado brevemente como root, los copia a un `tmpfs` privado en `/run/ctm-secrets/`, con propietario `ctm` y permisos `0600`; después baja privilegios mediante `gosu` antes de ejecutar la aplicación. El proceso de aplicación y Celery corren como `ctm` (UID `10001`). La excepción de Trivy `DS-0002` está limitada a esta instrucción `USER root` y documenta ese bootstrap requerido. Esto evita depender de remapeos de UID/GID que Compose no ofrece para secretos respaldados por archivos locales.
+Para evitar almacenar credenciales sensibles en variables de entorno, Compose monta los secretos como archivos en `/run/secrets/`. Los entrypoints del backend, los workers y el respaldo empiezan brevemente como root para copiarlos a un `tmpfs` privado en `/run/ctm-secrets/`, con permisos `0600`, y preparar sus directorios runtime; luego bajan privilegios mediante `gosu`. La API y Celery corren como `ctm` (UID `10001`); el respaldo corre como `postgres`. La excepción de Trivy `DS-0002` está limitada a las instrucciones `USER root` de esas dos imágenes y documenta el bootstrap requerido. Esto evita depender de remapeos de UID/GID que Compose no ofrece para secretos respaldados por archivos locales.
 - `master_key`: Clave simétrica de 256 bits para cifrar las credenciales de proveedores.
 - `postgres_password`: Contraseña de la base de datos PostgreSQL.
 - `smtp_password`: Contraseña para autenticar con el servidor de correo.
