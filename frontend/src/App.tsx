@@ -94,6 +94,10 @@ type StorageItem = {
 type ItemPage = { items: StorageItem[]; next_cursor: string | null; total_count: number };
 export type Transfer = TransferRecord;
 type TransferListPage = { items: Transfer[]; total_count: number };
+type TransferEventRecord = {
+  event_type: string;
+  provider_error_code: string | null;
+};
 type TransferCapabilities = {
   max_files_by_source_provider: { default: number; SMB: number };
 };
@@ -1855,6 +1859,7 @@ function TransferWorkspace({
     refetchIntervalInBackground: false,
   });
   const [reportTransferId, setReportTransferId] = useState<string | null>(null);
+  const reportCardRef = useRef<HTMLDivElement | null>(null);
   const [parentOmissionPrompt, setParentOmissionPrompt] = useState<{
     child: Transfer;
     parent: Transfer;
@@ -1939,6 +1944,24 @@ function TransferWorkspace({
   const reportTransfer = reportTransferId
     ? historyTransfers.find((transfer) => transfer.id === reportTransferId) ?? null
     : null;
+  useEffect(() => {
+    if (!reportTransferId) return;
+    const behavior = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+      ? 'auto'
+      : 'smooth';
+    reportCardRef.current?.scrollIntoView?.({ behavior, block: 'start' });
+  }, [reportTransferId]);
+  const transferEventsQuery = useQuery({
+    queryKey: ['transfer-events', reportTransferId, reportTransfer?.attempt_count],
+    enabled: Boolean(reportTransfer && reportTransfer.status === 'FAILED'),
+    queryFn: () => apiRequest<{ items: TransferEventRecord[] }>(
+      `/api/v1/transfers/${reportTransferId}/events`,
+    ),
+  });
+  const latestFailureDiagnostic = transferEventsQuery.data?.items
+    .slice()
+    .reverse()
+    .find((event) => event.event_type === 'FAILURE_DIAGNOSTIC');
   const liveTransfers = historyTransfers.filter((transfer) => (
     ['VALIDATING', 'RUNNING', 'RETRYING', 'PAUSING', 'CANCELLING'].includes(transfer.status)
     || visibleActiveTransfer?.id === transfer.id
@@ -2404,6 +2427,7 @@ function TransferWorkspace({
       queryClient.invalidateQueries({ queryKey: ['background-transfers'] }),
       queryClient.invalidateQueries({ queryKey: ['pending-transfers'] }),
       queryClient.invalidateQueries({ queryKey: ['transfer-manifest', transferId] }),
+      queryClient.invalidateQueries({ queryKey: ['transfer-events', transferId] }),
     ]);
   };
 
@@ -3267,7 +3291,7 @@ function TransferWorkspace({
         ))}
 
         {reportTransferId && reportTransfer && (
-          <Card className="progress-card" variant="outlined" aria-label="Resultado de transferencia">
+          <Card ref={reportCardRef} className="progress-card" variant="outlined" aria-label="Resultado de transferencia">
             <CardContent>
               <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2} sx={{ mb: 1 }}>
                 <Typography variant="overline" color="text.secondary">INFORME DE TRANSFERENCIA</Typography>
@@ -3285,6 +3309,8 @@ function TransferWorkspace({
                 onRetryOmitted={retryOmittedReportItems}
                 onDownloadOmissions={downloadOmissionReport}
                 onConflictRefresh={() => refreshTransferReport(reportTransfer.id)}
+                failureCode={latestFailureDiagnostic?.provider_error_code ?? null}
+                isLoadingFailureDetails={transferEventsQuery.isLoading}
               />
             </CardContent>
           </Card>
@@ -3355,14 +3381,18 @@ function TransferWorkspace({
                 <Typography variant="body2" fontWeight={700}>{formatProgressPercent(transfer.progress_percent)}%</Typography>
                 <Box className="history-progress-track"><Box style={{ width: `${Math.max(0, Math.min(100, transfer.progress_percent))}%` }} /></Box>
               </Box>
-              {(sourceConnection?.provider_type === 'SMB' || transfer.conflict_policy === 'KEEP_BOTH') && (
+              {(sourceConnection?.provider_type === 'SMB'
+                || transfer.conflict_policy === 'KEEP_BOTH'
+                || transfer.status === 'FAILED') && (
                 <Stack spacing={0.5} alignItems="flex-start">
                   <Button
                     size="small"
                     onClick={() => setReportTransferId(transfer.id)}
-                    aria-label={`Ver archivos de ${transfer.public_id}`}
+                    aria-label={transfer.status === 'FAILED'
+                      ? `Ver archivos de ${transfer.public_id} (informe de transferencia)`
+                      : `Ver archivos de ${transfer.public_id}`}
                   >
-                    Ver archivos
+                    {transfer.status === 'FAILED' ? 'Ver informe' : 'Ver archivos'}
                   </Button>
                   {['FAILED', 'CANCELLED'].includes(transfer.status) && (
                     <Button

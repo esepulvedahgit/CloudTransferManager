@@ -28,6 +28,8 @@ export type TransferFileReportProps = {
   onRetryOmitted: (itemIds: string[], requestId: string) => Promise<void>;
   onDownloadOmissions: () => void;
   onConflictRefresh?: () => void;
+  failureCode?: string | null;
+  isLoadingFailureDetails?: boolean;
 };
 
 const omissionConfirmation =
@@ -78,6 +80,8 @@ export default function TransferFileReport({
   onRetryOmitted,
   onDownloadOmissions,
   onConflictRefresh,
+  failureCode = null,
+  isLoadingFailureDetails = false,
 }: TransferFileReportProps) {
   const items = useMemo(() => pages.flatMap((page) => page.items), [pages]);
   const explicitOmissions = items.filter((item) => item.omission_kind && item.omitted_at);
@@ -138,10 +142,40 @@ export default function TransferFileReport({
   const selectedRetryableIds = selectedIds.filter((id) => retryableItems.some((item) => item.id === id));
   const selectedItems = retryableItems.filter((item) => selectedRetryableIds.includes(item.id));
   const retryKey = `retry:${transfer.id}:${transfer.attempt_count ?? 1}:${[...selectedRetryableIds].sort().join(',')}`;
+  const failedBecauseOfStaging = transfer.status === 'FAILED'
+    && failureCode === 'TRANSFER_STAGING_SPACE_INSUFFICIENT';
 
   return (
     <Box aria-label="Informe de archivos de transferencia">
       <Stack spacing={1.25}>
+        {failedBecauseOfStaging && (
+          <Alert
+            severity="warning"
+            role="status"
+            sx={{
+              alignItems: 'flex-start',
+              borderRadius: 2,
+              '& .MuiAlert-message': { width: '100%' },
+            }}
+          >
+            <Stack spacing={0.5}>
+              <Typography fontWeight={750}>Faltó espacio en el almacenamiento temporal</Typography>
+              <Typography variant="body2">
+                El servidor que ejecuta la transferencia no tenía suficiente espacio libre en el disco
+                configurado para staging. Los archivos que ya se copiaron se conservan.
+              </Typography>
+              <Typography variant="body2">
+                <strong>Qué hacer:</strong> libera espacio en ese disco o pide al administrador que amplíe
+                el almacenamiento de staging. Después, reanuda la transferencia desde el historial.
+              </Typography>
+            </Stack>
+          </Alert>
+        )}
+        {transfer.status === 'FAILED' && isLoadingFailureDetails && !failureCode && (
+          <Typography variant="caption" color="text.secondary" role="status">
+            Consultando el motivo del fallo…
+          </Typography>
+        )}
         {omittedCount > 0 && (
           <Alert severity="warning" role="status">
             <Typography fontWeight={700}>
@@ -165,7 +199,9 @@ export default function TransferFileReport({
             <Typography variant="overline" color="text.secondary">ARCHIVOS Y NOMBRES ASIGNADOS</Typography>
             <Typography variant="h6">{transfer.public_id}</Typography>
             <Typography variant="caption" color="text.secondary">
-              {copiedCount} copiados · {omittedCount} omitidos · {failedCount} con error
+              {failedBecauseOfStaging && items.length === 0
+                ? 'La transferencia se detuvo antes de registrar archivos individuales.'
+                : `${copiedCount} copiados · ${omittedCount} omitidos · ${failedCount} con error`}
             </Typography>
           </Box>
           {omittedCount > 0 && (
@@ -228,6 +264,21 @@ export default function TransferFileReport({
             );
           })}
         </Stack>
+        {!isLoading && !isError && items.length === 0 && (
+          <Typography
+            variant="body2"
+            color="text.secondary"
+            sx={{
+              border: '1px dashed',
+              borderColor: 'divider',
+              borderRadius: 2,
+              p: 2,
+              textAlign: 'center',
+            }}
+          >
+            No se registraron archivos para mostrar en esta ejecución.
+          </Typography>
+        )}
         {selectedRetryableIds.length > 0 && (
           <Button
             variant="outlined"
