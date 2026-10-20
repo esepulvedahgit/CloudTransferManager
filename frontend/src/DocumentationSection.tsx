@@ -142,7 +142,13 @@ export default function DocumentationSection() {
           <Paper className="documentation-callout" elevation={0}>
             <Typography variant="subtitle1" fontWeight={750}>Espacio temporal</Typography>
             <Typography variant="body2" color="text.secondary" sx={{ mt: 0.6 }}>
-              Algunas rutas, como las que usan SMB, MEGA o Seafile API, necesitan un archivo local temporal. El staging requiere espacio para el archivo más grande y además una reserva de al menos 1 GiB o un margen del 20% de ese archivo, el que sea mayor. La validación detiene la transferencia antes de copiar si falta espacio o no se conoce el tamaño. Varios trabajos no comparten el staging a la vez.
+              Las copias entre MEGA y otro proveedor usan MEGAcmd y el disco local del worker como puente. Desde MEGA, MEGAcmd descarga el archivo completo al staging y luego se sube al destino; hacia MEGA, primero se descarga desde el origen al staging y luego MEGAcmd lo sube. La copia local se borra al terminar cada archivo, incluso si falla o se cancela; si no se puede limpiar, el trabajo se detiene.
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+              El contenido del archivo no se guarda en RAM ni en el <code>tmpfs</code> pequeño de configuración: usa el espacio libre del filesystem que contiene <code>TRANSFER_STAGING_PATH</code> en el worker. Por defecto es <code>/var/lib/cloud-transfer/staging</code>, dentro del almacenamiento de Docker. MEGAcmd también crea allí un HOME temporal aislado que ocupa espacio adicional y normalmente se retira al cerrar la sesión.
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+              Antes de empezar se comprueba que haya espacio libre para el archivo más grande y que quede una reserva de al menos 1 GiB o un margen del 20% de ese archivo, el que sea mayor. Se vuelve a comprobar antes de procesar cada archivo. En el flujo normal se trabaja uno por uno, así que no hace falta sumar el tamaño de toda la selección; una verificación de una escritura interrumpida puede necesitar temporalmente otra copia local. Los trabajos que comparten el staging esperan su turno. La cuota de MEGA en destino es un límite separado.
             </Typography>
           </Paper>
           <Paper className="documentation-callout" elevation={0}>
@@ -152,6 +158,9 @@ export default function DocumentationSection() {
             </Typography>
           </Paper>
         </Box>
+        <Alert className="documentation-note" severity="warning">
+          Si una copia falla por falta de espacio en staging, abre <strong>Ver informe</strong> desde el historial para consultar el motivo. Libera espacio en el disco que contiene el staging o pide al administrador que lo amplíe y luego pulsa <strong>Reanudar</strong>. Ampliar la cuota de MEGA no corrige la falta de espacio local.
+        </Alert>
       </GuideSection>
 
       <GuideSection id="documentation-background" index="03" eyebrow="EJECUCIÓN" title="Cola, segundo plano y paralelismo">
@@ -204,7 +213,7 @@ export default function DocumentationSection() {
             Durante una copia normal se muestra porcentaje, bytes, velocidad y ETA cuando se pueden calcular. Los eventos llegan por SSE; la interfaz vuelve a consultar el estado cada 15 segundos como respaldo.
           </GuideCard>
           <GuideCard title="Historial reciente">
-            Al finalizar, el trabajo aparece con su identificador TRF, estado, fecha, duración, ruta y conteos. Los resultados son por usuario; la cuenta administradora puede consultar el conjunto de la instalación.
+            El trabajo aparece con su identificador TRF, estado, fecha, duración, ruta y conteos. En transferencias fallidas, <strong>Ver informe</strong> muestra el motivo general y, cuando existe, el detalle por archivo. Los resultados son por usuario; la cuenta administradora puede consultar el conjunto de la instalación.
           </GuideCard>
           <GuideCard title="Migraciones SMB">
             El historial permite abrir el manifiesto por archivo y ver copiados, omitidos y fallidos. El contador de elementos procesados también incluye omitidos, así que no representa solo archivos copiados.
